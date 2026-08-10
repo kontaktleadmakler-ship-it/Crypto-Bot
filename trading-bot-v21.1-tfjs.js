@@ -2698,10 +2698,11 @@ process.on('unhandledRejection', async (reason) => {
 (async () => {
   logger.info('🚀 Starte Trading Bot v21.1 ULTIMATE TFJS (Full Features, TensorFlow.js ML & Hurst Filter)...');
   
-  // Zwingt den Bot beim Start aus dem eventuell hängenden Pausen-Modus
-  if (typeof isPaused !== 'undefined') {
-    isPaused = false;
-  }
+  // ---> HIER DEN PAUSEN-STATUS UND DEN PEAK ZWINGEND ZURÜCKSETZEN <---
+  if (typeof isPaused !== 'undefined') isPaused = false;
+  if (typeof botPaused !== 'undefined') botPaused = false;
+  if (typeof peakCapital !== 'undefined') peakCapital = 100; // Setze hier dein echtes Kapital ein (z.B. 100)
+  if (typeof startBalance !== 'undefined') startBalance = 100;
 
   await initDatabase();
   await loadFuturesContractSpecs();
@@ -2712,6 +2713,10 @@ process.on('unhandledRejection', async (reason) => {
   // Funktion für den wiederkehrenden Scan
   const runScanCycle = async () => {
     try {
+      // Erzwinge auch hier vor jedem Scan, dass der Bot nicht pausiert ist:
+      if (typeof isPaused !== 'undefined') isPaused = false;
+      if (typeof botPaused !== 'undefined') botPaused = false;
+
       if (isDbConnected) {
         await scanMarket();
       } else {
@@ -2725,7 +2730,7 @@ process.on('unhandledRejection', async (reason) => {
   // Erster sofortiger Scan
   await runScanCycle();
 
-  // Ab jetzt alle 5 Minuten wiederholen (300000 Millisekunden)
+  // Ab jetzt alle 5 Minuten wiederholen
   const SCAN_INTERVAL_MS = 5 * 60 * 1000; 
   setInterval(runScanCycle, SCAN_INTERVAL_MS);
   
