@@ -832,6 +832,19 @@ async function isCoinDynamicallyBlacklisted(symbol) {
 // ==========================================
 // 8. RISIKOMANAGEMENT & DYNAMISCHER ATR
 // ==========================================
+function calculateDynamicLeverage(atr, currentPrice, baseLeverage = config.LEVERAGE) {
+  if (!currentPrice || currentPrice === 0 || !atr || atr === 0) return baseLeverage;
+  const volatilityPercent = (atr / currentPrice) * 100;
+  let adjustedLeverage = baseLeverage;
+
+  if (volatilityPercent > 3.0) {
+    adjustedLeverage = Math.max(1, Math.floor(baseLeverage * 0.5));
+  } else if (volatilityPercent > 2.0) {
+    adjustedLeverage = Math.max(1, Math.floor(baseLeverage * 0.75));
+  }
+  return Number(adjustedLeverage);
+}
+
 function checkGlobalDrawdown(currentEquity) {
   peakCapital = Math.max(peakCapital, currentEquity);
   const drawdown = peakCapital > 0 ? (peakCapital - currentEquity) / peakCapital * 100 : 0;
@@ -2176,48 +2189,56 @@ async function scanMarket() {
           scanStats.signalsSent++;
           scanStats.totalSignalScore += signalScore;
 
-          await upsertTrade(symbol, {
-            symbol, direction, entry: entryPrice, stopLoss, tp1, tp2,
-            positionSizeUnits: sizing.positionSizeUnits,
-            contracts: sizing.contracts,
-            notionalUSD: sizing.notionalUSD,
-            riskAmountUSD: sizing.riskAmountUSD,
-            entryFeeUSD: applyFees(sizing.notionalUSD),
-            entryFeePaidUSD: 0,
-            fundingCostUSD: 0,
-            lastFundingPeriod: 0,
-            openInterestAtEntry: futuresData?.openInterest || null,
-            fundingRateAtEntry: fundingRate,
-            atrAtEntry: atr,
-            rsiAtEntry: rsi,
-            adxAtEntry: adx,
-            relativeVolumeAtEntry: relativeVolume,
-            trend4hAtEntry: trend4h,
-            trend1hAtEntry: trend1h,
-            trend15mAtEntry: trend15m,
-            btcTrendAtEntry: btcTrend,
-            leverage: config.LEVERAGE,
-            marginMode: config.MARGIN_MODE,
-            tp1Hit: false,
-            partiallyClosed: false,
-            startTime: Date.now(),
-            maxHoldHours: config.MAX_HOLD_HOURS,
-            timeStopWarningSent: false,
-            signalScore,
-            marketPhase: currentMarketPhase,
-            adaptiveRisk,
-            // TensorFlow.js feature snapshot for reproducible future training
-            hurstAtEntry: hurst,
-            macdHistogramAtEntry: macd.histogram,
-            pocDistancePctAtEntry: pocDistancePct,
-            vwapDistancePctAtEntry: vwapDistancePct,
-            atrPctAtEntry: atrPct,
-            orderBookImbalanceAtEntry: orderBookImbalance,
-            mlProbabilityAtEntry: mlPrediction.probability,
-            mlConfidenceAtEntry: mlPrediction.confidence,
-            mlModelVersionAtEntry: mlModel.getStats().modelVersion || null
-          });
+         // Dynamischen Hebel basierend auf ATR und aktuellem Preis berechnen
+            const dynamicLeverage = (function(atrVal, priceVal, baseLev) {
+              if (!priceVal || priceVal === 0 || !atrVal || atrVal === 0) return baseLev;
+              const volPct = (atrVal / priceVal) * 100;
+              if (volPct > 3.0) return Math.max(1, Math.floor(baseLev * 0.5));
+              if (volPct > 2.0) return Math.max(1, Math.floor(baseLev * 0.75));
+              return Number(baseLev);
+            })(atr, currentPrice, config.LEVERAGE);
 
+            await upsertTrade(symbol, {
+              symbol, direction, entry: entryPrice, stopLoss, tp1, tp2,
+              positionSizeUnits: sizing.positionSizeUnits,
+              contracts: sizing.contracts,
+              notionalUSD: sizing.notionalUSD,
+              riskAmountUSD: sizing.riskAmountUSD,
+              entryFeeUSD: applyFees(sizing.notionalUSD),
+              entryFeePaidUSD: 0,
+              fundingCostUSD: 0,
+              lastFundingPeriod: 0,
+              openInterestAtEntry: futuresData?.openInterest || null,
+              fundingRateAtEntry: fundingRate,
+              atrAtEntry: atr,
+              rsiAtEntry: rsi,
+              adxAtEntry: adx,
+              relativeVolumeAtEntry: relativeVolume,
+              trend4hAtEntry: trend4h,
+              trend1hAtEntry: trend1h,
+              trend15mAtEntry: trend15m,
+              btcTrendAtEntry: btcTrend,
+              leverage: dynamicLeverage, // <--- Hier durch den dynamischen Hebel ersetzt
+              marginMode: config.MARGIN_MODE,
+              tp1Hit: false,
+              partiallyClosed: false,
+              startTime: Date.now(),
+              maxHoldHours: config.MAX_HOLD_HOURS,
+              timeStopWarningSent: false,
+              signalScore,
+              marketPhase: currentMarketPhase,
+              adaptiveRisk,
+              // TensorFlow.js feature snapshot for reproducible future training
+              hurstAtEntry: hurst,
+              macdHistogramAtEntry: macd.histogram,
+              pocDistancePctAtEntry: pocDistancePct,
+              vwapDistancePctAtEntry: vwapDistancePct,
+              atrPctAtEntry: atrPct,
+              orderBookImbalanceAtEntry: orderBookImbalance,
+              mlProbabilityAtEntry: mlPrediction.probability,
+              mlConfidenceAtEntry: mlPrediction.confidence,
+              mlModelVersionAtEntry: mlModel.getStats().modelVersion || null
+            });
           const safeSymbol = escapeHtml(symbol);
           const signalText = 
             `🚀 <b>NEUES SIGNAL: ${safeSymbol} (${direction})</b> [Score: ${signalScore}/100]\n` +
