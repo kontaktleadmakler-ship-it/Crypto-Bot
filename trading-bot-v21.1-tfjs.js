@@ -2747,3 +2747,16 @@ async function evaluateFundingAndSentiment(symbol, marketData) {
   
   logger.info(`🔄 Bot-Dauerschleife aktiv. Nächster Scan in ${SCAN_INTERVAL_MS / 60000} Minuten.`);
 })();
+
+// Mini-Webserver für Render Free Tier (verhindert den Port-Timeout-Fehler)
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+app.get('/', (req, res) => {
+  res.send('Trading Bot v21.1 is running smoothly!');
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🌐 Webserver bindet sich an Port ${PORT} für Render...`);
+});
