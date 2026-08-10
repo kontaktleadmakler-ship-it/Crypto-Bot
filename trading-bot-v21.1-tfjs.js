@@ -35,7 +35,7 @@ let currentStreak = 0;
 let maxWinStreak = 0;
 let maxLossStreak = 0;
 
-let peakCapital = 10000;
+let peakCapital = 100;
 let dailyNetPnL = 0;
 let consecutiveLosses = 0;                     // <-- NEU für MAX_CONSECUTIVE_LOSSES
 
