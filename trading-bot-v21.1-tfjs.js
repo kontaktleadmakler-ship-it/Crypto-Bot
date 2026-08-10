@@ -37,7 +37,7 @@ let maxLossStreak = 0;
 
 let peakCapital = 100;
 let dailyNetPnL = 0;
-let consecutiveLosses = 0;                     // <-- NEU für MAX_CONSECUTIVE_LOSSES
+let consecutiveLosses = 0;
 
 const MAX_DRAWDOWN_PERCENT = parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 25;
 const DAILY_PROFIT_TARGET = parseFloat(process.env.DAILY_PROFIT_TARGET) || 500;
@@ -235,7 +235,6 @@ async function sendTelegramReply(chatId, text) {
   });
 }
 
-// ---- NEUE ATOMARE ALERT-HISTORY (ersetzt alte getAlertHistoryMap / persistAlertHistory) ----
 async function getAlertTimestamp(key) {
   if (!botStateCollection || !isDbConnected) return 0;
   try {
@@ -256,9 +255,7 @@ async function persistAlertHistoryEntry(key, timestamp) {
     );
   } catch (e) {}
 }
-// ---- ENDE NEUE ATOMARE FUNKTIONEN ----
 
-// sendDeduplicatedAlert jetzt mit atomaren Funktionen
 async function sendDeduplicatedAlert(key, text, cooldownMs = 300000) {
   const lastSent = await getAlertTimestamp(key);
   if (Date.now() - lastSent < cooldownMs) return;
@@ -284,6 +281,7 @@ function updateTelegramConfig(token, chatId) {
   configTelegram.botToken = token;
   configTelegram.chatId = chatId;
 }
+
 // ==========================================
 // 5. KORRELATIONS-GRUPPEN
 // ==========================================
@@ -429,7 +427,6 @@ const config = {
   MAX_CHOP_INDEX: parseFloat(process.env.MAX_CHOP_INDEX) || 61.8,
   MIN_HURST_EXPONENT: parseFloat(process.env.MIN_HURST_EXPONENT) || 0.52,
 
-  // TensorFlow.js ML
   ML_ENABLED: process.env.ML_ENABLED !== 'false',
   ML_MIN_TRAINING_SAMPLES: parseInt(process.env.ML_MIN_TRAINING_SAMPLES, 10) || 40,
   ML_MAX_TRAINING_SAMPLES: parseInt(process.env.ML_MAX_TRAINING_SAMPLES, 10) || 2000,
@@ -502,8 +499,6 @@ let isPaused = false, lastScanTime = null, lastTrackerCheckTime = null;
 let trackerLock = false, trackerTimeout = null;
 const signalPerformanceHistory = new Map();
 
-// TensorFlow.js ML-Engine: trainiert ausschließlich auf bereits abgeschlossenen Trades.
-// Die Engine wird bewusst getrennt gehalten, damit das Trading-/Risk-Management unverändert bleibt.
 const mlModel = new TensorFlowSignalModel({
   modelDir: process.env.ML_MODEL_DIR || './models/signal-model',
   minSamples: config.ML_MIN_TRAINING_SAMPLES,
@@ -657,7 +652,6 @@ async function acquireInstanceLock() {
       if (acquired) { currentInstanceId = instanceId; return instanceId; }
       if (attempt < config.LOCK_ACQUIRE_RETRIES) await sleep(config.LOCK_ACQUIRE_RETRY_DELAY_MS);
     }
-    // ---- FIX: Harter Exit, wenn Lock nicht erworben werden konnte ----
     logger.error('🔴 Konnte Instance-Lock nicht erwerben – beende Prozess.');
     await sendTelegramAlert('🚨 <b>Instance-Lock fehlgeschlagen!</b> Bot wird beendet.');
     process.exit(1);
@@ -852,12 +846,13 @@ function checkGlobalDrawdown(currentEquity) {
     isPaused = true;
     persistPauseState();
     persistPeakCapital();
-    // ---- FIX: Deduplizierte Nachricht statt sendTelegramAlert ----
     sendDeduplicatedAlert('global_drawdown', `🔴 <b>MAX DRAWDOWN ERREICHT: ${drawdown.toFixed(1)}%!</b>\nBot wurde pausiert.`);
     return true;
   }
   return false;
-  function evaluateFundingAndSentiment(fundingRate, direction) {
+}
+
+async function evaluateFundingAndSentiment(fundingRate, direction) {
   if (fundingRate === null || fundingRate === undefined) return { allowed: true };
   const extremeThreshold = 0.0005; 
 
@@ -871,7 +866,6 @@ function checkGlobalDrawdown(currentEquity) {
     }
   }
   return { allowed: true };
-}
 }
 
 function checkDailyProfitTarget() {
@@ -892,7 +886,6 @@ async function recordTradePnL(pnlUSD) {
     peakCapital = currentEquity;
     await persistPeakCapital();
   }
-  // ---- FIX: MAX_CONSECUTIVE_LOSSES ----
   if (pnlUSD < 0) {
     consecutiveLosses++;
     if (config.MAX_CONSECUTIVE_LOSSES > 0 && consecutiveLosses >= config.MAX_CONSECUTIVE_LOSSES) {
@@ -1186,6 +1179,7 @@ function calculateSignalScore(params) {
   if (params.trend4h === (params.direction === 'LONG' ? 'BULLISH' : 'BEARISH')) score += 15;
   return Math.round(Math.min(score, 100));
 }
+
 // ==========================================
 // 10. KUCOIN MARKET DATA
 // ==========================================
@@ -2002,8 +1996,6 @@ async function scanMarket() {
     }
 
     let signalsSent = 0;
-    // ---- FIX: Atomare Cooldown-Abfrage statt globaler Map ----
-    // (kein alertHistoryMap mehr, wird direkt in der Schleife über getAlertTimestamp erledigt)
 
     await asyncPool(config.SCAN_CONCURRENCY, dynamicWatchlist, async (symbol) => {
       scanStats.total++;
@@ -2049,7 +2041,6 @@ async function scanMarket() {
           return; 
         }
 
-        // ---- FIX: Multi‑TF‑Fallback für 4h ----
         let raw4h = null;
         if (config.REQUIRE_4H_TREND) {
           if (config.ENABLE_MULTI_TF_DERIVATION) {
@@ -2086,68 +2077,66 @@ async function scanMarket() {
         const relativeVolume = calculateRelativeVolume(raw15m, 20);
         const fundingRate = futuresData ? futuresData.fundingRate : 0;
 
-        // --- HIER DEN SENTIMENT-FILTER EINBINDEN ---
-// Statt continue; einfach return; verwenden, wenn es außerhalb einer Schleife steht
-const sentimentCheck = evaluateFundingAndSentiment(fundingRate, direction);
-if (!sentimentCheck.allowed) {
-  return; 
-}
         const gateParams = {
           trend4h, trend1h, trend15m, btcTrend, adx, hurst, bosBullish, bosBearish,
           rsi, poc, vwap, currentPrice, macd, fundingRate, relativeVolume,
           adaptiveADX, adaptiveVolume
         };
 
-    // Vollständig abgesicherter Block für die Richtungs-Erkennung
-var direction = null;
-const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
-let primaryFail = evaluateDirectionGates(primaryDir, gateParams);
+        var direction = null;
+        const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
+        let primaryFail = evaluateDirectionGates(primaryDir, gateParams);
 
-if (!primaryFail) {
-  direction = primaryDir;
-} else if (config.ENABLE_SHORT_SIGNALS || primaryDir === 'LONG') {
-  const secondaryFail = evaluateDirectionGates(
-    primaryDir === 'LONG' ? 'SHORT' : 'LONG', 
-    gateParams
-  );
-  if (!secondaryFail) {
-    direction = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
-  } else {
-    scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
-  }
-} else {
-  scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
-}
+        if (!primaryFail) {
+          direction = primaryDir;
+        } else if (config.ENABLE_SHORT_SIGNALS || primaryDir === 'LONG') {
+          const secondaryFail = evaluateDirectionGates(
+            primaryDir === 'LONG' ? 'SHORT' : 'LONG', 
+            gateParams
+          );
+          if (!secondaryFail) {
+            direction = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
+          } else {
+            scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
+          }
+        } else {
+          scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
+        }
 
-if (direction !== null) {
-  const cooldownKey = `${symbol}_${direction}`;
-  const lastSent = await getAlertTimestamp(cooldownKey);
-  if (Date.now() - lastSent <= 2 * 3_600_000) {
-    scanStats.cooldownActive++;
-    return;
-  }
+        if (direction !== null) {
+          const sentimentCheck = await evaluateFundingAndSentiment(fundingRate, direction);
+          if (!sentimentCheck.allowed) {
+            scanStats.fundingBlocked = (scanStats.fundingBlocked || 0) + 1;
+            return;
+          }
 
-  if (!checkCorrelationLimit(symbol, direction, activeTrades, config.ENABLE_CORRELATION_LIMITS)) {
-    scanStats.correlationBlocked++;
-    return;
-  }
+          const cooldownKey = `${symbol}_${direction}`;
+          const lastSent = await getAlertTimestamp(cooldownKey);
+          if (Date.now() - lastSent <= 2 * 3_600_000) {
+            scanStats.cooldownActive++;
+            return;
+          }
 
-  const signalScore = calculateSignalScore({
-    adx, rsi, relativeVolume, trend1h, trend4h, direction
-  });
+          if (!checkCorrelationLimit(symbol, direction, activeTrades, config.ENABLE_CORRELATION_LIMITS)) {
+            scanStats.correlationBlocked++;
+            return;
+          }
 
-  let orderBookImbalance = null;
-  if (config.ENABLE_ORDERBOOK_ANALYSIS && signalScore > 60) {
-    orderBookImbalance = await fetchOrderBookImbalance(symbol).catch(() => null);
-    if (orderBookImbalance !== null) {
-      const obOk = direction === 'LONG' ? orderBookImbalance > 0.9 : orderBookImbalance < 1.1;
-      if (!obOk) {
-        scanStats.orderBookBlocked++;
-        return;
-      }
-    }
-  }
-}
+          const signalScore = calculateSignalScore({
+            adx, rsi, relativeVolume, trend1h, trend4h, direction
+          });
+
+          let orderBookImbalance = null;
+          if (config.ENABLE_ORDERBOOK_ANALYSIS && signalScore > 60) {
+            orderBookImbalance = await fetchOrderBookImbalance(symbol).catch(() => null);
+            if (orderBookImbalance !== null) {
+              const obOk = direction === 'LONG' ? orderBookImbalance > 0.9 : orderBookImbalance < 1.1;
+              if (!obOk) {
+                scanStats.orderBookBlocked++;
+                return;
+              }
+            }
+          }
 
           const pocDistancePct = poc && currentPrice ? ((currentPrice - poc) / currentPrice) * 100 : 0;
           const vwapDistancePct = vwap && currentPrice ? ((currentPrice - vwap) / currentPrice) * 100 : 0;
@@ -2204,62 +2193,54 @@ if (direction !== null) {
             return;
           }
 
-          // ---- FIX: Atomare Cooldown-Persistenz ----
           await persistAlertHistoryEntry(cooldownKey, Date.now());
           signalsSent++;
           scanStats.signalsSent++;
           scanStats.totalSignalScore += signalScore;
 
-         // Dynamischen Hebel basierend auf ATR und aktuellem Preis berechnen
-            const dynamicLeverage = (function(atrVal, priceVal, baseLev) {
-              if (!priceVal || priceVal === 0 || !atrVal || atrVal === 0) return baseLev;
-              const volPct = (atrVal / priceVal) * 100;
-              if (volPct > 3.0) return Math.max(1, Math.floor(baseLev * 0.5));
-              if (volPct > 2.0) return Math.max(1, Math.floor(baseLev * 0.75));
-              return Number(baseLev);
-            })(atr, currentPrice, config.LEVERAGE);
+          const dynamicLeverage = calculateDynamicLeverage(atr, currentPrice, config.LEVERAGE);
 
-            await upsertTrade(symbol, {
-              symbol, direction, entry: entryPrice, stopLoss, tp1, tp2,
-              positionSizeUnits: sizing.positionSizeUnits,
-              contracts: sizing.contracts,
-              notionalUSD: sizing.notionalUSD,
-              riskAmountUSD: sizing.riskAmountUSD,
-              entryFeeUSD: applyFees(sizing.notionalUSD),
-              entryFeePaidUSD: 0,
-              fundingCostUSD: 0,
-              lastFundingPeriod: 0,
-              openInterestAtEntry: futuresData?.openInterest || null,
-              fundingRateAtEntry: fundingRate,
-              atrAtEntry: atr,
-              rsiAtEntry: rsi,
-              adxAtEntry: adx,
-              relativeVolumeAtEntry: relativeVolume,
-              trend4hAtEntry: trend4h,
-              trend1hAtEntry: trend1h,
-              trend15mAtEntry: trend15m,
-              btcTrendAtEntry: btcTrend,
-              leverage: dynamicLeverage, // <--- Hier durch den dynamischen Hebel ersetzt
-              marginMode: config.MARGIN_MODE,
-              tp1Hit: false,
-              partiallyClosed: false,
-              startTime: Date.now(),
-              maxHoldHours: config.MAX_HOLD_HOURS,
-              timeStopWarningSent: false,
-              signalScore,
-              marketPhase: currentMarketPhase,
-              adaptiveRisk,
-              // TensorFlow.js feature snapshot for reproducible future training
-              hurstAtEntry: hurst,
-              macdHistogramAtEntry: macd.histogram,
-              pocDistancePctAtEntry: pocDistancePct,
-              vwapDistancePctAtEntry: vwapDistancePct,
-              atrPctAtEntry: atrPct,
-              orderBookImbalanceAtEntry: orderBookImbalance,
-              mlProbabilityAtEntry: mlPrediction.probability,
-              mlConfidenceAtEntry: mlPrediction.confidence,
-              mlModelVersionAtEntry: mlModel.getStats().modelVersion || null
-            });
+          await upsertTrade(symbol, {
+            symbol, direction, entry: entryPrice, stopLoss, tp1, tp2,
+            positionSizeUnits: sizing.positionSizeUnits,
+            contracts: sizing.contracts,
+            notionalUSD: sizing.notionalUSD,
+            riskAmountUSD: sizing.riskAmountUSD,
+            entryFeeUSD: applyFees(sizing.notionalUSD),
+            entryFeePaidUSD: 0,
+            fundingCostUSD: 0,
+            lastFundingPeriod: 0,
+            openInterestAtEntry: futuresData?.openInterest || null,
+            fundingRateAtEntry: fundingRate,
+            atrAtEntry: atr,
+            rsiAtEntry: rsi,
+            adxAtEntry: adx,
+            relativeVolumeAtEntry: relativeVolume,
+            trend4hAtEntry: trend4h,
+            trend1hAtEntry: trend1h,
+            trend15mAtEntry: trend15m,
+            btcTrendAtEntry: btcTrend,
+            leverage: dynamicLeverage,
+            marginMode: config.MARGIN_MODE,
+            tp1Hit: false,
+            partiallyClosed: false,
+            startTime: Date.now(),
+            maxHoldHours: config.MAX_HOLD_HOURS,
+            timeStopWarningSent: false,
+            signalScore,
+            marketPhase: currentMarketPhase,
+            adaptiveRisk,
+            hurstAtEntry: hurst,
+            macdHistogramAtEntry: macd.histogram,
+            pocDistancePctAtEntry: pocDistancePct,
+            vwapDistancePctAtEntry: vwapDistancePct,
+            atrPctAtEntry: atrPct,
+            orderBookImbalanceAtEntry: orderBookImbalance,
+            mlProbabilityAtEntry: mlPrediction.probability,
+            mlConfidenceAtEntry: mlPrediction.confidence,
+            mlModelVersionAtEntry: mlModel.getStats().modelVersion || null
+          });
+
           const safeSymbol = escapeHtml(symbol);
           const signalText = 
             `🚀 <b>NEUES SIGNAL: ${safeSymbol} (${direction})</b> [Score: ${signalScore}/100]\n` +
@@ -2529,11 +2510,9 @@ async function handleTelegramCommand(chatId, text) {
 let telegramOffset = 0;
 
 async function pollTelegramUpdates() {
-  // Am Anfang von pollTelegramUpdates einfügen:
-setInterval(() => {
-  if (!isShuttingDown) logger.info('💓 Telegram polling alive');
-}, 1800000);
-  
+  setInterval(() => {
+    if (!isShuttingDown) logger.info('💓 Telegram polling alive');
+  }, 1800000);
   
   const token = configTelegram.botToken || config.TELEGRAM_BOT_TOKEN;
   if (!token) return;
@@ -2553,16 +2532,15 @@ setInterval(() => {
         await handleTelegramCommand(msg.chat.id, msg.text);
       }
     } catch (e) {
-      // Bei 409 (Webhook-Konflikt) Webhook löschen
       if (e.response?.status === 409) {
         try { await axios.get(`https://api.telegram.org/bot${token}/deleteWebhook`); } catch (e2) {}
       }
       logger.error(`Telegram poll error: ${e.message}`);
       await sleep(5000);
-      // WICHTIG: Schleife läuft weiter
     }
   }
 }
+
 // ==========================================
 // 17. EXPRESS ENDPOINTS & GRAFANA METRICS
 // ==========================================
@@ -2638,7 +2616,9 @@ app.get('/api/ml/status', (req, res) => {
   });
 });
 
-const server = app.listen(config.PORT, () => { logger.info(`[SERVER] Port ${config.PORT}`); });
+const server = app.listen(config.PORT, '0.0.0.0', () => { 
+  logger.info(`🌐 Webserver bindet sich an Port ${config.PORT} für Render...`); 
+});
 
 // ==========================================
 // 18. TIMERS & SHUTDOWN
@@ -2681,7 +2661,6 @@ async function gracefulShutdown(signal) {
   process.exit(0);
 }
 
-// ---- FIX: Crash-Handler rufen gracefulShutdown auf ----
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('uncaughtException', async (err) => {
@@ -2693,26 +2672,15 @@ process.on('unhandledRejection', async (reason) => {
   await gracefulShutdown('unhandledRejection');
 });
 
-// Dummy-Funktion, um den "evaluateFundingAndSentiment is not defined" Fehler zu beheben
-async function evaluateFundingAndSentiment(symbol, marketData) {
-  // Gibt standardmäßig ein neutrales Sentiment zurück, falls die echte Funktion fehlt
-  return {
-    sentiment: 'NEUTRAL',
-    fundingRate: 0.01,
-    multiplier: 1.0
-  };
-}
-
 // ==========================================
 // 19. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
   logger.info('🚀 Starte Trading Bot v21.1 ULTIMATE TFJS (Full Features, TensorFlow.js ML & Hurst Filter)...');
   
-  // ---> HIER DEN PAUSEN-STATUS UND DEN PEAK ZWINGEND ZURÜCKSETZEN <---
   if (typeof isPaused !== 'undefined') isPaused = false;
   if (typeof botPaused !== 'undefined') botPaused = false;
-  if (typeof peakCapital !== 'undefined') peakCapital = 100; // Setze hier dein echtes Kapital ein (z.B. 100)
+  if (typeof peakCapital !== 'undefined') peakCapital = 100;
   if (typeof startBalance !== 'undefined') startBalance = 100;
 
   await initDatabase();
@@ -2721,10 +2689,8 @@ async function evaluateFundingAndSentiment(symbol, marketData) {
   if (!isModelTrained) await trainSignalMLModel(true);
   pollTelegramUpdates();
 
-  // Funktion für den wiederkehrenden Scan
   const runScanCycle = async () => {
     try {
-      // Erzwinge auch hier vor jedem Scan, dass der Bot nicht pausiert ist:
       if (typeof isPaused !== 'undefined') isPaused = false;
       if (typeof botPaused !== 'undefined') botPaused = false;
 
@@ -2738,25 +2704,10 @@ async function evaluateFundingAndSentiment(symbol, marketData) {
     }
   };
 
-  // Erster sofortiger Scan
   await runScanCycle();
 
-  // Ab jetzt alle 5 Minuten wiederholen
   const SCAN_INTERVAL_MS = 5 * 60 * 1000; 
   setInterval(runScanCycle, SCAN_INTERVAL_MS);
   
   logger.info(`🔄 Bot-Dauerschleife aktiv. Nächster Scan in ${SCAN_INTERVAL_MS / 60000} Minuten.`);
 })();
-
-// Mini-Webserver für Render Free Tier (verhindert den Port-Timeout-Fehler)
-const express = require('express');
-const app = express();
-const PORT = process.env.PORT || 10000;
-
-app.get('/', (req, res) => {
-  res.send('Trading Bot v21.1 is running smoothly!');
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🌐 Webserver bindet sich an Port ${PORT} für Render...`);
-});
