@@ -2098,56 +2098,57 @@ if (!sentimentCheck.allowed) {
           adaptiveADX, adaptiveVolume
         };
 
-        let direction = null;
-        const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
-        let primaryFail = evaluateDirectionGates(primaryDir, gateParams);
+      let direction = null;
+const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
+let primaryFail = evaluateDirectionGates(primaryDir, gateParams);
 
-        if (!primaryFail) {
-          direction = primaryDir;
-        } else if (config.ENABLE_SHORT_SIGNALS || primaryDir === 'LONG') {
-          const secondaryFail = evaluateDirectionGates(
-            primaryDir === 'LONG' ? 'SHORT' : 'LONG', 
-            gateParams
-          );
-          if (!secondaryFail) {
-            direction = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
-          } else {
-            scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
-          }
-        } else {
-          scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
-        }
+if (!primaryFail) {
+  direction = primaryDir;
+} else if (config.ENABLE_SHORT_SIGNALS || primaryDir === 'LONG') {
+  const secondaryFail = evaluateDirectionGates(
+    primaryDir === 'LONG' ? 'SHORT' : 'LONG', 
+    gateParams
+  );
+  if (!secondaryFail) {
+    direction = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
+  } else {
+    scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
+  }
+} else {
+  scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
+}
 
-        if (direction) {
-          const cooldownKey = `${symbol}_${direction}`;
-          // ---- FIX: Atomare Cooldown-Prüfung ----
-          const lastSent = await getAlertTimestamp(cooldownKey);
-          if (Date.now() - lastSent <= 2 * 3_600_000) {
-            scanStats.cooldownActive++;
-            return;
-          }
+if (direction) {
+  const cooldownKey = `${symbol}_${direction}`;
+  // ---- FIX: Atomare Cooldown-Prüfung ----
+  const lastSent = await getAlertTimestamp(cooldownKey);
+  if (Date.now() - lastSent <= 2 * 3_600_000) {
+    scanStats.cooldownActive++;
+    return;
+  }
 
-          if (!checkCorrelationLimit(symbol, direction, activeTrades, config.ENABLE_CORRELATION_LIMITS)) {
-            scanStats.correlationBlocked++;
-            return;
-          }
+  if (!checkCorrelationLimit(symbol, direction, activeTrades, config.ENABLE_CORRELATION_LIMITS)) {
+    scanStats.correlationBlocked++;
+    return;
+  }
 
-          const signalScore = calculateSignalScore({
-            adx, rsi, relativeVolume, trend1h, trend4h, direction
-          });
+  const signalScore = calculateSignalScore({
+    adx, rsi, relativeVolume, trend1h, trend4h, direction
+  });
 
-          // Orderbook wird vor der ML-Entscheidung geladen, damit es als Feature dienen kann.
-          let orderBookImbalance = null;
-          if (config.ENABLE_ORDERBOOK_ANALYSIS && signalScore > 60) {
-            orderBookImbalance = await fetchOrderBookImbalance(symbol).catch(() => null);
-            if (orderBookImbalance !== null) {
-              const obOk = direction === 'LONG' ? orderBookImbalance > 0.9 : orderBookImbalance < 1.1;
-              if (!obOk) {
-                scanStats.orderBookBlocked++;
-                return;
-              }
-            }
-          }
+  // Orderbook wird vor der ML-Entscheidung geladen, damit es als Feature dienen kann.
+  let orderBookImbalance = null;
+  if (config.ENABLE_ORDERBOOK_ANALYSIS && signalScore > 60) {
+    orderBookImbalance = await fetchOrderBookImbalance(symbol).catch(() => null);
+    if (orderBookImbalance !== null) {
+      const obOk = direction === 'LONG' ? orderBookImbalance > 0.9 : orderBookImbalance < 1.1;
+      if (!obOk) {
+        scanStats.orderBookBlocked++;
+        return;
+      }
+    }
+  }
+}
 
           const pocDistancePct = poc && currentPrice ? ((currentPrice - poc) / currentPrice) * 100 : 0;
           const vwapDistancePct = vwap && currentPrice ? ((currentPrice - vwap) / currentPrice) * 100 : 0;
