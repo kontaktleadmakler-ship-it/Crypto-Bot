@@ -857,6 +857,21 @@ function checkGlobalDrawdown(currentEquity) {
     return true;
   }
   return false;
+  function evaluateFundingAndSentiment(fundingRate, direction) {
+  if (fundingRate === null || fundingRate === undefined) return { allowed: true };
+  const extremeThreshold = 0.0005; 
+
+  if (fundingRate > extremeThreshold) {
+    if (direction === 'LONG') {
+      return { allowed: false, reason: 'fundingRateTooHighLongsOvercrowded' };
+    }
+  } else if (fundingRate < -extremeThreshold) {
+    if (direction === 'SHORT') {
+      return { allowed: false, reason: 'fundingRateTooLowShortsOvercrowded' };
+    }
+  }
+  return { allowed: true };
+}
 }
 
 function checkDailyProfitTarget() {
@@ -2070,6 +2085,12 @@ async function scanMarket() {
         const { bosBullish, bosBearish } = checkSwingBreakOfStructure(raw15m, config.BOS_LOOKBACK);
         const relativeVolume = calculateRelativeVolume(raw15m, 20);
         const fundingRate = futuresData ? futuresData.fundingRate : 0;
+
+        // --- HIER DEN SENTIMENT-FILTER EINBINDEN ---
+const sentimentCheck = evaluateFundingAndSentiment(fundingRate, direction);
+if (!sentimentCheck.allowed) {
+  continue; // Überspringe den Coin, wenn der Markt in dieser Richtung überhitzt ist
+}
 
         const gateParams = {
           trend4h, trend1h, trend15m, btcTrend, adx, hurst, bosBullish, bosBearish,
