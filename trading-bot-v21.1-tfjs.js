@@ -2692,6 +2692,17 @@ process.on('unhandledRejection', async (reason) => {
   logger.error(`💥 Unhandled Rejection: ${reason}`);
   await gracefulShutdown('unhandledRejection');
 });
+
+// Dummy-Funktion, um den "evaluateFundingAndSentiment is not defined" Fehler zu beheben
+async function evaluateFundingAndSentiment(symbol, marketData) {
+  // Gibt standardmäßig ein neutrales Sentiment zurück, falls die echte Funktion fehlt
+  return {
+    sentiment: 'NEUTRAL',
+    fundingRate: 0.01,
+    multiplier: 1.0
+  };
+}
+
 // ==========================================
 // 19. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
