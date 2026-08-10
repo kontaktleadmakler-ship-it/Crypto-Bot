@@ -2098,7 +2098,8 @@ if (!sentimentCheck.allowed) {
           adaptiveADX, adaptiveVolume
         };
 
-      let direction = null;
+    // Vollständig abgesicherter Block für die Richtungs-Erkennung
+var direction = null;
 const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
 let primaryFail = evaluateDirectionGates(primaryDir, gateParams);
 
@@ -2118,9 +2119,8 @@ if (!primaryFail) {
   scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
 }
 
-if (direction) {
+if (direction !== null) {
   const cooldownKey = `${symbol}_${direction}`;
-  // ---- FIX: Atomare Cooldown-Prüfung ----
   const lastSent = await getAlertTimestamp(cooldownKey);
   if (Date.now() - lastSent <= 2 * 3_600_000) {
     scanStats.cooldownActive++;
@@ -2136,7 +2136,6 @@ if (direction) {
     adx, rsi, relativeVolume, trend1h, trend4h, direction
   });
 
-  // Orderbook wird vor der ML-Entscheidung geladen, damit es als Feature dienen kann.
   let orderBookImbalance = null;
   if (config.ENABLE_ORDERBOOK_ANALYSIS && signalScore > 60) {
     orderBookImbalance = await fetchOrderBookImbalance(symbol).catch(() => null);
