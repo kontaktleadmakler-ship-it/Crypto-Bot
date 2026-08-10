@@ -322,7 +322,7 @@ const STRATEGY_PROFILES = {
     RSI_SHORT_MAX: 60,
     MIN_RELATIVE_VOLUME: 0.8,
     BOS_LOOKBACK: 4,
-    TREND_EMA_FAST_15M: 20,
+    TREND_EMA_FAST_15M: 20,        
     TREND_EMA_SLOW_15M: 50,
   },
   strict: {
@@ -2692,9 +2692,8 @@ process.on('unhandledRejection', async (reason) => {
   logger.error(`💥 Unhandled Rejection: ${reason}`);
   await gracefulShutdown('unhandledRejection');
 });
-
 // ==========================================
-// 19. BOT START (ASYNCHRON & ABSICHERT)
+// 19. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
   logger.info('🚀 Starte Trading Bot v21.1 ULTIMATE TFJS (Full Features, TensorFlow.js ML & Hurst Filter)...');
@@ -2703,9 +2702,26 @@ process.on('unhandledRejection', async (reason) => {
   await loadSignalMLModel();
   if (!isModelTrained) await trainSignalMLModel(true);
   pollTelegramUpdates();
-  if (isDbConnected) {
-    scanMarket();
-  } else {
-    logger.warn('⚠️ Erster Scan verzögert, warte auf DB-Reconnect...');
-  }
+
+  // Funktion für den wiederkehrenden Scan
+  const runScanCycle = async () => {
+    try {
+      if (isDbConnected) {
+        await scanMarket();
+      } else {
+        logger.warn('⚠️ Scan übersprungen, warte auf DB-Reconnect...');
+      }
+    } catch (error) {
+      logger.error(`Fehler im Scan-Zyklus: ${error.message}`);
+    }
+  };
+
+  // Erster sofortiger Scan
+  await runScanCycle();
+
+  // Ab jetzt alle X Minuten wiederholen (z.B. alle 5 Minuten = 300000 Millisekunden)
+  const SCAN_INTERVAL_MS = 5 * 60 * 1000; // Hier kannst du die Minuten anpassen (z.B. 5 oder 15)
+  setInterval(runScanCycle, SCAN_INTERVAL_MS);
+  
+  logger.info(`🔄 Bot-Dauerschleife aktiv. Nächster Scan in ${SCAN_INTERVAL_MS / 60000} Minuten.`);
 })();
