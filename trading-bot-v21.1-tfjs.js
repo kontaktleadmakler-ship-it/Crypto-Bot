@@ -2087,11 +2087,11 @@ async function scanMarket() {
         const fundingRate = futuresData ? futuresData.fundingRate : 0;
 
         // --- HIER DEN SENTIMENT-FILTER EINBINDEN ---
+// Statt continue; einfach return; verwenden, wenn es außerhalb einer Schleife steht
 const sentimentCheck = evaluateFundingAndSentiment(fundingRate, direction);
 if (!sentimentCheck.allowed) {
-  continue; // Überspringe den Coin, wenn der Markt in dieser Richtung überhitzt ist
+  return; 
 }
-
         const gateParams = {
           trend4h, trend1h, trend15m, btcTrend, adx, hurst, bosBullish, bosBearish,
           rsi, poc, vwap, currentPrice, macd, fundingRate, relativeVolume,
