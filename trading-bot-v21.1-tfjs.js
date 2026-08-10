@@ -809,8 +809,9 @@ async function isCoinDynamicallyBlacklisted(symbol) {
 
     if (recentTrades.length < 2) return false;
 
-    const consecutiveLosses = recentTrades.every(t => (t.pnlUSD || 0) < 0);
-    if (consecutiveLosses) {
+    // Behebung des Variablen-Shadowing: Umbenennung von consecutiveLosses zu recentConsecutiveLosses
+    const recentConsecutiveLosses = recentTrades.every(t => (t.pnlUSD || 0) < 0);
+    if (recentConsecutiveLosses) {
       const lastCloseTime = new Date(recentTrades[0].closeTime).getTime();
       const hoursSinceLoss = (Date.now() - lastCloseTime) / (1000 * 60 * 60);
 
@@ -1968,7 +1969,8 @@ async function scanMarket() {
     let adaptiveRisk = config.RISK_PERCENT;
     if (config.ENABLE_KELLY_SIZING) {
       const weekStats = await getPeriodPerformanceStats(7).catch(() => null);
-      if (weekStats && weekStats.totalTrades >= 5) {
+      // Erhöhung des Schwellenwerts auf mind. 20 Trades für statistische Stabilität
+      if (weekStats && weekStats.totalTrades >= 20) {
         adaptiveRisk = calculateKellyRisk(
           parseFloat(weekStats.winRate), 
           weekStats.avgWin, 
