@@ -2365,6 +2365,7 @@ async function handleTelegramCommand(chatId, text) {
       `/status - Gesamt-Status des Bots\n` +
       `/db - MongoDB Verbindungs-Check\n` +
       `/scanstats - Scan-Diagnose & Filter\n\n` +
+       /setpeak [Betrag] - Peak Capital manuell setzen (z. B. <code>/setpeak 12000</code>)
       `<b>⚙️ Parameter anpassen:</b>\n` +
       `/setcapital [Betrag] - Z.B. <code>/setcapital 15000</code>\n` +
       `/setleverage [1-100] - Z.B. <code>/setleverage 5</code>\n\n` +
