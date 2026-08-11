@@ -18,7 +18,7 @@
     "express": "^4.21.2",
     "mongodb": "^6.12.0",
     "node-cron": "^3.0.3",
-    "winston": "^3.17.0"
+    "winston": "^3.17.0",
     "@google/genai": "^0.1.1"
   }
 }
