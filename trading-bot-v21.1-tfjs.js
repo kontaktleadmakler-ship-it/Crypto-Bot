@@ -2492,6 +2492,9 @@ async function handleTelegramCommand(chatId, text) {
       `/db - MongoDB Verbindungs-Check\n` +
       `/scanstats - Scan-Diagnose & Filter\n` +
       `/logs - Letzte 15 System-Logs anzeigen\n\n` +
+      `<b>🤖 Künstliche Intelligenz (Gemini):</b>\n` +
+      `/ki [Frage] - Marktanalyse per KI abfragen\n` +
+      `/report - Automatisches KI-Trading Briefing\n\n` +
       `<b>🚨 Trade-Steuerung:</b>\n` +
       `/close [Symbol] - Einzelnen Trade schließen (z. B. <code>/close BTC-USDT</code>)\n` +
       `/closeall - ALLE aktiven Trades sofort schließen\n` +
@@ -2513,6 +2516,34 @@ async function handleTelegramCommand(chatId, text) {
     return;
   }
 
+  if (command === '/ki' || command === '/gemini') {
+    const promptText = args.join(' ') || 'Wie schätzt du die allgemeine Lage von Bitcoin und dem Kryptomarkt heute ein? Antworte kurz und präzise.';
+    
+    await sendTelegramReply(chatId, `🧠 <i>Frage Gemini nach einer Marktanalyse...</i>`);
+    
+    try {
+      const { GoogleGenAI } = require('@google/genai');
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: promptText,
+      });
+
+      const aiAnswer = response.text || 'Keine Antwort erhalten.';
+      
+      let report = `🤖 <b>GEMINI MARKTANALYSE</b>\n`;
+      report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+      report += `${escapeHtml(aiAnswer)}`;
+      
+      await sendTelegramReply(chatId, report);
+    } catch (e) {
+      logger.error(`Gemini API Fehler: ${e.message}`);
+      await sendTelegramReply(chatId, `⚠️ <b>Gemini ist momentan überlastet (503 Service Unavailable).</b>\nBitte versuche es in ein paar Minuten noch einmal!`);
+    }
+    return;
+  }
+
   if (command === '/report' || command === '/briefing') {
     await sendTelegramReply(chatId, `📊 <i>Sammle Marktdaten und erstelle KI-Briefing...</i>`);
     
@@ -2520,13 +2551,12 @@ async function handleTelegramCommand(chatId, text) {
       const { GoogleGenAI } = require('@google/genai');
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       
-      // Relevante Live-Daten des Bots zusammenfassen
       const currentEquity = config.CAPITAL_USD + dailyNetPnL;
       const openTradesCount = activeTrades.size;
       
       let tradesSummary = 'Keine offene Trades.';
       if (openTradesCount > 0) {
-        tradesSummary = [...activeTrades.entries()].map(([sym, t]) => `${sym} (${t: t.direction}, Entry: ${t.entry})`).join(', ');
+        tradesSummary = [...activeTrades.entries()].map(([sym, t]) => `${sym} (${t.direction}, Entry: ${t.entry})`).join(', ');
       }
 
       const prompt = `Erstelle einen professionellen Trading-Lagebericht basierend auf diesen Daten:
@@ -2552,35 +2582,6 @@ async function handleTelegramCommand(chatId, text) {
     } catch (e) {
       logger.error(`Gemini Briefing Fehler: ${e.message}`);
       await sendTelegramReply(chatId, `⚠️ <b>Briefing fehlgeschlagen:</b> Die KI ist momentan überlastet oder nicht erreichbar.`);
-    }
-    return;
-  }
-
-  if (command === '/ki' || command === '/gemini') {
-    const promptText = args.join(' ') || 'Wie schätzt du die allgemeine Lage von Bitcoin und dem Kryptomarkt heute ein? Antworte kurz und präzise.';
-    
-    await sendTelegramReply(chatId, `🧠 <i>Frage Gemini nach einer Marktanalyse...</i>`);
-    
-    try {
-      const { GoogleGenAI } = require('@google/genai');
-      // Nutzt automatisch den Key, den wir gerade bei Render hinterlegt haben
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: promptText,
-      });
-
-      const aiAnswer = response.text || 'Keine Antwort erhalten.';
-      
-      let report = `🤖 <b>GEMINI MARKTANALYSE</b>\n`;
-      report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
-      report += `${escapeHtml(aiAnswer)}`;
-      
-      await sendTelegramReply(chatId, report);
-  } catch (e) {
-      logger.error(`Gemini API Fehler: ${e.message}`);
-      await sendTelegramReply(chatId, `⚠️ <b>Gemini ist momentan überlastet (503 Service Unavailable).</b>\nBitte versuche es in ein paar Minuten noch einmal!`);
     }
     return;
   }
@@ -3205,7 +3206,6 @@ app.get('/metrics', (req, res) => {
   res.send(metrics);
 });
 
-// NEU: Integrierter Web-Backtest Endpoint
 app.get('/backtest', async (req, res) => {
   try {
     const symbol = req.query.symbol || 'BTC-USDT';
