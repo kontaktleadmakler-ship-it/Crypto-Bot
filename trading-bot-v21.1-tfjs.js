@@ -2365,9 +2365,9 @@ async function handleTelegramCommand(chatId, text) {
       `/status - Gesamt-Status des Bots\n` +
       `/db - MongoDB Verbindungs-Check\n` +
       `/scanstats - Scan-Diagnose & Filter\n\n` +
-       /setpeak [Betrag] - Peak Capital manuell setzen (z. B. <code>/setpeak 12000</code>)
       `<b>⚙️ Parameter anpassen:</b>\n` +
       `/setcapital [Betrag] - Z.B. <code>/setcapital 15000</code>\n` +
+      `/setpeak [Betrag] - Peak Capital setzen (z. B. <code>/setpeak 12000</code>)\n` +
       `/setleverage [1-100] - Z.B. <code>/setleverage 5</code>\n\n` +
       `<b>🎮 Steuerung:</b>\n` +
       `/pause - Bot pausieren\n` +
@@ -2421,6 +2421,27 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, 
       `✅ <b>Kapital erfolgreich angepasst!</b>\n` +
       `• Neues Startkapital: <b>$${newCapital.toFixed(2)}</b>\n` +
+      `• Neues Peak Capital: <b>$${peakCapital.toFixed(2)}</b>`
+    );
+    return;
+  }
+
+  if (command === '/setpeak' || command === '/setpeakcapital') {
+    if (!args[0]) {
+      await sendTelegramReply(chatId, `⚠️ Bitte gib einen Betrag an.\nBeispiel: <code>/setpeak 12000</code>`);
+      return;
+    }
+    const newPeak = parseFloat(args[0]);
+    if (isNaN(newPeak) || newPeak <= 0) {
+      await sendTelegramReply(chatId, `❌ Ungültiger Betrag: <b>${args[0]}</b>`);
+      return;
+    }
+
+    peakCapital = newPeak;
+    await persistPeakCapital();
+
+    await sendTelegramReply(chatId, 
+      `✅ <b>Peak Capital erfolgreich angepasst!</b>\n` +
       `• Neues Peak Capital: <b>$${peakCapital.toFixed(2)}</b>`
     );
     return;
