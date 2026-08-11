@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - ULTIMATE v21.2 FULL COMPLETE EDITION
+ * TRADING SIGNAL BOT - ULTIMATE v21.3 FULL COMPLETE EDITION
  * (Mit adaptivem TensorFlow.js ML, globaler Telegram-Queue, State-Persistenz & Hurst-Exponent)
  * ============================================================================
  */
@@ -1537,7 +1537,7 @@ async function checkRiskLevels() {
 }
 
 function formatScanStatsReport(stats) {
-  const lines = [`🔎 <b>SCAN-DIAGNOSE v21.2 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
+  const lines = [`🔎 <b>SCAN-DIAGNOSE v21.3 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
   lines.push(`Coins geprüft: ${stats.total} | Signale gesendet: ${stats.signalsSent}`);
   if (stats.avgSignalScore !== undefined) lines.push(`Ø Signal-Score: ${stats.avgSignalScore}/100`);
   lines.push(`Marktphase: ${currentMarketPhase}\n`);
@@ -1551,6 +1551,7 @@ function formatScanStatsReport(stats) {
   }
 
   const reasons = [];
+  if (stats.missingKlines) reasons.push(`Fehlende/Zu wenige Kerzen (missingKlines): ${stats.missingKlines}`);
   if (stats.skippedActiveTrade) reasons.push(`Offener Trade: ${stats.skippedActiveTrade}`);
   if (stats.skippedMaxSignals) reasons.push(`Max. Signale: ${stats.skippedMaxSignals}`);
   if (stats.skippedDynamicBlacklist) reasons.push(`KI-Erfahrung (Loss-Blocker): ${stats.skippedDynamicBlacklist}`);
@@ -1568,11 +1569,51 @@ function formatScanStatsReport(stats) {
   if (stats.correlationBlocked) reasons.push(`Korrelations-Limit: ${stats.correlationBlocked}`);
   if (stats.orderBookBlocked) reasons.push(`Orderbuch Imbalance: ${stats.orderBookBlocked}`);
   if (stats.spreadTooHigh) reasons.push(`Orderbuch Spread zu hoch: ${stats.spreadTooHigh}`);
+  if (stats.cooldownActive) reasons.push(`Signal-Cooldown aktiv: ${stats.cooldownActive}`);
+  if (stats.positionTooSmallForLot) reasons.push(`Position zu klein für Min-Lot: ${stats.positionTooSmallForLot}`);
 
   if (reasons.length > 0) {
     lines.push(`<b>Ausschlussgründe:</b>`);
     reasons.forEach(r => lines.push(`• ${r}`));
   }
+
+  // Summen-Integritätsprüfung zur Vermeidung blinder Flecken
+  const accountedFor = (stats.signalsSent || 0) +
+    (stats.missingKlines || 0) +
+    (stats.skippedActiveTrade || 0) +
+    (stats.skippedMaxSignals || 0) +
+    (stats.skippedDynamicBlacklist || 0) +
+    (stats.mlBlocked || 0) +
+    (stats.hurstBlocked || 0) +
+    (stats.adxTooLow || 0) +
+    (stats.marketChoppy || 0) +
+    (stats.noBOS || 0) +
+    (stats.rsiTooLow || 0) +
+    (stats.rsiTooHigh || 0) +
+    (stats.pocVwapFail || 0) +
+    (stats.macdFail || 0) +
+    (stats.fundingBlocked || 0) +
+    (stats.relVolTooLow || 0) +
+    (stats.correlationBlocked || 0) +
+    (stats.orderBookBlocked || 0) +
+    (stats.spreadTooHigh || 0) +
+    (stats.signalHistoryBlocked || 0) +
+    (stats.cooldownActive || 0) +
+    (stats.positionTooSmallForLot || 0) +
+    (stats.skippedDbDisconnected || 0) +
+    (stats.skippedMaxConcurrentTrades || 0) +
+    (stats.skippedDailyLossLimit || 0) +
+    (stats.skippedMaxSameDirection || 0) +
+    (stats.skippedExposureLimit || 0) +
+    (stats.skippedMaxDrawdown || 0) +
+    (stats.btcCounterTrendBlocked || 0) +
+    trendTotal;
+
+  const unaccounted = stats.total - accountedFor;
+  if (unaccounted > 0) {
+    lines.push(`\n⚠️ <b>Unklare Verwerfungen:</b> ${unaccounted} Coins`);
+  }
+
   return lines.join('\n');
 }
 
@@ -1872,9 +1913,6 @@ function evaluateDirectionGates(dir, p) {
   const trend1hOk = isLong ? p.trend1h === 'BULLISH' : p.trend1h === 'BEARISH';
   if (!trend1hOk) return 'trendMismatch1h';
 
-  // REGRESSION FIX: Der harte 15m-EMA-Trendblocker wurde entfernt. 
-  // Das 15m-Timing übernimmt exklusiver der Break of Structure (BOS), RSI & MACD-Histogramm.
-
   if (!config.ALLOW_COUNTER_BTC_TREND) {
     const against = (p.btcTrend === 'BEARISH' && isLong) || (p.btcTrend === 'BULLISH' && !isLong);
     if (against) return 'btcCounterTrendBlocked';
@@ -1934,7 +1972,7 @@ async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.2...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.3...`);
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
@@ -2302,7 +2340,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
-      `<b>🤖 TRADING BOT v21.2 ULTIMATE TFJS - BEFEHLE</b>\n` +
+      `<b>🤖 TRADING BOT v21.3 ULTIMATE TFJS - BEFEHLE</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
       `<b>📊 Performance & Status:</b>\n` +
       `/stats - Performance heute (UTC)\n` +
@@ -2397,7 +2435,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v21.2 ULTIMATE TFJS</b>`);
+    lines.push(`🤖 <b>BOT STATUS v21.3 ULTIMATE TFJS</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
@@ -2546,14 +2584,14 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v21.2 ULTIMATE TFJS | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v21.3 ULTIMATE TFJS | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 app.get('/health', (req, res) => {
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
   const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : '0';
   res.status(isDbConnected ? 200 : 503).json({
-    status: isDbConnected ? 'ok' : 'degraded', version: '21.2', dbConnected: isDbConnected,
+    status: isDbConnected ? 'ok' : 'degraded', version: '21.3', dbConnected: isDbConnected,
     isPaused, activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, currentEquity, peakCapital, drawdownPercent
   });
 });
@@ -2667,7 +2705,7 @@ process.on('unhandledRejection', async (reason) => {
 // 19. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v21.2 ULTIMATE TFJS (Full Features, TensorFlow.js ML & Hurst Filter)...');
+  logger.info('🚀 Starte Trading Bot v21.3 ULTIMATE TFJS (Full Features, TensorFlow.js ML & Hurst Filter)...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
