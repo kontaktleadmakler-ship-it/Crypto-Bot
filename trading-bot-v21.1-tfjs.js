@@ -2,7 +2,7 @@
  * ============================================================================
  * TRADING SIGNAL BOT - ULTIMATE v21.5 DYNAMIC FILTER ENGINE EDITION
  * (Mit adaptivem TensorFlow.js ML, globaler Telegram-Queue, State-Persistenz,
- *  Hurst-Exponent, Marktphasen-Logging & Dynamic Filter Control System)
+ *  Hurst-Exponent, Marktphasen-Logging, Dynamic Filter Control & Web-Backtest)
  * ============================================================================
  */
 
@@ -13,6 +13,7 @@ const axios = require('axios');
 const { MongoClient } = require('mongodb');
 const winston = require('winston');
 const { TensorFlowSignalModel } = require('./ml-engine');
+const { runBacktest, buildConfig: buildBacktestConfig } = require('./backtest-engine');
 
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
@@ -71,16 +72,6 @@ const manualBlacklist = new Set();
 // ==========================================
 // 2. FILTER REGISTRY & ZENTRALE KONFIGURATION
 // ==========================================
-/**
- * Jeder Filter definiert:
- * - configKey: Zugehöriges Attribut im `config`-Objekt
- * - name: Lesbare Bezeichnung
- * - default: Basis-Standardwert für Resets
- * - type: 'numeric' oder 'boolean'
- * - step: Schrittweite bei /filter soft | hard
- * - direction: 'higher_is_harder' (z.B. ADX) oder 'lower_is_harder' (z.B. CHOP)
- * - min / max: Hard Limits zum Schutz vor extremen Werten
- */
 const FILTER_REGISTRY = {
   hurst: { configKey: 'MIN_HURST_EXPONENT', name: 'Hurst Exponent', default: 0.52, type: 'numeric', step: 0.02, direction: 'higher_is_harder', min: 0.0, max: 0.95 },
   adx:   { configKey: 'ADX_MIN',            name: 'ADX Minimum',    default: 20,   type: 'numeric', step: 2.0,  direction: 'higher_is_harder', min: 0,   max: 60 },
@@ -93,7 +84,6 @@ const FILTER_REGISTRY = {
   btctrend:      { configKey: 'ALLOW_COUNTER_BTC_TREND', name: 'Gegen-BTC-Trend', default: false, type: 'boolean' }
 };
 
-// Speichert Deaktivierungen (z.B. filterState.hurst.enabled = false)
 const filterState = {};
 Object.keys(FILTER_REGISTRY).forEach(key => {
   filterState[key] = { enabled: true };
@@ -728,7 +718,6 @@ function startLockHeartbeat(instanceId) {
   }, 60_000);
 }
 
-// Persistenz für Filter-Anpassungen
 async function loadPersistedFilterState() {
   if (!botStateCollection) return;
   try {
@@ -2028,45 +2017,37 @@ async function asyncPool(concurrency, items, iteratorFn) {
 function evaluateDirectionGates(dir, p) {
   const isLong = dir === 'LONG';
 
-  // Dynamic Gate 1: 4H Trend Check
   if (filterState.trend4h.enabled && config.REQUIRE_4H_TREND) {
     const trendOk4h = isLong ? p.trend4h === 'BULLISH' : p.trend4h === 'BEARISH';
     if (!trendOk4h) return 'trendMismatch4h';
   }
 
-  // Gate 2: 1H Trend Check (Standard)
   const trend1hOk = isLong ? p.trend1h === 'BULLISH' : p.trend1h === 'BEARISH';
   if (!trend1hOk) return 'trendMismatch1h';
 
-  // Dynamic Gate 3: BTC Trend Alignment
   if (filterState.btctrend.enabled && !config.ALLOW_COUNTER_BTC_TREND) {
     const against = (p.btcTrend === 'BEARISH' && isLong) || (p.btcTrend === 'BULLISH' && !isLong);
     if (against) return 'btcCounterTrendBlocked';
   }
 
-  // Dynamic Gate 4: ADX Minimum
   if (filterState.adx.enabled) {
     const effectiveADX = p.adaptiveADX || config.ADX_MIN;
     if (p.adx < effectiveADX) return 'adxTooLow';
   }
 
-  // Dynamic Gate 5: Hurst Exponent (Trend-Stärke)
   if (filterState.hurst.enabled) {
     if (p.hurst < config.MIN_HURST_EXPONENT) return 'hurstBlocked';
   }
 
-  // Dynamic Gate 6: Choppiness Index
   if (filterState.chop.enabled) {
     if (p.chop && p.chop > config.MAX_CHOP_INDEX) return 'marketChoppy';
   }
 
-  // Dynamic Gate 7: Break of Structure (BOS)
   if (filterState.bos.enabled) {
     const bos = isLong ? p.bosBullish : p.bosBearish;
     if (!bos) return 'noBOS';
   }
 
-  // Dynamic Gates 8 & 9: RSI Limits
   if (isLong) {
     if (filterState.rsi_long_min.enabled && p.rsi < config.RSI_LONG_MIN) return 'rsiTooLow';
     if (p.rsi > config.RSI_LONG_MAX) return 'rsiTooHigh';
@@ -2075,19 +2056,15 @@ function evaluateDirectionGates(dir, p) {
     if (filterState.rsi_short_max.enabled && p.rsi > config.RSI_SHORT_MAX) return 'rsiTooHigh';
   }
 
-  // Gate 10: POC & VWAP Check
   const priceOk = p.poc && p.vwap && (isLong ? (p.currentPrice >= p.poc && p.currentPrice >= p.vwap) : (p.currentPrice <= p.poc && p.currentPrice <= p.vwap));
   if (!priceOk) return 'pocVwapFail';
 
-  // Gate 11: MACD Histogram Direction
   const macdOk = isLong ? p.macd.histogram >= 0 : p.macd.histogram <= 0;
   if (!macdOk) return 'macdFail';
 
-  // Gate 12: Funding Rates
   const fundingOk = isLong ? p.fundingRate <= config.MAX_FUNDING_RATE : p.fundingRate >= config.MIN_FUNDING_RATE;
   if (!fundingOk) return 'fundingBlocked';
 
-  // Dynamic Gate 13: Relatives Volumen
   if (filterState.relvol.enabled) {
     const effectiveVolume = p.adaptiveVolume || config.MIN_RELATIVE_VOLUME;
     if (effectiveVolume > 0 && p.relativeVolume < effectiveVolume) return 'relVolTooLow';
@@ -2536,9 +2513,6 @@ async function handleTelegramCommand(chatId, text) {
     return;
   }
 
-  // ==========================================
-  // DYNAMISCHE FILTER-BEFEHLE (/filters & /filter)
-  // ==========================================
   if (command === '/filters') {
     let msg = `<b>⚙️ DYNAMISCHE FILTER ÜBERSICHT</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
     Object.keys(FILTER_REGISTRY).forEach(key => {
@@ -2576,7 +2550,6 @@ async function handleTelegramCommand(chatId, text) {
       return;
     }
 
-    // Global Reset mit Sicherheitsabfrage
     if (subAction === 'reset' && (filterKey === 'all' || !filterKey)) {
       if (filterKey === 'all' && confirmFlag === 'confirm') {
         Object.keys(FILTER_REGISTRY).forEach(k => {
@@ -2664,9 +2637,6 @@ async function handleTelegramCommand(chatId, text) {
     return;
   }
 
-  // ==========================================
-  // WEITERE BESTEHENDE TELEGRAM-BEFEHLE
-  // ==========================================
   if (command === '/db') {
     if (!isDbConnected) {
       await sendTelegramReply(chatId, `🔴 <b>MONGODB STATUS:</b> Getrennt / Keine Verbindung!`);
@@ -3097,7 +3067,7 @@ async function pollTelegramUpdates() {
 }
 
 // ==========================================
-// 18. EXPRESS ENDPOINTS & GRAFANA METRICS
+// 18. EXPRESS ENDPOINTS & WEB-BACKTEST
 // ==========================================
 const app = express();
 app.use(express.json());
@@ -3133,6 +3103,23 @@ app.get('/metrics', (req, res) => {
   ].join('\n');
   res.setHeader('Content-Type', 'text/plain');
   res.send(metrics);
+});
+
+// NEU: Integrierter Web-Backtest Endpoint
+app.get('/backtest', async (req, res) => {
+  try {
+    const symbol = req.query.symbol || 'BTC-USDT';
+    const days = Number(req.query.days || 30);
+    const cfg = buildBacktestConfig(process.env);
+    const useML = req.query.noml !== 'true';
+
+    logger.info(`🚀 Starte Web-Backtest für ${symbol} (${days} Tage)...`);
+    const result = await runBacktest({ symbol, days, cfg, useML, walkForward: true });
+    res.json(result);
+  } catch (e) {
+    logger.error(`❌ Web-Backtest Fehler: ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/trades', (req, res) => {
