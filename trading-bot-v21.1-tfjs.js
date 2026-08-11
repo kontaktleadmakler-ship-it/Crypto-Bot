@@ -1,7 +1,7 @@
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - ULTIMATE v21.3 FULL COMPLETE EDITION
- * (Mit adaptivem TensorFlow.js ML, globaler Telegram-Queue, State-Persistenz & Hurst-Exponent)
+ * TRADING SIGNAL BOT - ULTIMATE v21.4 FULL COMPLETE EDITION
+ * (Mit adaptivem TensorFlow.js ML, globaler Telegram-Queue, State-Persistenz, Hurst-Exponent & Marktphasen-Logging)
  * ============================================================================
  */
 
@@ -491,7 +491,7 @@ const client = new MongoClient(config.MONGODB_URI, {
   family: 4
 });
 
-let tradesCollection, closedTradesCollection, botStateCollection, lockCollection;
+let tradesCollection, closedTradesCollection, botStateCollection, lockCollection, marketPhaseLogsCollection;
 const activeTrades = new Map();
 let isDbConnected = false, dbReconnectInterval = null, pendingClosedTrades = [];
 const priceFailureCounts = new Map();
@@ -685,6 +685,7 @@ async function initDatabase() {
     closedTradesCollection = db.collection('closedTrades');
     botStateCollection = db.collection('botState');
     lockCollection = db.collection('locks');
+    marketPhaseLogsCollection = db.collection('marketPhaseLogs');
     isDbConnected = true;
     apiLatencyStats.record('mongodb', Date.now() - startTime);
     logger.info('✅ Datenbank erfolgreich verbunden');
@@ -693,6 +694,7 @@ async function initDatabase() {
       await tradesCollection.createIndex({ symbol: 1 }, { unique: true });
       await closedTradesCollection.createIndex({ closeTime: -1 });
       await closedTradesCollection.createIndex({ symbol: 1, closeTime: -1 });
+      await marketPhaseLogsCollection.createIndex({ timestamp: -1 });
     } catch (e) {}
 
     if (dbReconnectInterval) { clearInterval(dbReconnectInterval); dbReconnectInterval = null; }
@@ -1537,7 +1539,7 @@ async function checkRiskLevels() {
 }
 
 function formatScanStatsReport(stats) {
-  const lines = [`🔎 <b>SCAN-DIAGNOSE v21.3 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
+  const lines = [`🔎 <b>SCAN-DIAGNOSE v21.4 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
   lines.push(`Coins geprüft: ${stats.total} | Signale gesendet: ${stats.signalsSent}`);
   if (stats.avgSignalScore !== undefined) lines.push(`Ø Signal-Score: ${stats.avgSignalScore}/100`);
   lines.push(`Marktphase: ${currentMarketPhase}\n`);
@@ -1972,7 +1974,7 @@ async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.3...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.4...`);
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
@@ -2306,6 +2308,20 @@ async function scanMarket() {
     }
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
+    
+    // 📈 1. MARKTPHASEN LOGGING (MongoDB & Console Log)
+    if (marketPhaseLogsCollection && isDbConnected) {
+      await marketPhaseLogsCollection.insertOne({
+        timestamp: new Date(),
+        marketPhase: currentMarketPhase,
+        totalCoinsChecked: scanStats.total,
+        signalsSent: scanStats.signalsSent,
+        avgSignalScore: scanStats.avgSignalScore || 0,
+        reasons: scanStats
+      }).catch(err => logger.error(`[MARKET PHASE LOG ERROR] ${err.message}`));
+    }
+    logger.info(`📈 [PHASE-LOG] Phase: ${currentMarketPhase} | Gecheckt: ${scanStats.total} | Signale: ${signalsSent}`);
+
     lastScanStats = scanStats;
     scanCounter++;
 
@@ -2340,7 +2356,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
-      `<b>🤖 TRADING BOT v21.3 ULTIMATE TFJS - BEFEHLE</b>\n` +
+      `<b>🤖 TRADING BOT v21.4 ULTIMATE TFJS - BEFEHLE</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
       `<b>📊 Performance & Status:</b>\n` +
       `/stats - Performance heute (UTC)\n` +
@@ -2435,7 +2451,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v21.3 ULTIMATE TFJS</b>`);
+    lines.push(`🤖 <b>BOT STATUS v21.4 ULTIMATE TFJS</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
@@ -2584,14 +2600,14 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v21.3 ULTIMATE TFJS | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v21.4 ULTIMATE TFJS | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 app.get('/health', (req, res) => {
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
   const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : '0';
   res.status(isDbConnected ? 200 : 503).json({
-    status: isDbConnected ? 'ok' : 'degraded', version: '21.3', dbConnected: isDbConnected,
+    status: isDbConnected ? 'ok' : 'degraded', version: '21.4', dbConnected: isDbConnected,
     isPaused, activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, currentEquity, peakCapital, drawdownPercent
   });
 });
@@ -2705,7 +2721,7 @@ process.on('unhandledRejection', async (reason) => {
 // 19. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v21.3 ULTIMATE TFJS (Full Features, TensorFlow.js ML & Hurst Filter)...');
+  logger.info('🚀 Starte Trading Bot v21.4 ULTIMATE TFJS (Full Features, TensorFlow.js ML & Hurst Filter)...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
