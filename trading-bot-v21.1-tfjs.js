@@ -2508,8 +2508,12 @@ async function handleTelegramCommand(chatId, text) {
       `/showblacklist - Gesperrte Coins auflisten\n` +
       `/retrain - TensorFlow.js KI neu trainieren\n\n` +
       `<b>🎮 System:</b>\n` +
-      `/pause | /resume | /scan`
-       if (command === '/backtest') {
+      `/pause | /resume | /scan | /backtest [Symbol] [Days]`
+    );
+    return;
+  }
+
+  if (command === '/backtest') {
     const symbol = args[0] ? args[0].toUpperCase() : 'BTC-USDT';
     const days = args[1] ? Number(args[1]) : 30;
     
@@ -2534,9 +2538,6 @@ async function handleTelegramCommand(chatId, text) {
     } catch (e) {
       await sendTelegramReply(chatId, `❌ Backtest fehlgeschlagen: ${escapeHtml(e.message)}`);
     }
-    return;
-  }
-    );
     return;
   }
 
