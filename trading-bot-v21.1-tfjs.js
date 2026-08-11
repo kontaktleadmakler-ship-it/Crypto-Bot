@@ -1388,7 +1388,7 @@ async function fetchFuturesData(symbol) {
   return null;
 }
 
-async function fetchOrderBookImbalance(symbol) {
+async function fetchOrderBookMetrics(symbol) {
   try {
     const futuresSymbol = getFuturesSymbol(symbol);
     if (!futuresSymbol) return null;
@@ -1397,13 +1397,21 @@ async function fetchOrderBookImbalance(symbol) {
     if (res.data?.code === '200000' && res.data.data) {
       const bids = res.data.data.bids || [];
       const asks = res.data.data.asks || [];
+      if (bids.length === 0 || asks.length === 0) return { spreadPct: 0, bidAskRatio: 1 };
+      
+      const bestBid = parseFloat(bids[0][0]);
+      const bestAsk = parseFloat(asks[0][0]);
+      const spreadPct = bestBid > 0 ? ((bestAsk - bestBid) / bestBid) * 100 : 0;
+
       const depth = config.ORDERBOOK_DEPTH_LEVELS || 10;
       const bidVolume = bids.slice(0, depth).reduce((sum, [_, size]) => sum + parseFloat(size || 0), 0);
       const askVolume = asks.slice(0, depth).reduce((sum, [_, size]) => sum + parseFloat(size || 0), 0);
-      return askVolume > 0 ? bidVolume / askVolume : 1;
+      const bidAskRatio = askVolume > 0 ? bidVolume / askVolume : 1;
+
+      return { spreadPct, bidAskRatio };
     }
   } catch (e) {}
-  return null;
+  return { spreadPct: 0, bidAskRatio: 1 };
 }
 
 const contractSpecsCache = new Map();
@@ -2212,6 +2220,7 @@ async function scanMarket() {
         }
 
         const futuresData = await fetchFuturesData(symbol).catch(() => null);
+        const orderBookMetrics = await fetchOrderBookMetrics(symbol).catch(() => ({ spreadPct: 0, bidAskRatio: 1 }));
 
         const closes4h = raw4h ? raw4h.map(c => c.close) : [];
         const closes1h = raw1h.map(c => c.close);
@@ -2285,15 +2294,11 @@ async function scanMarket() {
             adx, rsi, relativeVolume, trend1h, trend4h, direction
           });
 
-          let orderBookImbalance = null;
           if (config.ENABLE_ORDERBOOK_ANALYSIS && signalScore > 60) {
-            orderBookImbalance = await fetchOrderBookImbalance(symbol).catch(() => null);
-            if (orderBookImbalance !== null) {
-              const obOk = direction === 'LONG' ? orderBookImbalance > 0.9 : orderBookImbalance < 1.1;
-              if (!obOk) {
-                scanStats.orderBookBlocked++;
-                return;
-              }
+            const obOk = direction === 'LONG' ? orderBookMetrics.bidAskRatio > 0.9 : orderBookMetrics.bidAskRatio < 1.1;
+            if (!obOk) {
+              scanStats.orderBookBlocked++;
+              return;
             }
           }
 
@@ -2308,7 +2313,9 @@ async function scanMarket() {
             fundingRate, openInterest: futuresData?.openInterest || 0,
             trend4h, trend1h, trend15m, btcTrend, direction,
             marketPhase: currentMarketPhase,
-            orderBookImbalance
+            orderBookImbalance: orderBookMetrics.bidAskRatio,
+            spreadPct: orderBookMetrics.spreadPct,
+            volatilityRatio: btcATR > 0 ? atr / btcATR : 1
           });
 
           const mlPrediction = predictSignalSuccess(mlFeatures);
@@ -2394,7 +2401,9 @@ async function scanMarket() {
             pocDistancePctAtEntry: pocDistancePct,
             vwapDistancePctAtEntry: vwapDistancePct,
             atrPctAtEntry: atrPct,
-            orderBookImbalanceAtEntry: orderBookImbalance,
+            orderBookImbalanceAtEntry: orderBookMetrics.bidAskRatio,
+            spreadPctAtEntry: orderBookMetrics.spreadPct,
+            volatilityRatioAtEntry: btcATR > 0 ? atr / btcATR : 1,
             mlProbabilityAtEntry: mlPrediction.probability,
             mlConfidenceAtEntry: mlPrediction.confidence,
             mlModelVersionAtEntry: mlModel.getStats().modelVersion || null
