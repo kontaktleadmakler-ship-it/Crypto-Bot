@@ -2513,6 +2513,34 @@ async function handleTelegramCommand(chatId, text) {
     return;
   }
 
+  if (command === '/ki' || command === '/gemini') {
+    const promptText = args.join(' ') || 'Wie schätzt du die allgemeine Lage von Bitcoin und dem Kryptomarkt heute ein? Antworte kurz und präzise.';
+    
+    await sendTelegramReply(chatId, `🧠 <i>Frage Gemini nach einer Marktanalyse...</i>`);
+    
+    try {
+      const { GoogleGenAI } = require('@google/genai');
+      // Nutzt automatisch den Key, den wir gerade bei Render hinterlegt haben
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: promptText,
+      });
+
+      const aiAnswer = response.text || 'Keine Antwort erhalten.';
+      
+      let report = `🤖 <b>GEMINI MARKTANALYSE</b>\n`;
+      report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+      report += `${escapeHtml(aiAnswer)}`;
+      
+      await sendTelegramReply(chatId, report);
+    } catch (e) {
+      await sendTelegramReply(chatId, `❌ Fehler bei der KI-Abfrage: ${escapeHtml(e.message)}`);
+    }
+    return;
+  }
+
   if (command === '/backtest') {
     const symbol = args[0] ? args[0].toUpperCase() : 'BTC-USDT';
     const days = args[1] ? Number(args[1]) : 30;
