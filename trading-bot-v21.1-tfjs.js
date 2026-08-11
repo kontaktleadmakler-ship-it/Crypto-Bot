@@ -2509,6 +2509,33 @@ async function handleTelegramCommand(chatId, text) {
       `/retrain - TensorFlow.js KI neu trainieren\n\n` +
       `<b>🎮 System:</b>\n` +
       `/pause | /resume | /scan`
+       if (command === '/backtest') {
+    const symbol = args[0] ? args[0].toUpperCase() : 'BTC-USDT';
+    const days = args[1] ? Number(args[1]) : 30;
+    
+    await sendTelegramReply(chatId, `🔄 Starte Backtest für ${symbol} (${days} Tage)... Bitte einen Moment Geduld.`);
+    
+    try {
+      const cfg = buildBacktestConfig(process.env);
+      const result = await runBacktest({ symbol, days, cfg, useML: true, walkForward: true });
+      const m = result.metrics;
+      
+      const emoji = m.netProfit >= 0 ? '🟢' : '🔴';
+      let report = `📊 <b>BACKTEST ERGEBNIS (${result.symbol} | ${result.days} Tage)</b>\n`;
+      report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+      report += `${emoji} <b>Net Profit: $${m.netProfit.toFixed(2)} (${m.returnPct.toFixed(2)}%)</b>\n`;
+      report += `• Ausgeführte Trades: ${result.trades} (Win-Rate: ${m.winRate.toFixed(2)}%)\n`;
+      report += `• Profit Factor: ${Number.isFinite(m.profitFactor) ? m.profitFactor.toFixed(2) : '∞'}\n`;
+      report += `• Max Drawdown: ${m.maxDrawdownPct.toFixed(2)}%\n`;
+      report += `• Sharpe Ratio: ${m.sharpe.toFixed(2)}\n`;
+      report += `• ML Retrains: ${result.mlRetrains} | Blocked: ${result.mlBlocked}`;
+      
+      await sendTelegramReply(chatId, report);
+    } catch (e) {
+      await sendTelegramReply(chatId, `❌ Backtest fehlgeschlagen: ${escapeHtml(e.message)}`);
+    }
+    return;
+  }
     );
     return;
   }
