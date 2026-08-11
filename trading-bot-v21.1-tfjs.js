@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - ULTIMATE v21.1 FULL COMPLETE EDITION
+ * TRADING SIGNAL BOT - ULTIMATE v21.2 FULL COMPLETE EDITION
  * (Mit adaptivem TensorFlow.js ML, globaler Telegram-Queue, State-Persistenz & Hurst-Exponent)
  * ============================================================================
  */
@@ -35,7 +35,7 @@ let currentStreak = 0;
 let maxWinStreak = 0;
 let maxLossStreak = 0;
 
-let peakCapital = 100;
+let peakCapital = parseFloat(process.env.CAPITAL_USD) || 10000;
 let dailyNetPnL = 0;
 let consecutiveLosses = 0;
 
@@ -355,7 +355,7 @@ const config = {
   
   CAPITAL_USD: parseFloat(process.env.CAPITAL_USD) || 10000,
   RISK_PERCENT: parseFloat(process.env.RISK_PERCENT) || 0.75,
-  TOP_COIN_LIMIT: parseInt(process.env.TOP_COIN_LIMIT, 10) || 150,
+  TOP_COIN_LIMIT: parseInt(process.env.TOP_COIN_LIMIT, 10) || 250,
   MAX_SIGNALS_PER_SCAN: parseInt(process.env.MAX_SIGNALS_PER_SCAN, 10) || 5,
   MAX_CONCURRENT_TRADES: parseInt(process.env.MAX_CONCURRENT_TRADES, 10) || 3,
   MAX_DAILY_LOSS_USD: parseFloat(process.env.MAX_DAILY_LOSS_USD) || 250,
@@ -809,8 +809,8 @@ async function isCoinDynamicallyBlacklisted(symbol) {
 
     if (recentTrades.length < 2) return false;
 
-    const consecutiveLosses = recentTrades.every(t => (t.pnlUSD || 0) < 0);
-    if (consecutiveLosses) {
+    const recentConsecutiveLosses = recentTrades.every(t => (t.pnlUSD || 0) < 0);
+    if (recentConsecutiveLosses) {
       const lastCloseTime = new Date(recentTrades[0].closeTime).getTime();
       const hoursSinceLoss = (Date.now() - lastCloseTime) / (1000 * 60 * 60);
 
@@ -854,13 +854,12 @@ function checkGlobalDrawdown(currentEquity) {
 
 async function evaluateFundingAndSentiment(fundingRate, direction) {
   if (fundingRate === null || fundingRate === undefined) return { allowed: true };
-  const extremeThreshold = 0.0005; 
-
-  if (fundingRate > extremeThreshold) {
+  
+  if (fundingRate > config.MAX_FUNDING_RATE) {
     if (direction === 'LONG') {
       return { allowed: false, reason: 'fundingRateTooHighLongsOvercrowded' };
     }
-  } else if (fundingRate < -extremeThreshold) {
+  } else if (fundingRate < config.MIN_FUNDING_RATE) {
     if (direction === 'SHORT') {
       return { allowed: false, reason: 'fundingRateTooLowShortsOvercrowded' };
     }
@@ -1538,15 +1537,14 @@ async function checkRiskLevels() {
 }
 
 function formatScanStatsReport(stats) {
-  const lines = [`🔎 <b>SCAN-DIAGNOSE v20.8 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
+  const lines = [`🔎 <b>SCAN-DIAGNOSE v21.2 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
   lines.push(`Coins geprüft: ${stats.total} | Signale gesendet: ${stats.signalsSent}`);
   if (stats.avgSignalScore !== undefined) lines.push(`Ø Signal-Score: ${stats.avgSignalScore}/100`);
   lines.push(`Marktphase: ${currentMarketPhase}\n`);
 
-  const trendTotal = (stats.trendMismatch15m || 0) + (stats.trendMismatch1h || 0) + (stats.trendMismatch4h || 0) + (stats.trendMismatch || 0);
+  const trendTotal = (stats.trendMismatch1h || 0) + (stats.trendMismatch4h || 0) + (stats.trendMismatch || 0);
   if (trendTotal > 0) {
     lines.push(`<b>Trend-Filter (${trendTotal}):</b>`);
-    if (stats.trendMismatch15m) lines.push(`  • 15m Trend: ${stats.trendMismatch15m}`);
     if (stats.trendMismatch1h) lines.push(`  • 1h Trend: ${stats.trendMismatch1h}`);
     if (stats.trendMismatch4h) lines.push(`  • 4h Trend: ${stats.trendMismatch4h}`);
     lines.push('');
@@ -1874,8 +1872,8 @@ function evaluateDirectionGates(dir, p) {
   const trend1hOk = isLong ? p.trend1h === 'BULLISH' : p.trend1h === 'BEARISH';
   if (!trend1hOk) return 'trendMismatch1h';
 
-  const trend15mOk = isLong ? p.trend15m === 'BULLISH' : p.trend15m === 'BEARISH';
-  if (!trend15mOk) return 'trendMismatch15m';
+  // REGRESSION FIX: Der harte 15m-EMA-Trendblocker wurde entfernt. 
+  // Das 15m-Timing übernimmt exklusiver der Break of Structure (BOS), RSI & MACD-Histogramm.
 
   if (!config.ALLOW_COUNTER_BTC_TREND) {
     const against = (p.btcTrend === 'BEARISH' && isLong) || (p.btcTrend === 'BULLISH' && !isLong);
@@ -1921,7 +1919,7 @@ function createEmptyScanStats() {
     skippedActiveTrade: 0, skippedMaxSignals: 0, skippedDbDisconnected: 0,
     skippedMaxConcurrentTrades: 0, skippedDailyLossLimit: 0, skippedMaxSameDirection: 0,
     skippedExposureLimit: 0, skippedMaxDrawdown: 0, missingKlines: 0,
-    trendMismatch: 0, trendMismatch1h: 0, trendMismatch4h: 0, trendMismatch15m: 0,
+    trendMismatch: 0, trendMismatch1h: 0, trendMismatch4h: 0,
     btcCounterTrendBlocked: 0, adxTooLow: 0, hurstBlocked: 0, marketChoppy: 0, noBOS: 0, rsiOutOfRange: 0,
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
@@ -1936,7 +1934,7 @@ async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.1...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.2...`);
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
@@ -1968,7 +1966,7 @@ async function scanMarket() {
     let adaptiveRisk = config.RISK_PERCENT;
     if (config.ENABLE_KELLY_SIZING) {
       const weekStats = await getPeriodPerformanceStats(7).catch(() => null);
-      if (weekStats && weekStats.totalTrades >= 5) {
+      if (weekStats && weekStats.totalTrades >= 20) {
         adaptiveRisk = calculateKellyRisk(
           parseFloat(weekStats.winRate), 
           weekStats.avgWin, 
@@ -2304,7 +2302,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
-      `<b>🤖 TRADING BOT v21.0 ULTIMATE TFJS - BEFEHLE</b>\n` +
+      `<b>🤖 TRADING BOT v21.2 ULTIMATE TFJS - BEFEHLE</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
       `<b>📊 Performance & Status:</b>\n` +
       `/stats - Performance heute (UTC)\n` +
@@ -2399,7 +2397,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v21.0 ULTIMATE TFJS</b>`);
+    lines.push(`🤖 <b>BOT STATUS v21.2 ULTIMATE TFJS</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
@@ -2548,14 +2546,14 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v21.1 ULTIMATE TFJS | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v21.2 ULTIMATE TFJS | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 app.get('/health', (req, res) => {
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
   const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : '0';
   res.status(isDbConnected ? 200 : 503).json({
-    status: isDbConnected ? 'ok' : 'degraded', version: '21.1', dbConnected: isDbConnected,
+    status: isDbConnected ? 'ok' : 'degraded', version: '21.2', dbConnected: isDbConnected,
     isPaused, activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, currentEquity, peakCapital, drawdownPercent
   });
 });
@@ -2626,13 +2624,6 @@ const server = app.listen(config.PORT, '0.0.0.0', () => {
 const cronJobs = [];
 const intervalTimers = [];
 
-let isScanningInterval = false;
-cronJobs.push(cron.schedule('*/15 * * * *', async () => {
-  if (isScanningInterval) return;
-  isScanningInterval = true;
-  try { await scanMarket(); } finally { isScanningInterval = false; }
-}, { timezone: 'UTC' }));
-
 intervalTimers.push(setInterval(async () => { await checkActiveTrades(); }, config.FAST_TRACK_INTERVAL_SECONDS * 1000));
 intervalTimers.push(setInterval(() => { klinesCache.cleanup(config.CACHE_CLEANUP_MINUTES * 60 * 1000); }, config.CACHE_CLEANUP_MINUTES * 60 * 1000));
 
@@ -2676,13 +2667,8 @@ process.on('unhandledRejection', async (reason) => {
 // 19. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v21.1 ULTIMATE TFJS (Full Features, TensorFlow.js ML & Hurst Filter)...');
+  logger.info('🚀 Starte Trading Bot v21.2 ULTIMATE TFJS (Full Features, TensorFlow.js ML & Hurst Filter)...');
   
-  if (typeof isPaused !== 'undefined') isPaused = false;
-  if (typeof botPaused !== 'undefined') botPaused = false;
-  if (typeof peakCapital !== 'undefined') peakCapital = 100;
-  if (typeof startBalance !== 'undefined') startBalance = 100;
-
   await initDatabase();
   await loadFuturesContractSpecs();
   await loadSignalMLModel();
@@ -2691,9 +2677,6 @@ process.on('unhandledRejection', async (reason) => {
 
   const runScanCycle = async () => {
     try {
-      if (typeof isPaused !== 'undefined') isPaused = false;
-      if (typeof botPaused !== 'undefined') botPaused = false;
-
       if (isDbConnected) {
         await scanMarket();
       } else {
