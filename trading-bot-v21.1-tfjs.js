@@ -355,7 +355,7 @@ const config = {
   
   CAPITAL_USD: parseFloat(process.env.CAPITAL_USD) || 10000,
   RISK_PERCENT: parseFloat(process.env.RISK_PERCENT) || 0.75,
-  TOP_COIN_LIMIT: parseInt(process.env.TOP_COIN_LIMIT, 10) || 250,
+  TOP_COIN_LIMIT: parseInt(process.env.TOP_COIN_LIMIT, 10) || 150,
   MAX_SIGNALS_PER_SCAN: parseInt(process.env.MAX_SIGNALS_PER_SCAN, 10) || 5,
   MAX_CONCURRENT_TRADES: parseInt(process.env.MAX_CONCURRENT_TRADES, 10) || 3,
   MAX_DAILY_LOSS_USD: parseFloat(process.env.MAX_DAILY_LOSS_USD) || 250,
