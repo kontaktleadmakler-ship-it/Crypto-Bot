@@ -17,14 +17,19 @@ const { TensorFlowSignalModel } = require('./ml-engine');
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
 // ==========================================
+const { Writable } = require('stream');
+
 const recentLogs = [];
-const memoryLogTransport = new winston.transports.Stream({
-  stream: {
-    write: (message) => {
-      recentLogs.push(message.trim());
-      if (recentLogs.length > 50) recentLogs.shift();
-    }
+const memoryStream = new Writable({
+  write(chunk, encoding, callback) {
+    recentLogs.push(chunk.toString().trim());
+    if (recentLogs.length > 50) recentLogs.shift();
+    callback();
   }
+});
+
+const memoryLogTransport = new winston.transports.Stream({
+  stream: memoryStream
 });
 
 const logger = winston.createLogger({
