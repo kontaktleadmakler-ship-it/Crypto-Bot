@@ -6,11 +6,6 @@
  * Learns from completed trades only. The model predicts the probability that
  * a candidate setup would finish with positive net PnL under the bot's
  * existing execution/risk rules.
- *
- * Important: historical closed trades are the available labels. A real
- * 3-class LONG/SHORT/NO-TRADE model would require rejected-signal examples;
- * therefore this engine uses probability + thresholding instead of inventing
- * NO-TRADE labels.
  */
 
 const fs = require('fs');
@@ -29,6 +24,8 @@ const FEATURE_NAMES = [
   'vwapDistancePct',
   'fundingRate',
   'orderBookImbalance',
+  'spreadPct',
+  'volatilityRatio',
   'trend4h',
   'trend1h',
   'trend15m',
@@ -102,8 +99,6 @@ class TensorFlowSignalModel {
     const orderBook = data.orderBookImbalance == null ? 1 : finite(data.orderBookImbalance, 1);
     const fundingRate = finite(data.fundingRate, 0);
 
-    // Keep every live feature bounded. This prevents one bad API value from
-    // dominating the neural network before standardization.
     return [
       clamp(finite(data.adx, 20), 0, 100),
       clamp(finite(data.rsi, 50), 0, 100),
@@ -116,6 +111,8 @@ class TensorFlowSignalModel {
       clamp(finite(data.vwapDistancePct, 0), -25, 25),
       clamp(fundingRate, -0.05, 0.05),
       clamp(orderBook, 0.05, 20),
+      clamp(finite(data.spreadPct, 0), 0, 5),
+      clamp(finite(data.volatilityRatio, 1), 0.1, 10),
       trendValue(data.trend4h),
       trendValue(data.trend1h),
       trendValue(data.trend15m),
@@ -155,6 +152,8 @@ class TensorFlowSignalModel {
       vwapDistancePct,
       fundingRate: trade.fundingRateAtEntry,
       orderBookImbalance: trade.orderBookImbalanceAtEntry,
+      spreadPct: trade.spreadPctAtEntry,
+      volatilityRatio: trade.volatilityRatioAtEntry,
       trend4h: trade.trend4hAtEntry,
       trend1h: trade.trend1hAtEntry,
       trend15m: trade.trend15mAtEntry,
@@ -222,12 +221,10 @@ class TensorFlowSignalModel {
         return { trained: false, reason: 'insufficient-class-balance', samples: dataset.length };
       }
 
-      // Chronological split: older trades train, newer trades validate.
       const splitIndex = Math.max(1, Math.floor(dataset.length * 0.80));
       const trainSet = dataset.slice(0, splitIndex);
       const validationSet = dataset.slice(splitIndex);
 
-      // Scaler is fit ONLY on training data -> no validation leakage.
       const scaler = this.makeScaler(trainSet.map(x => x.features));
       const xTrain = this.scaleMatrix(trainSet.map(x => x.features), scaler);
       const yTrain = trainSet.map(x => x.label);
@@ -277,8 +274,6 @@ class TensorFlowSignalModel {
       const validationAccuracy = finite(evalAcc[0], 0);
       const validationLoss = finite(evalLoss[0], 0);
 
-      // Do not replace a good live model with an obviously poor validation model
-      // unless force=true or there is no existing model.
       const oldAccuracy = finite(this.stats.validationAccuracy, 0);
       if (!force && this.trained && validationAccuracy + 0.02 < oldAccuracy) {
         this.logger.warn(`🧠 [TensorFlow.js] Neues Modell verworfen: Val-Accuracy ${(validationAccuracy * 100).toFixed(1)}% vs. aktuell ${(oldAccuracy * 100).toFixed(1)}%.`);
