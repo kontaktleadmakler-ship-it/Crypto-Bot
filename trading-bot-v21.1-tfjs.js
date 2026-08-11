@@ -2535,8 +2535,9 @@ async function handleTelegramCommand(chatId, text) {
       report += `${escapeHtml(aiAnswer)}`;
       
       await sendTelegramReply(chatId, report);
-    } catch (e) {
-      await sendTelegramReply(chatId, `❌ Fehler bei der KI-Abfrage: ${escapeHtml(e.message)}`);
+  } catch (e) {
+      logger.error(`Gemini API Fehler: ${e.message}`);
+      await sendTelegramReply(chatId, `⚠️ <b>Gemini ist momentan überlastet (503 Service Unavailable).</b>\nBitte versuche es in ein paar Minuten noch einmal!`);
     }
     return;
   }
