@@ -2526,7 +2526,7 @@ async function handleTelegramCommand(chatId, text) {
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       
       const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.5-flash-lite',
         contents: promptText,
       });
 
@@ -2568,7 +2568,7 @@ async function handleTelegramCommand(chatId, text) {
       Analysiere das kurz, professionell und motivierend auf Deutsch.`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.5-flash-lite',
         contents: prompt,
       });
 
