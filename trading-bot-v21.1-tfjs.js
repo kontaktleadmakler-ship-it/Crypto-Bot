@@ -2513,6 +2513,49 @@ async function handleTelegramCommand(chatId, text) {
     return;
   }
 
+  if (command === '/report' || command === '/briefing') {
+    await sendTelegramReply(chatId, `📊 <i>Sammle Marktdaten und erstelle KI-Briefing...</i>`);
+    
+    try {
+      const { GoogleGenAI } = require('@google/genai');
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      
+      // Relevante Live-Daten des Bots zusammenfassen
+      const currentEquity = config.CAPITAL_USD + dailyNetPnL;
+      const openTradesCount = activeTrades.size;
+      
+      let tradesSummary = 'Keine offene Trades.';
+      if (openTradesCount > 0) {
+        tradesSummary = [...activeTrades.entries()].map(([sym, t]) => `${sym} (${t: t.direction}, Entry: ${t.entry})`).join(', ');
+      }
+
+      const prompt = `Erstelle einen professionellen Trading-Lagebericht basierend auf diesen Daten:
+      - Aktuelle Marktphase des Bots: ${currentMarketPhase}
+      - Heutige Netto-PnL: $${dailyNetPnL.toFixed(2)}
+      - Aktuelles Kapital: $${currentEquity.toFixed(2)}
+      - Offene Trades (${openTradesCount}): ${tradesSummary}
+      
+      Analysiere das kurz, professionell und motivierend auf Deutsch.`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: prompt,
+      });
+
+      const aiAnswer = response.text || 'Keine Analyse erhalten.';
+      
+      let report = `📈 <b>KI-TRADING BRIEFING</b>\n`;
+      report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+      report += `${escapeHtml(aiAnswer)}`;
+      
+      await sendTelegramReply(chatId, report);
+    } catch (e) {
+      logger.error(`Gemini Briefing Fehler: ${e.message}`);
+      await sendTelegramReply(chatId, `⚠️ <b>Briefing fehlgeschlagen:</b> Die KI ist momentan überlastet oder nicht erreichbar.`);
+    }
+    return;
+  }
+
   if (command === '/ki' || command === '/gemini') {
     const promptText = args.join(' ') || 'Wie schätzt du die allgemeine Lage von Bitcoin und dem Kryptomarkt heute ein? Antworte kurz und präzise.';
     
