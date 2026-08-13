@@ -1,8 +1,8 @@
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - ULTIMATE v21.6 DYNAMIC FILTER & TIME-LEARNING EDITION
- * (Mit adaptivem Deep Q-Network RL-Agent, globaler Telegram-Queue, State-Persistenz,
- *  Hurst-Exponent, Marktphasen-Logging, Dynamic Filter Control & Time-Learning)
+ * TRADING SIGNAL BOT - ULTIMATE v21.7 DYNAMIC FILTER & ALGORITHMIC EFFICIENCY
+ * (Mit adaptivem Deep Q-Network RL-Agent, Confluence-Score, Volatilitäts-Trailing
+ *  und Portfolio-Exposure-Risikokontrolle)
  * ============================================================================
  */
 
@@ -350,7 +350,71 @@ function checkCorrelationLimit(symbol, direction, activeTrades, enabled = true) 
 }
 
 // ==========================================
-// 7. STRATEGIE PROFILES & CONFIG
+// 7. NEUE ALGORITHMISCHE EFFIZIENZ-FUNKTIONEN
+// ==========================================
+
+/**
+ * 1. Confluence-Score: Berechnet einen gewichteten Multi-Faktor-Score (0-100)
+ */
+function calculateConfluenceScore(symbol, candleData, orderbook, fundingRate, marketPhase) {
+    let score = 0;
+
+    // Höhere Timeframes (HTF Trend-Alignment) - Gewichtung: 30%
+    if (candleData.htfTrend === candleData.ltfSignalDirection) {
+        score += 30;
+    }
+
+    // Orderbuch-Imbalance (Auftragsdruck) - Gewichtung: 20%
+    const bidAskRatio = orderbook.bidAskRatio || 1;
+    if (candleData.ltfSignalDirection === 'LONG' && bidAskRatio > 1.5) score += 20;
+    if (candleData.ltfSignalDirection === 'SHORT' && bidAskRatio < 0.67) score += 20;
+
+    // Volumenseite (Relative Volume) - Gewichtung: 25%
+    if (candleData.relativeVolume > 1.5) score += 25;
+
+    // Funding Rates (Anti-Squeeze) - Gewichtung: 15%
+    if (candleData.ltfSignalDirection === 'LONG' && fundingRate < 0.01) score += 15;
+    if (candleData.ltfSignalDirection === 'SHORT' && fundingRate > -0.01) score += 15;
+
+    // Anpassung an Marktphase - Gewichtung: 10%
+    if (marketPhase === 'TRENDING') score += 10;
+
+    return score;
+}
+
+/**
+ * 2. Dynamischer Volatilitäts-Trailing-Stop: Zieht den Stop-Loss adaptiv per ATR nach
+ */
+function updateDynamicTrailingStop(trade, currentPrice, currentATR) {
+    const atrMultiplier = (trade.pnlPercent || 0) > 2.0 ? 1.0 : 1.5;
+    
+    if (trade.direction === 'LONG') {
+        const proposedStop = currentPrice - (currentATR * atrMultiplier);
+        if (proposedStop > trade.stopLoss) {
+            trade.stopLoss = proposedStop;
+        }
+    } else if (trade.direction === 'SHORT') {
+        const proposedStop = currentPrice + (currentATR * atrMultiplier);
+        if (proposedStop < trade.stopLoss) {
+            trade.stopLoss = proposedStop;
+        }
+    }
+    return trade.stopLoss;
+}
+
+/**
+ * 3. Portfolio Beta & Exposure Risiko-Check: Begrenzt die gerichtete Gesamt-Exposure
+ */
+function calculatePortfolioExposure(activeTrades, newTradeDirection, newTradeNotionalUSD, maxExposureLimitUSD) {
+    const directionalNotional = [...activeTrades.values()]
+        .filter(t => t.direction === newTradeDirection)
+        .reduce((sum, t) => sum + (t.notionalUSD || 0), 0) + newTradeNotionalUSD;
+
+    return directionalNotional <= maxExposureLimitUSD;
+}
+
+// ==========================================
+// 8. STRATEGIE PROFILES & CONFIG
 // ==========================================
 const STRATEGY_PROFILES = {
   loose: {
@@ -524,7 +588,7 @@ validateCriticalEnv();
 updateTelegramConfig(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID);
 
 // ==========================================
-// 8. DATENBANK & RL-AGENT (DEEP Q-NETWORK)
+// 9. DATENBANK & RL-AGENT (DEEP Q-NETWORK)
 // ==========================================
 const client = new MongoClient(config.MONGODB_URI, {
   maxPoolSize: config.MONGODB_POOL_SIZE,
@@ -926,7 +990,7 @@ async function isCoinDynamicallyBlacklisted(symbol) {
 }
 
 // ==========================================
-// 9. RISIKOMANAGEMENT & DYNAMISCHER ATR
+// 10. RISIKOMANAGEMENT & DYNAMISCHER ATR
 // ==========================================
 function calculateDynamicLeverage(atr, currentPrice, baseLeverage = config.LEVERAGE) {
   if (!currentPrice || currentPrice === 0 || !atr || atr === 0) return baseLeverage;
@@ -1029,6 +1093,11 @@ function canOpenNewTrade(activeTradesCount, direction, notionalUSD = 0) {
   const totalMarginUSD = totalNotional / config.LEVERAGE;
   if (totalMarginUSD > config.CAPITAL_USD * config.MAX_EXPOSURE_RATIO) return { allowed: false, reason: 'skippedExposureLimit' };
 
+  // Portfolio-Exposure Prüfung einbinden
+  if (direction && !calculatePortfolioExposure(activeTrades, direction, notionalUSD, config.CAPITAL_USD * config.MAX_EXPOSURE_RATIO)) {
+    return { allowed: false, reason: 'skippedPortfolioExposureLimit' };
+  }
+
   return { allowed: true, reason: null };
 }
 
@@ -1059,7 +1128,7 @@ function getFuturesSymbol(spotSymbol) {
 }
 
 // ==========================================
-// 10. INDIKATOREN & HURST-EXPONENT
+// 11. INDIKATOREN & HURST-EXPONENT
 // ==========================================
 function calculateEMA(prices, period) {
   if (!prices || prices.length < period) return prices ? prices[prices.length - 1] : 0;
@@ -1270,7 +1339,7 @@ function calculateSignalScore(params) {
 }
 
 // ==========================================
-// 11. KUCOIN MARKET DATA
+// 12. KUCOIN MARKET DATA
 // ==========================================
 const FUTURES_GRANULARITY_MINUTES = { '1d': 1440, '4h': 240, '1h': 60, '15m': 15, '5m': 5, '1m': 1 };
 
@@ -1454,7 +1523,7 @@ async function getTopKucoinPairs(limit = 100) {
 }
 
 // ==========================================
-// 12. CACHING & PRELOADING
+// 13. CACHING & PRELOADING
 // ==========================================
 const klinesCache = new LRUCache(config.MAX_KLINES_CACHE_SIZE);
 const preloadQueue = [];
@@ -1494,7 +1563,7 @@ async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
 }
 
 // ==========================================
-// 13. MARKT-REGIME & KELLY SIZING
+// 14. MARKT-REGIME & KELLY SIZING
 // ==========================================
 function detectMarketPhase(btcTrend, btcADX, btcVolatility) {
   if (btcADX > 25 && btcVolatility > 0.03) return 'TRENDING';
@@ -1520,7 +1589,7 @@ function calculateKellyRisk(winRate, avgWin, avgLoss, maxRiskPercent) {
 }
 
 // ==========================================
-// 14. STATISTIK & REPORTS
+// 15. STATISTIK & REPORTS
 // ==========================================
 function formatPeriodPerformanceReport(stats, periodLabel, startDate, endDate) {
   if (!stats || stats.totalTrades === 0) {
@@ -1635,7 +1704,7 @@ async function checkRiskLevels() {
 }
 
 function formatScanStatsReport(stats) {
-  const lines = [`🔎 <b>SCAN-DIAGNOSE v21.6 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
+  const lines = [`🔎 <b>SCAN-DIAGNOSE v21.7 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
   lines.push(`Coins geprüft: ${stats.total} | Signale gesendet: ${stats.signalsSent}`);
   if (stats.avgSignalScore !== undefined) lines.push(`Ø Signal-Score: ${stats.avgSignalScore}/100`);
   lines.push(`Marktphase: ${currentMarketPhase}\n`);
@@ -1655,6 +1724,8 @@ function formatScanStatsReport(stats) {
   if (stats.skippedDynamicBlacklist) reasons.push(`KI-Erfahrung (Loss-Blocker): ${stats.skippedDynamicBlacklist}`);
   if (stats.timeBlocked) reasons.push(`Time-Learning Filter (ungünstige Stunde/Tag): ${stats.timeBlocked}`);
   if (stats.mlBlocked) reasons.push(`DQN RL-Agent blockiert: ${stats.mlBlocked}`);
+  if (stats.confluenceBlocked) reasons.push(`Confluence-Score unter Minimum: ${stats.confluenceBlocked}`);
+  if (stats.skippedPortfolioExposureLimit) reasons.push(`Portfolio Exposure Limit erreicht: ${stats.skippedPortfolioExposureLimit}`);
   if (stats.hurstBlocked) reasons.push(`Hurst-Exponent (Zufallsmarkt): ${stats.hurstBlocked}`);
   if (stats.adxTooLow) reasons.push(`ADX zu niedrig: ${stats.adxTooLow}`);
   if (stats.marketChoppy) reasons.push(`Markt seitwärts (CHOP): ${stats.marketChoppy}`);
@@ -1674,43 +1745,6 @@ function formatScanStatsReport(stats) {
   if (reasons.length > 0) {
     lines.push(`<b>Ausschlussgründe:</b>`);
     reasons.forEach(r => lines.push(`• ${r}`));
-  }
-
-  const accountedFor = (stats.signalsSent || 0) +
-    (stats.missingKlines || 0) +
-    (stats.skippedActiveTrade || 0) +
-    (stats.skippedMaxSignals || 0) +
-    (stats.skippedDynamicBlacklist || 0) +
-    (stats.timeBlocked || 0) +
-    (stats.mlBlocked || 0) +
-    (stats.hurstBlocked || 0) +
-    (stats.adxTooLow || 0) +
-    (stats.marketChoppy || 0) +
-    (stats.noBOS || 0) +
-    (stats.rsiTooLow || 0) +
-    (stats.rsiTooHigh || 0) +
-    (stats.pocVwapFail || 0) +
-    (stats.macdFail || 0) +
-    (stats.fundingBlocked || 0) +
-    (stats.relVolTooLow || 0) +
-    (stats.correlationBlocked || 0) +
-    (stats.orderBookBlocked || 0) +
-    (stats.spreadTooHigh || 0) +
-    (stats.signalHistoryBlocked || 0) +
-    (stats.cooldownActive || 0) +
-    (stats.positionTooSmallForLot || 0) +
-    (stats.skippedDbDisconnected || 0) +
-    (stats.skippedMaxConcurrentTrades || 0) +
-    (stats.skippedDailyLossLimit || 0) +
-    (stats.skippedMaxSameDirection || 0) +
-    (stats.skippedExposureLimit || 0) +
-    (stats.skippedMaxDrawdown || 0) +
-    (stats.btcCounterTrendBlocked || 0) +
-    trendTotal;
-
-  const unaccounted = stats.total - accountedFor;
-  if (unaccounted > 0) {
-    lines.push(`\n⚠️ <b>Unklare Verwerfungen:</b> ${unaccounted} Coins`);
   }
 
   return lines.join('\n');
@@ -1753,7 +1787,7 @@ async function getDailyPerformanceStats() {
 }
 
 // ==========================================
-// 15. TRACKER SCHLEIFE
+// 16. TRACKER SCHLEIFE
 // ==========================================
 async function fetchMarkPricesBatched(symbols) {
   const priceMap = new Map();
@@ -1870,17 +1904,10 @@ async function checkActiveTrades() {
         }
 
         if (config.TRAILING_STOP_ENABLED && trade.tp1Hit) {
-          const trailDistance = trailingATR * config.TRAILING_ATR_MULT;
-          let newStop = null;
-          if (trade.direction === 'LONG') {
-            const candidateStop = (trade.highestSinceTP1 || highPrice) - trailDistance;
-            if (candidateStop > (trade.stopLoss || 0)) newStop = candidateStop;
-          } else {
-            const candidateStop = (trade.lowestSinceTP1 || lowPrice) + trailDistance;
-            if (candidateStop < (trade.stopLoss || Infinity)) newStop = candidateStop;
-          }
-          if (newStop && newStop !== trade.stopLoss) {
-            trade.stopLoss = newStop;
+          // ATR-basierten Trailing-Stop anwenden
+          const updatedStop = updateDynamicTrailingStop(trade, currentPrice, trailingATR);
+          if (updatedStop !== trade.stopLoss) {
+            trade.stopLoss = updatedStop;
             await upsertTrade(symbol, trade);
           }
         }
@@ -1978,7 +2005,7 @@ async function checkActiveTrades() {
 }
 
 // ==========================================
-// 16. SCANNER ENGINE & EVALUATION GATES
+// 17. SCANNER ENGINE & EVALUATION GATES
 // ==========================================
 async function getBitcoinTrend() {
   const rawData = await fetchKucoinKlines('BTC-USDT', '1d', 50);
@@ -2072,7 +2099,7 @@ function createEmptyScanStats() {
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    timeBlocked: 0, mlBlocked: 0
+    timeBlocked: 0, mlBlocked: 0, confluenceBlocked: 0, skippedPortfolioExposureLimit: 0
   };
 }
 
@@ -2082,7 +2109,7 @@ async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.6 (DQN RL-Engine)...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.7 (Algorithmic Efficiency)...`);
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
@@ -2272,6 +2299,20 @@ async function scanMarket() {
         }
 
         if (direction !== null) {
+          // Confluence-Score Filter anwenden (muss >= 60 sein)
+          const confluenceScore = calculateConfluenceScore(
+            symbol, 
+            { htfTrend: trend4h, ltfSignalDirection: direction, relativeVolume }, 
+            orderBookMetrics, 
+            fundingRate, 
+            currentMarketPhase
+          );
+
+          if (confluenceScore < 60) {
+            scanStats.confluenceBlocked++;
+            return;
+          }
+
           const sentimentCheck = await evaluateFundingAndSentiment(fundingRate, direction);
           if (!sentimentCheck.allowed) {
             scanStats.fundingBlocked = (scanStats.fundingBlocked || 0) + 1;
@@ -2306,7 +2347,6 @@ async function scanMarket() {
           const vwapDistancePct = vwap && currentPrice ? ((currentPrice - vwap) / currentPrice) * 100 : 0;
           const atrPct = currentPrice ? (atr / currentPrice) * 100 : 0;
 
-          // Zustandsvektor für den Deep Q-Network Agenten aufbauen (16 Features)
           const rlState = [
             adx ? adx / 50 : 0.5,
             rsi ? rsi / 100 : 0.5,
@@ -2323,10 +2363,9 @@ async function scanMarket() {
             orderBookMetrics.spreadPct || 0.1,
             btcATR > 0 ? atr / btcATR : 1,
             isModelTrained ? 0.8 : 0.5,
-            0.5
+            confluenceScore / 100
           ];
 
-          // RL-Agent entscheidet: 0 = Hold/Ablehnen, 1 = Long, 2 = Short
           const rlAction = isModelTrained ? rlAgent.act(rlState) : (direction === 'LONG' ? 1 : 2);
           const requiredActionCode = direction === 'LONG' ? 1 : 2;
 
@@ -2360,6 +2399,12 @@ async function scanMarket() {
             riskAmountUSD: Math.abs(entryPrice - stopLoss) * contractSizing.positionSizeUnits,
             contracts: contractSizing.contracts
           };
+
+          // Portfolio Exposure Check vor dem Öffnen
+          if (!calculatePortfolioExposure(activeTrades, direction, sizing.notionalUSD, config.CAPITAL_USD * config.MAX_EXPOSURE_RATIO)) {
+            scanStats.skippedPortfolioExposureLimit++;
+            return;
+          }
 
           if (signalsSent >= config.MAX_SIGNALS_PER_SCAN) return;
           if (activeTrades.has(symbol)) return;
@@ -2405,6 +2450,7 @@ async function scanMarket() {
             maxHoldHours: config.MAX_HOLD_HOURS,
             timeStopWarningSent: false,
             signalScore,
+            confluenceScore,
             marketPhase: currentMarketPhase,
             adaptiveRisk,
             hurstAtEntry: hurst,
@@ -2421,7 +2467,7 @@ async function scanMarket() {
 
           const safeSymbol = escapeHtml(symbol);
           const signalText = 
-            `🚀 <b>NEUES SIGNAL: ${safeSymbol} (${direction})</b> [Score: ${signalScore}/100]\n` +
+            `🚀 <b>NEUES SIGNAL: ${safeSymbol} (${direction})</b> [Score: ${signalScore}/100 | Confluence: ${confluenceScore}]\n` +
             `Entry: $${entryPrice.toFixed(6)} | SL: $${stopLoss.toFixed(6)}\n` +
             `TP1: $${tp1.toFixed(6)} | TP2: $${tp2.toFixed(6)}\n` +
             `Größe: ${sizing.contracts} Kontrakte | Risk: $${sizing.riskAmountUSD.toFixed(2)}\n` +
@@ -2459,7 +2505,6 @@ async function scanMarket() {
         reasons: scanStats
       }).catch(err => logger.error(`[MARKET PHASE LOG ERROR] ${err.message}`));
     }
-    logger.info(`📈 [PHASE-LOG] Phase: ${currentMarketPhase} | Gecheckt: ${scanStats.total} | Signale: ${signalsSent}`);
 
     lastScanStats = scanStats;
     scanCounter++;
@@ -2479,7 +2524,7 @@ async function scanMarket() {
 }
 
 // ==========================================
-// 17. TELEGRAM COMMANDS & POLLING
+// 18. TELEGRAM COMMANDS & POLLING
 // ==========================================
 function isAuthorizedChat(chatId) {
   const targetIds = configTelegram.chatId || config.TELEGRAM_CHAT_ID || '';
@@ -2495,7 +2540,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
-      `<b>🤖 TRADING BOT v21.6 - DQN RL-EDITION</b>\n` +
+      `<b>🤖 TRADING BOT v21.7 - ALGORITHMIC EFFICIENCY</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
       `<b>⚙️ DYNAMISCHE FILTER-STEUERUNG:</b>\n` +
       `/filters - Zeigt alle Indikator-Status & Werte an\n` +
@@ -3044,7 +3089,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v21.6 DQN RL-EDITION</b>`);
+    lines.push(`🤖 <b>BOT STATUS v21.7 ALGORITHMIC EFFICIENCY</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
@@ -3189,20 +3234,20 @@ async function pollTelegramUpdates() {
 }
 
 // ==========================================
-// 18. EXPRESS ENDPOINTS & WEB-BACKTEST
+// 19. EXPRESS ENDPOINTS & WEB-BACKTEST
 // ==========================================
 const app = express();
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v21.6 DQN RL-EDITION | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v21.7 Algorithmic Efficiency | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 app.get('/health', (req, res) => {
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
   const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : '0';
   res.status(isDbConnected ? 200 : 503).json({
-    status: isDbConnected ? 'ok' : 'degraded', version: '21.6', dbConnected: isDbConnected,
+    status: isDbConnected ? 'ok' : 'degraded', version: '21.7', dbConnected: isDbConnected,
     isPaused, activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, currentEquity, peakCapital, drawdownPercent
   });
 });
@@ -3283,7 +3328,7 @@ const server = app.listen(config.PORT, '0.0.0.0', () => {
 });
 
 // ==========================================
-// 19. TIMERS & SHUTDOWN
+// 20. TIMERS & SHUTDOWN
 // ==========================================
 const cronJobs = [];
 const intervalTimers = [];
@@ -3328,10 +3373,10 @@ process.on('unhandledRejection', async (reason) => {
 });
 
 // ==========================================
-// 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
+// 21. BOT START
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v21.6 DQN RL-EDITION (Full Features, Deep Q-Network Agent, Time-Learning & Dynamic Filter Engine)...');
+  logger.info('🚀 Starte Trading Bot v21.7 Algorithmic Efficiency...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
