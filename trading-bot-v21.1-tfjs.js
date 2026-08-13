@@ -2,7 +2,7 @@
  * ============================================================================
  * TRADING SIGNAL BOT - ULTIMATE v21.6 DYNAMIC FILTER & TIME-LEARNING EDITION
  * (Mit adaptivem TensorFlow.js ML, globaler Telegram-Queue, State-Persistenz,
- *  Hurst-Exponent, Marktphasen-Logging, Dynamic Filter Control & Time-Learning)
+ *  Hurst-Exponent, Marktphasen-Logging, Dynamic Filter Control & Cross-Hedging)
  * ============================================================================
  */
 
@@ -13,6 +13,7 @@ const axios = require('axios');
 const { MongoClient } = require('mongodb');
 const winston = require('winston');
 const { TensorFlowSignalModel } = require('./ml-engine');
+const { HedgeManager } = require('./hedgeManager'); // <-- HedgeManager Modul eingebunden
 const { runBacktest, buildConfig: buildBacktestConfig } = require('./backtest-engine');
 
 // ==========================================
@@ -524,7 +525,7 @@ validateCriticalEnv();
 updateTelegramConfig(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID);
 
 // ==========================================
-// 8. DATENBANK & ADAPTIVES ML-MODELL
+// 8. DATENBANK & ADAPTIVES ML-MODELL & HEDGE
 // ==========================================
 const client = new MongoClient(config.MONGODB_URI, {
   maxPoolSize: config.MONGODB_POOL_SIZE,
@@ -553,6 +554,10 @@ const mlModel = new TensorFlowSignalModel({
   batchSize: config.ML_BATCH_SIZE,
   logger
 });
+
+// Initialisierung des HedgeManagers (ab -2.5% BTC-Drop wird gewarnt/gehedged)
+const hedgeManager = new HedgeManager({ logger, thresholdDropPct: -2.5 });
+
 let isModelTrained = false;
 let lastMLTrainingStats = null;
 
@@ -1777,7 +1782,7 @@ async function getDailyPerformanceStats() {
 }
 
 // ==========================================
-// 15. TRACKER SCHLEIFE
+// 15. TRACKER SCHLEIFE & CROSS-HEDGING
 // ==========================================
 async function fetchMarkPricesBatched(symbols) {
   const priceMap = new Map();
@@ -1818,6 +1823,22 @@ async function checkActiveTrades() {
   try {
     if (trackerTimeout) { clearTimeout(trackerTimeout); trackerTimeout = null; }
     lastTrackerCheckTime = Date.now();
+
+    // 🛡️ Cross-Hedging Check für Bitcoin ausführen
+    const btcMark = await fetchKucoinMarkPrice('BTC-USDT') || await fetchKucoinTickerPrice('BTC-USDT');
+    if (btcMark && activeTrades.size > 0) {
+      const hedgeEvaluation = await hedgeManager.evaluateHedgeNeed(activeTrades, btcMark);
+      if (hedgeEvaluation.shouldHedge) {
+        await sendDeduplicatedAlert(
+          'btc_hedge_flash_crash',
+          `🚨 <b>CROSS-HEDGING ALARM!</b>\n` +
+          `Bitcoin ist um <b>${hedgeEvaluation.dropPct.toFixed(2)}%</b> eingebrochen.\n` +
+          `<i>Empfehlung: Schutz-Short auf BTC öffnen oder Risiko der offenen Longs drosseln!</i>`,
+          600000
+        );
+      }
+    }
+
     if (activeTrades.size === 0) return;
 
     const symbols = [...activeTrades.keys()];
@@ -2148,7 +2169,6 @@ async function scanMarket() {
       }
     }
 
-    // Time-based Learning Filter Check
     let timeFilterBlocked = false;
     if (filterState.timetrend.enabled && config.ENABLE_TIME_FILTER) {
       const timeStats = await getTimeBasedAnalysis();
@@ -3352,7 +3372,7 @@ process.on('unhandledRejection', async (reason) => {
 // 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v21.6 ULTIMATE TFJS (Full Features, TensorFlow.js ML, Time-Learning Filter & Dynamic Filter Engine)...');
+  logger.info('🚀 Starte Trading Bot v21.6 ULTIMATE TFJS (Full Features, TensorFlow.js ML, Time-Learning Filter & Cross-Hedging)...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
