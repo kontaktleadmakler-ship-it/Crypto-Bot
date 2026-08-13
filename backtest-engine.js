@@ -192,3 +192,51 @@ async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.en
 }
 
 module.exports={runBacktest,fetchKucoinCandles,buildConfig,metrics};
+
+// Füge dies in backtest-engine.js ein oder ergänze es:
+
+async function optimizeHyperparameters(symbol, days, baseConfig) {
+  // Definition eines kleinen Suchraums (Grid Search)
+  const learningRates = [0.0001, 0.001, 0.01];
+  const atrMultipliers = [2.0, 2.3, 2.6];
+  const adxMins = [15, 20, 25];
+
+  let bestScore = -Infinity;
+  let bestParams = null;
+
+  console.log(`🔍 Starte Hyperparameter-Optimierung für ${symbol}...`);
+
+  for (const lr of learningRates) {
+    for (const atrM of atrMultipliers) {
+      for (const adx of adxMins) {
+        // Test-Konfiguration anpassen
+        const testConfig = { 
+          ...baseConfig, 
+          ML_LEARNING_RATE: lr, 
+          ATR_STOP_MULT: atrM, 
+          ADX_MIN: adx 
+        };
+
+        try {
+          const result = await runBacktest({ symbol, days, cfg: testConfig, useML: true, walkForward: false });
+          const metrics = result.metrics;
+
+          // Bewerte anhand von Sharpe-Ratio und Net Profit (Score-Funktion)
+          const score = (metrics.sharpe * 2) + (metrics.netProfit > 0 ? metrics.netProfit / 100 : -10);
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestParams = { learningRate: lr, atrMultiplier: atrM, adxMin: adx, metrics };
+          }
+        } catch (e) {
+          // Ignoriere fehlerhafte Kombinationen
+        }
+      }
+    }
+  }
+
+  console.log(`✅ Optimierung abgeschlossen. Beste Parameter gefunden:`, bestParams);
+  return bestParams;
+}
+
+module.exports = { runBacktest, buildConfig, optimizeHyperparameters };
