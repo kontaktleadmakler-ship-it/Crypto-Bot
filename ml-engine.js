@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * TensorFlow.js Signal ML Engine
+ * TensorFlow.js Signal ML Engine (mit automatischem Hyperparameter-Tuning)
  *
  * Learns from completed trades only. The model predicts the probability that
  * a candidate setup would finish with positive net PnL under the bot's
@@ -82,7 +82,8 @@ class TensorFlowSignalModel {
       trainedAt: null,
       modelVersion: null,
       featureCount: FEATURE_NAMES.length,
-      featureNames: FEATURE_NAMES
+      featureNames: FEATURE_NAMES,
+      bestHyperparameters: null
     };
   }
 
@@ -231,57 +232,95 @@ class TensorFlowSignalModel {
       const xVal = this.scaleMatrix(validationSet.map(x => x.features), scaler);
       const yVal = validationSet.map(x => x.label);
 
-      const model = tf.sequential();
-      model.add(tf.layers.dense({ inputShape: [FEATURE_NAMES.length], units: 32, activation: 'relu', kernelInitializer: 'heNormal' }));
-      model.add(tf.layers.dropout({ rate: 0.15 }));
-      model.add(tf.layers.dense({ units: 16, activation: 'relu' }));
-      model.add(tf.layers.dense({ units: 8, activation: 'relu' }));
-      model.add(tf.layers.dense({ units: 1, activation: 'sigmoid' }));
+      // --- HYPERPARAMETER TUNING SCHLEIFE ---
+      const hyperparameterGrid = [
+        { learningRate: 0.001, dropoutRate: 0.15, batchSize: 32, units: 32 },
+        { learningRate: 0.0005, dropoutRate: 0.2, batchSize: 16, units: 64 },
+        { learningRate: 0.003, dropoutRate: 0.1, batchSize: 32, units: 32 }
+      ];
 
-      model.compile({
-        optimizer: tf.train.adam(0.001),
-        loss: 'binaryCrossentropy',
-        metrics: ['accuracy']
-      });
+      let bestCandidate = null;
+      let bestValAccuracy = -1;
+      let bestValLoss = Infinity;
+      let bestHistory = null;
+
+      this.logger.star?.(`🧠 [TensorFlow.js] Starte automatisches Hyperparameter-Tuning (${hyperparameterGrid.length} Kombinationen)...`) || 
+      this.logger.info(`🧠 [TensorFlow.js] Starte automatisches Hyperparameter-Tuning (${hyperparameterGrid.length} Kombinationen)...`);
 
       const xs = tf.tensor2d(xTrain, [xTrain.length, FEATURE_NAMES.length]);
       const ys = tf.tensor2d(yTrain, [yTrain.length, 1]);
       const vx = tf.tensor2d(xVal, [xVal.length, FEATURE_NAMES.length]);
       const vy = tf.tensor2d(yVal, [yVal.length, 1]);
 
-      let history;
       try {
-        history = await model.fit(xs, ys, {
-          epochs: this.epochs,
-          batchSize: Math.min(this.batchSize, xTrain.length),
-          validationData: [vx, vy],
-          shuffle: false,
-          verbose: 0,
-          callbacks: tf.callbacks.earlyStopping({ monitor: 'val_loss', patience: 10, restoreBestWeight: true })
-        });
+        for (const config of hyperparameterGrid) {
+          const candidateModel = tf.sequential();
+          candidateModel.add(tf.layers.dense({ inputShape: [FEATURE_NAMES.length], units: config.units, activation: 'relu', kernelInitializer: 'heNormal' }));
+          candidateModel.add(tf.layers.dropout({ rate: config.dropoutRate }));
+          candidateModel.add(tf.layers.dense({ units: Math.max(8, config.units / 2), activation: 'relu' }));
+          candidateModel.add(tf.layers.dense({ units: 1, activation: 'sigmoid' }));
+
+          candidateModel.compile({
+            optimizer: tf.train.adam(config.learningRate),
+            loss: 'binaryCrossentropy',
+            metrics: ['accuracy']
+          });
+
+          let history;
+          try {
+            history = await candidateModel.fit(xs, ys, {
+              epochs: Math.min(this.epochs, 50), // Kürzerer Testlauf fürs Tuning
+              batchSize: Math.min(config.batchSize, xTrain.length),
+              validationData: [vx, vy],
+              shuffle: false,
+              verbose: 0,
+              callbacks: tf.callbacks.earlyStopping({ monitor: 'val_loss', patience: 6, restoreBestWeight: true })
+            });
+          } catch (fitErr) {
+            candidateModel.dispose();
+            continue;
+          }
+
+          // Evaluiere Performance
+          const evalResult = candidateModel.evaluate(vx, vy, { verbose: 0 });
+          const evalLoss = Array.isArray(evalResult) ? await evalResult[0].data() : await evalResult.data();
+          const evalAcc = Array.isArray(evalResult) ? await evalResult[1].data() : [0];
+          if (Array.isArray(evalResult)) evalResult.forEach(t => t.dispose()); else evalResult.dispose();
+
+          const acc = finite(evalAcc[0], 0);
+          const loss = finite(evalLoss[0], 0);
+
+          // Prio 1: Accuracy, Prio 2: Loss bei gleicher Accuracy
+          if (acc > bestValAccuracy || (acc === bestValAccuracy && loss < bestValLoss)) {
+            bestValAccuracy = acc;
+            bestValLoss = loss;
+            if (bestCandidate) bestCandidate.dispose();
+            bestCandidate = candidateModel;
+            bestHistory = history;
+            bestBestConfig = config;
+          } else {
+            candidateModel.dispose();
+          }
+        }
       } finally {
         xs.dispose(); ys.dispose(); vx.dispose(); vy.dispose();
       }
 
-      const evalXs = tf.tensor2d(xVal, [xVal.length, FEATURE_NAMES.length]);
-      const evalYs = tf.tensor2d(yVal, [yVal.length, 1]);
-      const evalResult = model.evaluate(evalXs, evalYs, { verbose: 0 });
-      const evalLoss = Array.isArray(evalResult) ? await evalResult[0].data() : await evalResult.data();
-      const evalAcc = Array.isArray(evalResult) ? await evalResult[1].data() : [0];
-      if (Array.isArray(evalResult)) evalResult.forEach(t => t.dispose()); else evalResult.dispose();
-      evalXs.dispose(); evalYs.dispose();
+      if (!bestCandidate) {
+        return { trained: false, reason: 'tuning-failed' };
+      }
 
-      const validationAccuracy = finite(evalAcc[0], 0);
-      const validationLoss = finite(evalLoss[0], 0);
+      const validationAccuracy = bestValAccuracy;
+      const validationLoss = bestValLoss;
 
       const oldAccuracy = finite(this.stats.validationAccuracy, 0);
       if (!force && this.trained && validationAccuracy + 0.02 < oldAccuracy) {
-        this.logger.warn(`🧠 [TensorFlow.js] Neues Modell verworfen: Val-Accuracy ${(validationAccuracy * 100).toFixed(1)}% vs. aktuell ${(oldAccuracy * 100).toFixed(1)}%.`);
-        model.dispose();
+        this.logger.warn(`🧠 [TensorFlow.js] Neues getuntes Modell verworfen: Val-Accuracy ${(validationAccuracy * 100).toFixed(1)}% vs. aktuell ${(oldAccuracy * 100).toFixed(1)}%.`);
+        bestCandidate.dispose();
         return { trained: false, reason: 'candidate-model-worse', validationAccuracy, oldAccuracy };
       }
 
-      this.model = model;
+      this.model = bestCandidate;
       this.scaler = scaler;
       this.trained = true;
       this.stats = {
@@ -292,15 +331,16 @@ class TensorFlowSignalModel {
         positiveRate: positives / dataset.length,
         validationAccuracy,
         validationLoss,
-        epochs: history?.epoch?.length || 0,
+        epochs: bestHistory?.epoch?.length || 0,
         trainedAt: new Date().toISOString(),
         modelVersion: `tfjs-${Date.now()}`,
         featureCount: FEATURE_NAMES.length,
-        featureNames: [...FEATURE_NAMES]
+        featureNames: [...FEATURE_NAMES],
+        bestHyperparameters: bestBestConfig || null
       };
 
       await this.save();
-      this.logger.info(`🧠 [TensorFlow.js] Modell trainiert: ${dataset.length} Trades | Val-Accuracy ${(validationAccuracy * 100).toFixed(1)}% | Val-Loss ${validationLoss.toFixed(4)} | Version ${this.stats.modelVersion}`);
+      this.logger.info(`🧠 [TensorFlow.js] Getuntes Modell erfolgreich trainiert: ${dataset.length} Trades | Val-Accuracy ${(validationAccuracy * 100).toFixed(1)}% | Val-Loss ${validationLoss.toFixed(4)}`);
       return { trained: true, ...this.getStats() };
     } catch (e) {
       this.logger.error(`🧠 [TensorFlow.js] Training fehlgeschlagen: ${e.stack || e.message}`);
