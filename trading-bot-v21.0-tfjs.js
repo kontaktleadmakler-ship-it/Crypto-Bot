@@ -2347,7 +2347,7 @@ async function scanMarket() {
           const vwapDistancePct = vwap && currentPrice ? ((currentPrice - vwap) / currentPrice) * 100 : 0;
           const atrPct = currentPrice ? (atr / currentPrice) * 100 : 0;
 
-          const rlState = [
+        const rlState = [
             adx ? adx / 50 : 0.5,
             rsi ? rsi / 100 : 0.5,
             hurst || 0.5,
@@ -2363,7 +2363,7 @@ async function scanMarket() {
             orderBookMetrics.spreadPct || 0.1,
             btcATR > 0 ? atr / btcATR : 1,
             isModelTrained ? 0.8 : 0.5,
-            confluenceScore / 100
+            confluenceScore / 100 // <-- Confluence-Score als 16. Feature
           ];
 
           const rlAction = isModelTrained ? rlAgent.act(rlState) : (direction === 'LONG' ? 1 : 2);
