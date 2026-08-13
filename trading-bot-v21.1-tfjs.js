@@ -2,8 +2,8 @@
  * ============================================================================
  * TRADING SIGNAL BOT - ULTIMATE v21.7 DYNAMIC VOLATILITY SURFACE EDITION
  * (Mit adaptivem TensorFlow.js ML, globaler Telegram-Queue, State-Persistenz,
- *  Hurst-Exponent, Marktphasen-Logging, Dynamic Filter Control, Cross-Hedging 
- *  & Dynamic Volatility Surface)
+ *  Hurst-Exponent, Marktphasen-Logging, Dynamic Filter Control, Cross-Hedging,
+ *  Dynamic Volatility Surface & Order Flow / CVD Analyzer)
  * ============================================================================
  */
 
@@ -16,6 +16,7 @@ const winston = require('winston');
 const { TensorFlowSignalModel } = require('./ml-engine');
 const { HedgeManager } = require('./hedgeManager'); // <-- HedgeManager Modul eingebunden
 const { VolatilitySurfaceManager } = require('./volatilitySurface'); // <-- VolatilitySurfaceManager Modul eingebunden
+const { OrderFlowAnalyzer } = require('./orderFlowAnalyzer'); // <-- OrderFlowAnalyzer Modul eingebunden
 const { runBacktest, buildConfig: buildBacktestConfig } = require('./backtest-engine');
 
 // ==========================================
@@ -557,9 +558,10 @@ const mlModel = new TensorFlowSignalModel({
   logger
 });
 
-// Initialisierung des HedgeManagers und VolatilitySurfaceManagers
+// Initialisierung der Manager (inkl. OrderFlowAnalyzer)
 const hedgeManager = new HedgeManager({ logger, thresholdDropPct: -2.5 });
 const volManager = new VolatilitySurfaceManager({ logger });
+const orderFlowManager = new OrderFlowAnalyzer({ logger });
 
 let isModelTrained = false;
 let lastMLTrainingStats = null;
@@ -1699,6 +1701,7 @@ function formatScanStatsReport(stats) {
   if (stats.relVolTooLow) reasons.push(`Volumen zu niedrig: ${stats.relVolTooLow}`);
   if (stats.correlationBlocked) reasons.push(`Korrelations-Limit: ${stats.correlationBlocked}`);
   if (stats.orderBookBlocked) reasons.push(`Orderbuch Imbalance: ${stats.orderBookBlocked}`);
+  if (stats.orderFlowBlocked) reasons.push(`Order Flow / CVD blockiert: ${stats.orderFlowBlocked}`);
   if (stats.spreadTooHigh) reasons.push(`Orderbuch Spread zu hoch: ${stats.spreadTooHigh}`);
   if (stats.cooldownActive) reasons.push(`Signal-Cooldown aktiv: ${stats.cooldownActive}`);
   if (stats.positionTooSmallForLot) reasons.push(`Position zu klein für Min-Lot: ${stats.positionTooSmallForLot}`);
@@ -1727,6 +1730,7 @@ function formatScanStatsReport(stats) {
     (stats.relVolTooLow || 0) +
     (stats.correlationBlocked || 0) +
     (stats.orderBookBlocked || 0) +
+    (stats.orderFlowBlocked || 0) +
     (stats.spreadTooHigh || 0) +
     (stats.signalHistoryBlocked || 0) +
     (stats.cooldownActive || 0) +
@@ -2119,7 +2123,7 @@ function createEmptyScanStats() {
     btcCounterTrendBlocked: 0, adxTooLow: 0, hurstBlocked: 0, marketChoppy: 0, noBOS: 0, rsiOutOfRange: 0,
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
-    orderBookBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
+    orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
     timeBlocked: 0, mlBlocked: 0
   };
 }
@@ -2270,6 +2274,9 @@ async function scanMarket() {
         const futuresData = await fetchFuturesData(symbol).catch(() => null);
         const orderBookMetrics = await fetchOrderBookMetrics(symbol).catch(() => ({ spreadPct: 0, bidAskRatio: 1 }));
 
+        // 🌊 Order Flow & CVD Filter-Auswertung einbinden
+        const orderFlowEval = orderFlowManager.evaluateOrderFlow(raw15m, orderBookMetrics);
+
         const closes4h = raw4h ? raw4h.map(c => c.close) : [];
         const closes1h = raw1h.map(c => c.close);
         const closes15m = raw15m.map(c => c.close);
@@ -2320,6 +2327,16 @@ async function scanMarket() {
         }
 
         if (direction !== null) {
+          // Zusätzlicher Order Flow Filter-Check
+          if (direction === 'LONG' && orderFlowEval.pressure === 'BEARISH_DOMINANT' && orderFlowEval.score < 35) {
+            scanStats.orderFlowBlocked++;
+            return;
+          }
+          if (direction === 'SHORT' && orderFlowEval.pressure === 'BULLISH_DOMINANT' && orderFlowEval.score > 65) {
+            scanStats.orderFlowBlocked++;
+            return;
+          }
+
           const sentimentCheck = await evaluateFundingAndSentiment(fundingRate, direction);
           if (!sentimentCheck.allowed) {
             scanStats.fundingBlocked = (scanStats.fundingBlocked || 0) + 1;
@@ -2381,7 +2398,7 @@ async function scanMarket() {
           const volEvaluation = await volManager.evaluateVolatilityMultiplier(symbol, atr, currentPrice);
 
           const entryPrice = applySlippage(currentPrice, direction, 'entry');
-          const stopDistance = atr * adaptiveATR * volEvaluation.volFactor; // Dynamisch angepasst durch volFactor
+          const stopDistance = atr * adaptiveATR * volEvaluation.volFactor; 
           const stopLoss = direction === 'LONG' ? entryPrice - stopDistance : entryPrice + stopDistance;
           const tp1 = direction === 'LONG' ? entryPrice + (stopDistance * adaptiveTP1) : entryPrice - (stopDistance * adaptiveTP1);
           const tp2 = direction === 'LONG' ? entryPrice + (stopDistance * config.TP2_MULT) : entryPrice - (stopDistance * config.TP2_MULT);
@@ -2457,6 +2474,8 @@ async function scanMarket() {
             volatilityRatioAtEntry: btcATR > 0 ? atr / btcATR : 1,
             volFactorAtEntry: volEvaluation.volFactor,
             marketStressAtEntry: volEvaluation.marketStress,
+            orderFlowScoreAtEntry: orderFlowEval.score,
+            orderFlowPressureAtEntry: orderFlowEval.pressure,
             mlProbabilityAtEntry: mlPrediction.probability,
             mlConfidenceAtEntry: mlPrediction.confidence,
             mlModelVersionAtEntry: mlModel.getStats().modelVersion || null
@@ -2468,7 +2487,7 @@ async function scanMarket() {
             `Entry: $${entryPrice.toFixed(6)} | SL: $${stopLoss.toFixed(6)}\n` +
             `TP1: $${tp1.toFixed(6)} | TP2: $${tp2.toFixed(6)}\n` +
             `Größe: ${sizing.contracts} Kontrakte | Risk: $${sizing.riskAmountUSD.toFixed(2)}\n` +
-            `ADX: ${adx} | Hurst: ${hurst} | Vol-Stress: ${volEvaluation.marketStress}\n` +
+            `ADX: ${adx} | Hurst: ${hurst} | CVD-Score: ${orderFlowEval.score}\n` +
             `🧠 TensorFlow.js: ${mlPrediction.trained ? (mlPrediction.probability * 100).toFixed(1) + '% Erfolgswahrscheinlichkeit' : 'noch nicht trainiert'}`;
 
           if (config.ENABLE_BATCH_SIGNALS) {
@@ -3380,7 +3399,7 @@ process.on('unhandledRejection', async (reason) => {
 // 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v21.7 ULTIMATE TFJS (Full Features, TensorFlow.js ML, Time-Learning Filter, Cross-Hedging & Volatility Surface)...');
+  logger.info('🚀 Starte Trading Bot v21.7 ULTIMATE TFJS (Full Features, TensorFlow.js ML, Time-Learning Filter, Cross-Hedging, Volatility Surface & Order Flow)...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
