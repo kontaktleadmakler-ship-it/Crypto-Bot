@@ -12,7 +12,7 @@ const path = require('path');
 class DeepQTheTradingAgent {
   constructor(options = {}) {
     this.modelDir = options.modelDir || './models/rl-dqn-model';
-    this.stateSize = options.stateSize || 16; // Anzahl der Markt-Features
+    this.stateSize = options.stateSize || 16; // Anzahl der Markt-Features (inkl. Confluence-Score)
     this.actionSize = options.actionSize || 3; // 0: Nichts tun, 1: Long, 2: Short
     
     // RL Hyperparameter
@@ -87,7 +87,7 @@ class DeepQTheTradingAgent {
       this.logger.info('🤖 [RL-Engine] DQN Agent erfolgreich initialisiert.');
     } catch (e) {
       this.logger.error(`[RL-Engine Init Fehler]: ${e.message}`);
-      this.isInitialized = true; // Fallback auf unterntrainiertes Modell
+      this.isInitialized = true; // Fallback auf unternährtes Modell
     }
   }
 
@@ -200,6 +200,7 @@ class DeepQTheTradingAgent {
 
   /**
    * Wandelt Closed Trades aus der MongoDB in RL-Erfahrungen um und trainiert das Netz
+   * (Erweitert um Confluence-Score im State-Vektor und optimiertes Reward Shaping)
    */
   async trainFromClosedTrades(closedTradesCollection) {
     try {
@@ -212,7 +213,7 @@ class DeepQTheTradingAgent {
       for (let i = 0; i < trades.length - 1; i++) {
         const t = trades[i];
         
-        // Zustand aus den Entry-Parametern rekonstruieren
+        // Zustand aus den Entry-Parametern rekonstruieren (inkl. Confluence-Score Feature am Ende)
         const state = [
           t.adxAtEntry ? t.adxAtEntry / 50 : 0.5,
           t.rsiAtEntry ? t.rsiAtEntry / 100 : 0.5,
@@ -229,14 +230,18 @@ class DeepQTheTradingAgent {
           t.spreadPctAtEntry || 0.1,
           t.volatilityRatioAtEntry || 1,
           t.mlProbabilityAtEntry || 0.5,
-          0.5 // Bias / Platzhalter
+          t.confluenceScore ? t.confluenceScore / 100 : 0.6 // Confluence-Score als 16. Feature
         ];
 
         const action = t.direction === 'LONG' ? 1 : 2;
         
-        // Reward-Berechnung: Profit ist positiv, Verlust ist negativ (stark gewichtet)
+        // Erweitertes Reward Shaping: PnL kombiniert mit Confluence-Güte und Schnelligkeit
         const pnlUSD = t.pnlUSD || 0;
-        const reward = pnlUSD > 0 ? Math.min(pnlUSD / 50, 5) : Math.max(pnlUSD / 50, -5);
+        let baseReward = pnlUSD > 0 ? Math.min(pnlUSD / 50, 5) : Math.max(pnlUSD / 50, -5);
+        
+        // Bonus für Trades mit hohem Confluence-Score, die gewonnen haben, bzw. Strafe bei Fehlsignalen
+        const confluenceBonus = (t.confluenceScore || 60) >= 70 ? 0.5 : 0;
+        const reward = pnlUSD > 0 ? (baseReward + confluenceBonus) : (baseReward - confluenceBonus);
         
         const nextT = trades[i + 1];
         const nextState = [
@@ -255,7 +260,7 @@ class DeepQTheTradingAgent {
           nextT.spreadPctAtEntry || 0.1,
           nextT.volatilityRatioAtEntry || 1,
           nextT.mlProbabilityAtEntry || 0.5,
-          0.5
+          nextT.confluenceScore ? nextT.confluenceScore / 100 : 0.6
         ];
 
         this.remember(state, action, reward, nextState, false);
