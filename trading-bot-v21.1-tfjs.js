@@ -4,325 +4,325 @@
  * (Mit adaptivem TensorFlow.js ML, globaler Telegram-Queue, State-Persistenz,
  *  Hurst-Exponent, Marktphasen-Logging, Dynamic Filter Control & Web-Backtest)
  * ============================================================================
- */ 5]
+ */ 
 
-require('dotenv').config(); 5]
-const express = require('express'); 5]
-const cron = require('node-cron'); 5]
-const axios = require('axios'); 5]
-const { MongoClient } = require('mongodb'); 5]
-const winston = require('winston'); 5]
-const { TensorFlowSignalModel } = require('./ml-engine'); 5]
-const { runBacktest, buildConfig: buildBacktestConfig } = require('./backtest-engine'); 5]
+require('dotenv').config(); 
+const express = require('express'); 
+const cron = require('node-cron'); 
+const axios = require('axios'); 
+const { MongoClient } = require('mongodb'); 
+const winston = require('winston'); 
+const { TensorFlowSignalModel } = require('./ml-engine'); 
+const { runBacktest, buildConfig: buildBacktestConfig } = require('./backtest-engine'); 
 
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
 // ==========================================
-const { Writable } = require('stream'); 5]
+const { Writable } = require('stream'); 
 
-const recentLogs = []; 5]
-const memoryStream = new Writable({ 5]
-  write(chunk, encoding, callback) { 5]
-    recentLogs.push(chunk.toString().trim()); 5]
-    if (recentLogs.length > 50) recentLogs.shift(); 5]
-    callback(); 5]
-  } 5]
-}); 5]
+const recentLogs = []; 
+const memoryStream = new Writable({ 
+  write(chunk, encoding, callback) { 
+    recentLogs.push(chunk.toString().trim()); 
+    if (recentLogs.length > 50) recentLogs.shift(); 
+    callback(); 
+  } 
+}); 
 
-const memoryLogTransport = new winston.transports.Stream({ 5]
-  stream: memoryStream 5]
-}); 5]
+const memoryLogTransport = new winston.transports.Stream({ 
+  stream: memoryStream 
+}); 
 
-const logger = winston.createLogger({ 5]
-  level: 'info', 5]
-  format: winston.format.combine( 5]
-    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }), 5]
-    winston.format.printf(({ timestamp, level, message }) => `[${timestamp}] ${level.toUpperCase()}: ${message}`) 5]
-  ), 5]
-  transports: [ 5]
-    new winston.transports.Console(), 5]
-    memoryLogTransport 5]
-  ] 5]
-}); 5]
+const logger = winston.createLogger({ 
+  level: 'info', 
+  format: winston.format.combine( 
+    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }), 
+    winston.format.printf(({ timestamp, level, message }) => `[${timestamp}] ${level.toUpperCase()}: ${message}`) 
+  ), 
+  transports: [ 
+    new winston.transports.Console(), 
+    memoryLogTransport 
+  ] 
+}); 
 
-let isShuttingDown = false; 5]
-let currentMarketPhase = 'RANGING'; 5]
-let adaptiveConfig = null; 5]
-let lastScanStats = null; 5]
-let scanCounter = 0; 5]
+let isShuttingDown = false; 
+let currentMarketPhase = 'RANGING'; 
+let adaptiveConfig = null; 
+let lastScanStats = null; 
+let scanCounter = 0; 
 
-let currentStreak = 0; 5]
-let maxWinStreak = 0; 5]
-let maxLossStreak = 0; 5]
+let currentStreak = 0; 
+let maxWinStreak = 0; 
+let maxLossStreak = 0; 
 
-let peakCapital = parseFloat(process.env.CAPITAL_USD) || 10000; 5]
-let dailyNetPnL = 0; 5]
-let consecutiveLosses = 0; 5]
+let peakCapital = parseFloat(process.env.CAPITAL_USD) || 10000; 
+let dailyNetPnL = 0; 
+let consecutiveLosses = 0; 
 
-const MAX_DRAWDOWN_PERCENT = parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 25; 5]
-const DAILY_PROFIT_TARGET = parseFloat(process.env.DAILY_PROFIT_TARGET) || 500; 5]
+const MAX_DRAWDOWN_PERCENT = parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 25; 
+const DAILY_PROFIT_TARGET = parseFloat(process.env.DAILY_PROFIT_TARGET) || 500; 
 
-let kucoinErrorCount = 0; 5]
-let kucoinCircuitOpenUntil = 0; 5]
-const KUCOIN_CIRCUIT_THRESHOLD = 3; 5]
-const KUCOIN_CIRCUIT_COOLDOWN_MS = 300000; 5]
+let kucoinErrorCount = 0; 
+let kucoinCircuitOpenUntil = 0; 
+const KUCOIN_CIRCUIT_THRESHOLD = 3; 
+const KUCOIN_CIRCUIT_COOLDOWN_MS = 300000; 
 
-const manualBlacklist = new Set(); 5]
+const manualBlacklist = new Set(); 
 
 // ==========================================
 // 2. FILTER REGISTRY & ZENTRALE KONFIGURATION
 // ==========================================
-const FILTER_REGISTRY = { 5]
-  hurst: { configKey: 'MIN_HURST_EXPONENT', name: 'Hurst Exponent', default: 0.52, type: 'numeric', step: 0.02, direction: 'higher_is_harder', min: 0.0, max: 0.95 }, 5]
-  adx:   { configKey: 'ADX_MIN',            name: 'ADX Minimum',    default: 20,   type: 'numeric', step: 2.0,  direction: 'higher_is_harder', min: 0,   max: 60 }, 5]
-  bos:   { configKey: 'BOS_LOOKBACK',       name: 'BOS Lookback',   default: 10,   type: 'numeric', step: 2,    direction: 'higher_is_harder', min: 2,   max: 50 }, 5]
-  relvol:{ configKey: 'MIN_RELATIVE_VOLUME',name: 'Rel. Volumen',   default: 1.2,  type: 'numeric', step: 0.1,  direction: 'higher_is_harder', min: 0.0, max: 10.0 }, 5]
-  chop:  { configKey: 'MAX_CHOP_INDEX',     name: 'Max Chop Index', default: 61.8, type: 'numeric', step: 2.0,  direction: 'lower_is_harder',  min: 10,  max: 90 }, 5]
-  rsi_long_min:  { configKey: 'RSI_LONG_MIN',  name: 'RSI Long Min',   default: 48,   type: 'numeric', step: 2.0,  direction: 'higher_is_harder', min: 10,  max: 80 }, 5]
-  rsi_short_max: { configKey: 'RSI_SHORT_MAX', name: 'RSI Short Max',  default: 52,   type: 'numeric', step: 2.0,  direction: 'lower_is_harder',  min: 20,  max: 90 }, 5]
-  trend4h:       { configKey: 'REQUIRE_4H_TREND', name: '4H Trend-Filter', default: true, type: 'boolean' }, 5]
-  btctrend:      { configKey: 'ALLOW_COUNTER_BTC_TREND', name: 'Gegen-BTC-Trend', default: false, type: 'boolean' } 5]
-}; 5]
+const FILTER_REGISTRY = { 
+  hurst: { configKey: 'MIN_HURST_EXPONENT', name: 'Hurst Exponent', default: 0.52, type: 'numeric', step: 0.02, direction: 'higher_is_harder', min: 0.0, max: 0.95 }, 
+  adx:   { configKey: 'ADX_MIN',            name: 'ADX Minimum',    default: 20,   type: 'numeric', step: 2.0,  direction: 'higher_is_harder', min: 0,   max: 60 }, 
+  bos:   { configKey: 'BOS_LOOKBACK',       name: 'BOS Lookback',   default: 10,   type: 'numeric', step: 2,    direction: 'higher_is_harder', min: 2,   max: 50 }, 
+  relvol:{ configKey: 'MIN_RELATIVE_VOLUME',name: 'Rel. Volumen',   default: 1.2,  type: 'numeric', step: 0.1,  direction: 'higher_is_harder', min: 0.0, max: 10.0 }, 
+  chop:  { configKey: 'MAX_CHOP_INDEX',     name: 'Max Chop Index', default: 61.8, type: 'numeric', step: 2.0,  direction: 'lower_is_harder',  min: 10,  max: 90 }, 
+  rsi_long_min:  { configKey: 'RSI_LONG_MIN',  name: 'RSI Long Min',   default: 48,   type: 'numeric', step: 2.0,  direction: 'higher_is_harder', min: 10,  max: 80 }, 
+  rsi_short_max: { configKey: 'RSI_SHORT_MAX', name: 'RSI Short Max',  default: 52,   type: 'numeric', step: 2.0,  direction: 'lower_is_harder',  min: 20,  max: 90 }, 
+  trend4h:       { configKey: 'REQUIRE_4H_TREND', name: '4H Trend-Filter', default: true, type: 'boolean' }, 
+  btctrend:      { configKey: 'ALLOW_COUNTER_BTC_TREND', name: 'Gegen-BTC-Trend', default: false, type: 'boolean' } 
+}; 
 
-const filterState = {}; 5]
-Object.keys(FILTER_REGISTRY).forEach(key => { 5]
-  filterState[key] = { enabled: true }; 5]
-}); 5]
+const filterState = {}; 
+Object.keys(FILTER_REGISTRY).forEach(key => { 
+  filterState[key] = { enabled: true }; 
+}); 
 
 // ==========================================
 // 3. API LATENZ & RATE LIMITER
 // ==========================================
-const apiLatencyStats = { 5]
-  kucoin: [], 5]
-  telegram: [], 5]
-  mongodb: [], 5]
+const apiLatencyStats = { 
+  kucoin: [], 
+  telegram: [], 
+  mongodb: [], 
   
-  record(service, latencyMs) { 5]
-    if (!this[service]) this[service] = []; 5]
-    this[service].push({ time: Date.now(), latency: latencyMs }); 5]
-    if (this[service].length > 100) this[service].shift(); 5]
-  }, 5]
+  record(service, latencyMs) { 
+    if (!this[service]) this[service] = []; 
+    this[service].push({ time: Date.now(), latency: latencyMs }); 
+    if (this[service].length > 100) this[service].shift(); 
+  }, 
   
-  getAverage(service) { 5]
-    if (!this[service] || this[service].length === 0) return 0; 5]
-    return this[service].reduce((sum, e) => sum + e.latency, 0) / this[service].length; 5]
-  } 5]
-}; 5]
+  getAverage(service) { 
+    if (!this[service] || this[service].length === 0) return 0; 
+    return this[service].reduce((sum, e) => sum + e.latency, 0) / this[service].length; 
+  } 
+}; 
 
-const apiRateLimiter = { 5]
-  requests: 0, 5]
-  windowStart: Date.now(), 5]
-  maxRequests: 1800, 5]
-  windowMs: 60000, 5]
+const apiRateLimiter = { 
+  requests: 0, 
+  windowStart: Date.now(), 
+  maxRequests: 1800, 
+  windowMs: 60000, 
   
-  async checkLimit() { 5]
-    const now = Date.now(); 5]
-    if (now - this.windowStart > this.windowMs) { 5]
-      this.requests = 0; 5]
-      this.windowStart = now; 5]
-    } 5]
-    if (this.requests >= this.maxRequests) { 5]
-      const waitMs = this.windowMs - (now - this.windowStart) + 100; 5]
-      logger.warn(`⚠️ API Rate-Limit erreicht (${this.requests}/${this.maxRequests}), warte ${waitMs}ms`); 5]
-      await sleep(waitMs); 5]
-      this.requests = 0; 5]
-      this.windowStart = Date.now(); 5]
-    } 5]
-    this.requests++; 5]
-  } 5]
-}; 5]
+  async checkLimit() { 
+    const now = Date.now(); 
+    if (now - this.windowStart > this.windowMs) { 
+      this.requests = 0; 
+      this.windowStart = now; 
+    } 
+    if (this.requests >= this.maxRequests) { 
+      const waitMs = this.windowMs - (now - this.windowStart) + 100; 
+      logger.warn(`⚠️ API Rate-Limit erreicht (${this.requests}/${this.maxRequests}), warte ${waitMs}ms`); 
+      await sleep(waitMs); 
+      this.requests = 0; 
+      this.windowStart = Date.now(); 
+    } 
+    this.requests++; 
+  } 
+}; 
 
 // ==========================================
 // 4. BULK QUEUE & LRU CACHE
 // ==========================================
-let dbBulkQueue = []; 5]
-let dbBulkTimer = null; 5]
+let dbBulkQueue = []; 
+let dbBulkTimer = null; 
 
-class LRUCache { 5]
-  constructor(maxSize) { 5]
-    this.maxSize = maxSize; 5]
-    this.cache = new Map(); 5]
-  } 5]
+class LRUCache { 
+  constructor(maxSize) { 
+    this.maxSize = maxSize; 
+    this.cache = new Map(); 
+  } 
   
-  get(key) { 5]
-    if (!this.cache.has(key)) return null; 5]
-    const value = this.cache.get(key); 5]
-    this.cache.delete(key); 5]
-    this.cache.set(key, value); 5]
-    return value; 5]
-  } 5]
+  get(key) { 
+    if (!this.cache.has(key)) return null; 
+    const value = this.cache.get(key); 
+    this.cache.delete(key); 
+    this.cache.set(key, value); 
+    return value; 
+  } 
   
-  set(key, value) { 5]
-    if (this.cache.has(key)) { 5]
-      this.cache.delete(key); 5]
-    } else if (this.cache.size >= this.maxSize) { 5]
-      const firstKey = this.cache.keys().next().value; 5]
-      this.cache.delete(firstKey); 5]
-    } 5]
-    this.cache.set(key, value); 5]
-  } 5]
+  set(key, value) { 
+    if (this.cache.has(key)) { 
+      this.cache.delete(key); 
+    } else if (this.cache.size >= this.maxSize) { 
+      const firstKey = this.cache.keys().next().value; 
+      this.cache.delete(firstKey); 
+    } 
+    this.cache.set(key, value); 
+  } 
   
-  delete(key) { this.cache.delete(key); } 5]
-  has(key) { return this.cache.has(key); } 5]
-  get size() { return this.cache.size; } 5]
+  delete(key) { this.cache.delete(key); } 
+  has(key) { return this.cache.has(key); } 
+  get size() { return this.cache.size; } 
   
-  cleanup(maxAge) { 5]
-    const now = Date.now(); 5]
-    for (const [key, value] of this.cache.entries()) { 5]
-      if (now - value.timestamp > maxAge) this.cache.delete(key); 5]
-    } 5]
-  } 5]
-} 5]
+  cleanup(maxAge) { 
+    const now = Date.now(); 
+    for (const [key, value] of this.cache.entries()) { 
+      if (now - value.timestamp > maxAge) this.cache.delete(key); 
+    } 
+  } 
+} 
 
 // ==========================================
 // 5. HELFER & TELEGRAM ENGINE
 // ==========================================
-function safeParseFloat(value, fieldName, context) { 5]
-  const parsed = parseFloat(value); 5]
-  if (!Number.isFinite(parsed)) { 5]
-    logger.error(`[DATA ERROR] ${fieldName} bei ${context}: ${JSON.stringify(value)}`); 5]
-    return null; 5]
-  } 5]
-  return parsed; 5]
-} 5]
+function safeParseFloat(value, fieldName, context) { 
+  const parsed = parseFloat(value); 
+  if (!Number.isFinite(parsed)) { 
+    logger.error(`[DATA ERROR] ${fieldName} bei ${context}: ${JSON.stringify(value)}`); 
+    return null; 
+  } 
+  return parsed; 
+} 
 
-function escapeHtml(value) { 5]
-  return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); 5]
-} 5]
+function escapeHtml(value) { 
+  return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); 
+} 
 
-function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); } 5]
-function todayUTCString() { return new Date().toISOString().slice(0, 10); } 5]
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); } 
+function todayUTCString() { return new Date().toISOString().slice(0, 10); } 
 
-const configTelegram = { 5]
-  botToken: process.env.TELEGRAM_BOT_TOKEN || '', 5]
-  chatId: process.env.TELEGRAM_CHAT_ID || '' 5]
-}; 5]
+const configTelegram = { 
+  botToken: process.env.TELEGRAM_BOT_TOKEN || '', 
+  chatId: process.env.TELEGRAM_CHAT_ID || '' 
+}; 
 
-let telegramQueue = Promise.resolve(); 5]
+let telegramQueue = Promise.resolve(); 
 
-function queueTelegramMessage(taskFn) { 5]
-  telegramQueue = telegramQueue.then(async () => { 5]
-    try { 5]
-      await taskFn(); 5]
-    } catch (e) {} 5]
-  }); 5]
-  return telegramQueue; 5]
-} 5]
+function queueTelegramMessage(taskFn) { 
+  telegramQueue = telegramQueue.then(async () => { 
+    try { 
+      await taskFn(); 
+    } catch (e) {} 
+  }); 
+  return telegramQueue; 
+} 
 
-async function sendTelegramAlert(text) { 5]
-  if (!configTelegram.botToken || !configTelegram.chatId) return; 5]
-  const startTime = Date.now(); 5]
-  const chatIds = configTelegram.chatId.split(',').map(id => id.trim()).filter(Boolean); 5]
+async function sendTelegramAlert(text) { 
+  if (!configTelegram.botToken || !configTelegram.chatId) return; 
+  const startTime = Date.now(); 
+  const chatIds = configTelegram.chatId.split(',').map(id => id.trim()).filter(Boolean); 
 
-  for (const chatId of chatIds) { 5]
-    await queueTelegramMessage(async () => { 5]
-      let success = false; 5]
-      let attempts = 0; 5]
-      let delay = 3000; 5]
+  for (const chatId of chatIds) { 
+    await queueTelegramMessage(async () => { 
+      let success = false; 
+      let attempts = 0; 
+      let delay = 3000; 
 
-      while (!success && attempts < 3) { 5]
-        try { 5]
-          attempts++; 5]
-          await axios.post( 5]
-            `https://api.telegram.org/bot${configTelegram.botToken}/sendMessage`, 5]
-            { chat_id: chatId, text: text, parse_mode: 'HTML' }, 5]
-            { timeout: 10000 } 5]
-          ); 5]
-          success = true; 5]
-          await sleep(500); 5]
-        } catch (e) { 5]
-          if (e.response && e.response.status === 429) { 5]
-            logger.warn(`⚠️ Telegram Rate-Limit (429) für Chat ${chatId}. Warte ${delay}ms...`); 5]
-            await sleep(delay); 5]
-            delay *= 2; 5]
-          } else { 5]
-            logger.error(`Telegram (${chatId}): ${e.message}`); 5]
-            break; 5]
-          } 5]
-        } 5]
-      } 5]
-    }); 5]
-  } 5]
-  apiLatencyStats.record('telegram', Date.now() - startTime); 5]
-} 5]
+      while (!success && attempts < 3) { 
+        try { 
+          attempts++; 
+          await axios.post( 
+            `https://api.telegram.org/bot${configTelegram.botToken}/sendMessage`, 
+            { chat_id: chatId, text: text, parse_mode: 'HTML' }, 
+            { timeout: 10000 } 
+          ); 
+          success = true; 
+          await sleep(500); 
+        } catch (e) { 
+          if (e.response && e.response.status === 429) { 
+            logger.warn(`⚠️ Telegram Rate-Limit (429) für Chat ${chatId}. Warte ${delay}ms...`); 
+            await sleep(delay); 
+            delay *= 2; 
+          } else { 
+            logger.error(`Telegram (${chatId}): ${e.message}`); 
+            break; 
+          } 
+        } 
+      } 
+    }); 
+  } 
+  apiLatencyStats.record('telegram', Date.now() - startTime); 
+} 
 
-async function sendTelegramReply(chatId, text) { 5]
-  if (!configTelegram.botToken || !chatId) return; 5]
-  await queueTelegramMessage(async () => { 5]
-    let success = false; 5]
-    let attempts = 0; 5]
-    let delay = 3000; 5]
+async function sendTelegramReply(chatId, text) { 
+  if (!configTelegram.botToken || !chatId) return; 
+  await queueTelegramMessage(async () => { 
+    let success = false; 
+    let attempts = 0; 
+    let delay = 3000; 
 
-    while (!success && attempts < 3) { 5]
-      try { 5]
-        attempts++; 5]
-        await axios.post( 5]
-          `https://api.telegram.org/bot${configTelegram.botToken}/sendMessage`, 5]
-          { chat_id: chatId, text: text, parse_mode: 'HTML' }, 5]
-          { timeout: 10000 } 5]
-        ); 5]
-        success = true; 5]
-        await sleep(500); 5]
-      } catch (e) { 5]
-        if (e.response && e.response.status === 429) { 5]
-          logger.warn(`⚠️ Telegram Reply Rate-Limit (429) für Chat ${chatId}. Warte ${delay}ms...`); 5]
-          await sleep(delay); 5]
-          delay *= 2; 5]
-        } else { 5]
-          logger.error(`Telegram Reply (${chatId}): ${e.message}`); 5]
-          break; 5]
-        } 5]
-      } 5]
-    } 5]
-  }); 5]
-} 5]
+    while (!success && attempts < 3) { 
+      try { 
+        attempts++; 
+        await axios.post( 
+          `https://api.telegram.org/bot${configTelegram.botToken}/sendMessage`, 
+          { chat_id: chatId, text: text, parse_mode: 'HTML' }, 
+          { timeout: 10000 } 
+        ); 
+        success = true; 
+        await sleep(500); 
+      } catch (e) { 
+        if (e.response && e.response.status === 429) { 
+          logger.warn(`⚠️ Telegram Reply Rate-Limit (429) für Chat ${chatId}. Warte ${delay}ms...`); 
+          await sleep(delay); 
+          delay *= 2; 
+        } else { 
+          logger.error(`Telegram Reply (${chatId}): ${e.message}`); 
+          break; 
+        } 
+      } 
+    } 
+  }); 
+} 
 
-async function getAlertTimestamp(key) { 5]
-  if (!botStateCollection || !isDbConnected) return 0; 5]
-  try { 5]
-    const doc = await botStateCollection.findOne({ _id: `alert_${key}` }); 5]
-    return doc ? doc.lastSent : 0; 5]
-  } catch (e) { 5]
-    return 0; 5]
-  } 5]
-} 5]
+async function getAlertTimestamp(key) { 
+  if (!botStateCollection || !isDbConnected) return 0; 
+  try { 
+    const doc = await botStateCollection.findOne({ _id: `alert_${key}` }); 
+    return doc ? doc.lastSent : 0; 
+  } catch (e) { 
+    return 0; 
+  } 
+} 
 
-async function persistAlertHistoryEntry(key, timestamp) { 5]
-  if (!botStateCollection || !isDbConnected) return; 5]
-  try { 5]
-    await botStateCollection.updateOne( 5]
-      { _id: `alert_${key}` }, 5]
-      { $set: { lastSent: timestamp } }, 5]
-      { upsert: true } 5]
-    ); 5]
-  } catch (e) {} 5]
-} 5]
+async function persistAlertHistoryEntry(key, timestamp) { 
+  if (!botStateCollection || !isDbConnected) return; 
+  try { 
+    await botStateCollection.updateOne( 
+      { _id: `alert_${key}` }, 
+      { $set: { lastSent: timestamp } }, 
+      { upsert: true } 
+    ); 
+  } catch (e) {} 
+} 
 
-async function sendDeduplicatedAlert(key, text, cooldownMs = 300000) { 5]
-  const lastSent = await getAlertTimestamp(key); 5]
-  if (Date.now() - lastSent < cooldownMs) return; 5]
-  await persistAlertHistoryEntry(key, Date.now()); 5]
-  await sendTelegramAlert(text); 5]
-} 5]
+async function sendDeduplicatedAlert(key, text, cooldownMs = 300000) { 
+  const lastSent = await getAlertTimestamp(key); 
+  if (Date.now() - lastSent < cooldownMs) return; 
+  await persistAlertHistoryEntry(key, Date.now()); 
+  await sendTelegramAlert(text); 
+} 
 
-async function sendBatchedSignalAlert(signals) { 5]
-  if (signals.length === 0) return; 5]
-  if (signals.length === 1) { 5]
-    await sendTelegramAlert(signals[0].text); 5]
-    return; 5]
-  } 5]
-  let batchText = `🚀 <b>${signals.length} NEUE SIGNALE</b>\n━━━━━━━━━━━━━━━━━━\n\n`; 5]
-  signals.forEach((signal, index) => { 5]
-    batchText += `${index + 1}. ${signal.text}\n\n`; 5]
-  }); 5]
-  batchText += `⚠️ <b>Mehrere Signale - Position Sizing beachten!</b>`; 5]
-  await sendTelegramAlert(batchText); 5]
-} 5]
+async function sendBatchedSignalAlert(signals) { 
+  if (signals.length === 0) return; 
+  if (signals.length === 1) { 
+    await sendTelegramAlert(signals[0].text); 
+    return; 
+  } 
+  let batchText = `🚀 <b>${signals.length} NEUE SIGNALE</b>\n━━━━━━━━━━━━━━━━━━\n\n`; 
+  signals.forEach((signal, index) => { 
+    batchText += `${index + 1}. ${signal.text}\n\n`; 
+  }); 
+  batchText += `⚠️ <b>Mehrere Signale - Position Sizing beachten!</b>`; 
+  await sendTelegramAlert(batchText); 
+} 
 
-function updateTelegramConfig(token, chatId) { 5]
-  configTelegram.botToken = token; 5]
-  configTelegram.chatId = chatId; 5]
-} 5]
+function updateTelegramConfig(token, chatId) { 
+  configTelegram.botToken = token; 
+  configTelegram.chatId = chatId; 
+} 
 
 // ==========================================
 // 5.1 NEU: AUTOMATISCHER GEMINI-RISIKO-CHECK
@@ -362,157 +362,157 @@ async function evaluateSignalWithGemini(symbol, direction, score, marketPhase, m
 // ==========================================
 // 6. KORRELATIONS-GRUPPEN
 // ==========================================
-const CORRELATION_GROUPS = { 5]
-  'MAJOR':   ['BTC-USDT', 'ETH-USDT'], 5]
-  'DEFI':    ['UNI-USDT', 'AAVE-USDT', 'MKR-USDT', 'COMP-USDT', 'CRV-USDT', 'SNX-USDT'], 5]
-  'L1':      ['SOL-USDT', 'AVAX-USDT', 'NEAR-USDT', 'APT-USDT', 'SUI-USDT', 'SEI-USDT'], 5]
-  'L2':      ['ARB-USDT', 'OP-USDT', 'MATIC-USDT', 'IMX-USDT', 'STRK-USDT'], 5]
-  'MEME':    ['DOGE-USDT', 'SHIB-USDT', 'PEPE-USDT', 'WIF-USDT', 'BONK-USDT'], 5]
-  'AI':      ['FET-USDT', 'AGIX-USDT', 'OCEAN-USDT', 'WLD-USDT', 'RNDR-USDT'], 5]
-  'GAMING':  ['GALA-USDT', 'SAND-USDT', 'MANA-USDT', 'AXS-USDT'], 5]
-}; 5]
+const CORRELATION_GROUPS = { 
+  'MAJOR':   ['BTC-USDT', 'ETH-USDT'], 
+  'DEFI':    ['UNI-USDT', 'AAVE-USDT', 'MKR-USDT', 'COMP-USDT', 'CRV-USDT', 'SNX-USDT'], 
+  'L1':      ['SOL-USDT', 'AVAX-USDT', 'NEAR-USDT', 'APT-USDT', 'SUI-USDT', 'SEI-USDT'], 
+  'L2':      ['ARB-USDT', 'OP-USDT', 'MATIC-USDT', 'IMX-USDT', 'STRK-USDT'], 
+  'MEME':    ['DOGE-USDT', 'SHIB-USDT', 'PEPE-USDT', 'WIF-USDT', 'BONK-USDT'], 
+  'AI':      ['FET-USDT', 'AGIX-USDT', 'OCEAN-USDT', 'WLD-USDT', 'RNDR-USDT'], 
+  'GAMING':  ['GALA-USDT', 'SAND-USDT', 'MANA-USDT', 'AXS-USDT'], 
+}; 
 
-function checkCorrelationLimit(symbol, direction, activeTrades, enabled = true) { 5]
-  if (!enabled) return true; 5]
-  for (const [group, coins] of Object.entries(CORRELATION_GROUPS)) { 5]
-    if (coins.includes(symbol)) { 5]
-      const sameInGroup = [...activeTrades.values()].filter(t => coins.includes(t.symbol) && t.direction === direction).length; 5]
-      return sameInGroup === 0; 5]
-    } 5]
-  } 5]
-  return true; 5]
-} 5]
+function checkCorrelationLimit(symbol, direction, activeTrades, enabled = true) { 
+  if (!enabled) return true; 
+  for (const [group, coins] of Object.entries(CORRELATION_GROUPS)) { 
+    if (coins.includes(symbol)) { 
+      const sameInGroup = [...activeTrades.values()].filter(t => coins.includes(t.symbol) && t.direction === direction).length; 
+      return sameInGroup === 0; 
+    } 
+  } 
+  return true; 
+} 
 
 // ==========================================
 // 7. STRATEGIE PROFILES & CONFIG
 // ==========================================
-const STRATEGY_PROFILES = { 5]
-  loose: { 5]
-    ALLOW_COUNTER_BTC_TREND: true, 5]
-    REQUIRE_4H_TREND: false, 5]
-    ADX_MIN: 15, 5]
-    RSI_LONG_MIN: 40, 5]
-    RSI_LONG_MAX: 75, 5]
-    RSI_SHORT_MIN: 25, 5]
-    RSI_SHORT_MAX: 60, 5]
-    MIN_RELATIVE_VOLUME: 0.8, 5]
-    BOS_LOOKBACK: 4, 5]
-    TREND_EMA_FAST_15M: 20,        5]
-    TREND_EMA_SLOW_15M: 50, 5]
-  }, 5]
-  strict: { 5]
-    ALLOW_COUNTER_BTC_TREND: false, 5]
-    REQUIRE_4H_TREND: true, 5]
-    ADX_MIN: 20, 5]
-    RSI_LONG_MIN: 48, 5]
-    RSI_LONG_MAX: 68, 5]
-    RSI_SHORT_MIN: 32, 5]
-    RSI_SHORT_MAX: 52, 5]
-    MIN_RELATIVE_VOLUME: 1.2, 5]
-    BOS_LOOKBACK: 10, 5]
-    TREND_EMA_FAST_15M: 20, 5]
-    TREND_EMA_SLOW_15M: 50, 5]
-  } 5]
-}; 5]
+const STRATEGY_PROFILES = { 
+  loose: { 
+    ALLOW_COUNTER_BTC_TREND: true, 
+    REQUIRE_4H_TREND: false, 
+    ADX_MIN: 15, 
+    RSI_LONG_MIN: 40, 
+    RSI_LONG_MAX: 75, 
+    RSI_SHORT_MIN: 25, 
+    RSI_SHORT_MAX: 60, 
+    MIN_RELATIVE_VOLUME: 0.8, 
+    BOS_LOOKBACK: 4, 
+    TREND_EMA_FAST_15M: 20,        
+    TREND_EMA_SLOW_15M: 50, 
+  }, 
+  strict: { 
+    ALLOW_COUNTER_BTC_TREND: false, 
+    REQUIRE_4H_TREND: true, 
+    ADX_MIN: 20, 
+    RSI_LONG_MIN: 48, 
+    RSI_LONG_MAX: 68, 
+    RSI_SHORT_MIN: 32, 
+    RSI_SHORT_MAX: 52, 
+    MIN_RELATIVE_VOLUME: 1.2, 
+    BOS_LOOKBACK: 10, 
+    TREND_EMA_FAST_15M: 20, 
+    TREND_EMA_SLOW_15M: 50, 
+  } 
+}; 
 
-let STRATEGY_PROFILE_NAME = (process.env.STRATEGY_PROFILE || 'strict').toLowerCase(); 5]
-let activeProfile = STRATEGY_PROFILES[STRATEGY_PROFILE_NAME] || STRATEGY_PROFILES.strict; 5]
+let STRATEGY_PROFILE_NAME = (process.env.STRATEGY_PROFILE || 'strict').toLowerCase(); 
+let activeProfile = STRATEGY_PROFILES[STRATEGY_PROFILE_NAME] || STRATEGY_PROFILES.strict; 
 
-function envFloatOrProfile(envVal, profileVal) { return envVal !== undefined ? parseFloat(envVal) : profileVal; } 5]
-function envBoolOrProfile(envVal, profileVal, trueLiteral) { 5]
-  if (envVal === undefined) return profileVal; 5]
-  return trueLiteral ? envVal === 'true' : envVal !== 'false'; 5]
-} 5]
+function envFloatOrProfile(envVal, profileVal) { return envVal !== undefined ? parseFloat(envVal) : profileVal; } 
+function envBoolOrProfile(envVal, profileVal, trueLiteral) { 
+  if (envVal === undefined) return profileVal; 
+  return trueLiteral ? envVal === 'true' : envVal !== 'false'; 
+} 
 
-const config = { 5]
-  PORT: parseInt(process.env.PORT, 10) || 10000, 5]
-  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '', 5]
-  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '', 5]
-  MONGODB_URI: process.env.MONGODB_URI || '', 5]
+const config = { 
+  PORT: parseInt(process.env.PORT, 10) || 10000, 
+  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '', 
+  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '', 
+  MONGODB_URI: process.env.MONGODB_URI || '', 
   
-  CAPITAL_USD: parseFloat(process.env.CAPITAL_USD) || 10000, 5]
-  RISK_PERCENT: parseFloat(process.env.RISK_PERCENT) || 0.75, 5]
-  TOP_COIN_LIMIT: parseInt(process.env.TOP_COIN_LIMIT, 10) || 150, 5]
-  MAX_SIGNALS_PER_SCAN: parseInt(process.env.MAX_SIGNALS_PER_SCAN, 10) || 5, 5]
-  MAX_CONCURRENT_TRADES: parseInt(process.env.MAX_CONCURRENT_TRADES, 10) || 3, 5]
-  MAX_DAILY_LOSS_USD: parseFloat(process.env.MAX_DAILY_LOSS_USD) || 250, 5]
-  MAX_FUNDING_RATE: parseFloat(process.env.MAX_FUNDING_RATE) || 0.0005, 5]
-  MIN_FUNDING_RATE: parseFloat(process.env.MIN_FUNDING_RATE) || -0.0005, 5]
+  CAPITAL_USD: parseFloat(process.env.CAPITAL_USD) || 10000, 
+  RISK_PERCENT: parseFloat(process.env.RISK_PERCENT) || 0.75, 
+  TOP_COIN_LIMIT: parseInt(process.env.TOP_COIN_LIMIT, 10) || 150, 
+  MAX_SIGNALS_PER_SCAN: parseInt(process.env.MAX_SIGNALS_PER_SCAN, 10) || 5, 
+  MAX_CONCURRENT_TRADES: parseInt(process.env.MAX_CONCURRENT_TRADES, 10) || 3, 
+  MAX_DAILY_LOSS_USD: parseFloat(process.env.MAX_DAILY_LOSS_USD) || 250, 
+  MAX_FUNDING_RATE: parseFloat(process.env.MAX_FUNDING_RATE) || 0.0005, 
+  MIN_FUNDING_RATE: parseFloat(process.env.MIN_FUNDING_RATE) || -0.0005, 
 
-  ALLOW_COUNTER_BTC_TREND: envBoolOrProfile(process.env.ALLOW_COUNTER_BTC_TREND, activeProfile.ALLOW_COUNTER_BTC_TREND, false), 5]
-  REQUIRE_4H_TREND: envBoolOrProfile(process.env.REQUIRE_4H_TREND, activeProfile.REQUIRE_4H_TREND, true), 5]
-  ADX_MIN: envFloatOrProfile(process.env.ADX_MIN, activeProfile.ADX_MIN), 5]
-  RSI_LONG_MIN: envFloatOrProfile(process.env.RSI_LONG_MIN, activeProfile.RSI_LONG_MIN), 5]
-  RSI_LONG_MAX: envFloatOrProfile(process.env.RSI_LONG_MAX, activeProfile.RSI_LONG_MAX), 5]
-  RSI_SHORT_MIN: envFloatOrProfile(process.env.RSI_SHORT_MIN, activeProfile.RSI_SHORT_MIN), 5]
-  RSI_SHORT_MAX: envFloatOrProfile(process.env.RSI_SHORT_MAX, activeProfile.RSI_SHORT_MAX), 5]
-  MIN_RELATIVE_VOLUME: envFloatOrProfile(process.env.MIN_RELATIVE_VOLUME, activeProfile.MIN_RELATIVE_VOLUME), 5]
-  BOS_LOOKBACK: process.env.BOS_LOOKBACK !== undefined ? parseInt(process.env.BOS_LOOKBACK, 10) : activeProfile.BOS_LOOKBACK, 5]
-  TREND_EMA_FAST_15M: process.env.TREND_EMA_FAST_15M !== undefined ? parseInt(process.env.TREND_EMA_FAST_15M, 10) : activeProfile.TREND_EMA_FAST_15M, 5]
-  TREND_EMA_SLOW_15M: process.env.TREND_EMA_SLOW_15M !== undefined ? parseInt(process.env.TREND_EMA_SLOW_15M, 10) : activeProfile.TREND_EMA_SLOW_15M, 5]
+  ALLOW_COUNTER_BTC_TREND: envBoolOrProfile(process.env.ALLOW_COUNTER_BTC_TREND, activeProfile.ALLOW_COUNTER_BTC_TREND, false), 
+  REQUIRE_4H_TREND: envBoolOrProfile(process.env.REQUIRE_4H_TREND, activeProfile.REQUIRE_4H_TREND, true), 
+  ADX_MIN: envFloatOrProfile(process.env.ADX_MIN, activeProfile.ADX_MIN), 
+  RSI_LONG_MIN: envFloatOrProfile(process.env.RSI_LONG_MIN, activeProfile.RSI_LONG_MIN), 
+  RSI_LONG_MAX: envFloatOrProfile(process.env.RSI_LONG_MAX, activeProfile.RSI_LONG_MAX), 
+  RSI_SHORT_MIN: envFloatOrProfile(process.env.RSI_SHORT_MIN, activeProfile.RSI_SHORT_MIN), 
+  RSI_SHORT_MAX: envFloatOrProfile(process.env.RSI_SHORT_MAX, activeProfile.RSI_SHORT_MAX), 
+  MIN_RELATIVE_VOLUME: envFloatOrProfile(process.env.MIN_RELATIVE_VOLUME, activeProfile.MIN_RELATIVE_VOLUME), 
+  BOS_LOOKBACK: process.env.BOS_LOOKBACK !== undefined ? parseInt(process.env.BOS_LOOKBACK, 10) : activeProfile.BOS_LOOKBACK, 
+  TREND_EMA_FAST_15M: process.env.TREND_EMA_FAST_15M !== undefined ? parseInt(process.env.TREND_EMA_FAST_15M, 10) : activeProfile.TREND_EMA_FAST_15M, 
+  TREND_EMA_SLOW_15M: process.env.TREND_EMA_SLOW_15M !== undefined ? parseInt(process.env.TREND_EMA_SLOW_15M, 10) : activeProfile.TREND_EMA_SLOW_15M, 
 
-  ATR_STOP_MULT: parseFloat(process.env.ATR_STOP_MULT) || 2.3, 5]
-  TP1_MULT: parseFloat(process.env.TP1_MULT) || 1.3, 5]
-  TP2_MULT: parseFloat(process.env.TP2_MULT) || 2.5, 5]
-  MAX_HOLD_HOURS: parseFloat(process.env.MAX_HOLD_HOURS) || 4, 5]
-  ABSOLUTE_MAX_HOLD_HOURS: parseFloat(process.env.ABSOLUTE_MAX_HOLD_HOURS) || 24, 5]
-  MAX_SAME_DIRECTION: parseInt(process.env.MAX_SAME_DIRECTION, 10) || 2, 5]
-  TRAILING_STOP_ENABLED: process.env.TRAILING_STOP_ENABLED !== 'false', 5]
-  TRAILING_ATR_MULT: parseFloat(process.env.TRAILING_ATR_MULT) || 2.2, 5]
-  DYNAMIC_TRAILING_ATR: process.env.DYNAMIC_TRAILING_ATR !== 'false', 5]
-  FAST_TRACK_INTERVAL_SECONDS: parseInt(process.env.FAST_TRACK_INTERVAL_SECONDS, 10) || 60, 5]
-  TICKER_BATCH_SIZE: parseInt(process.env.TICKER_BATCH_SIZE, 10) || 10, 5]
-  SLIPPAGE_PERCENT: parseFloat(process.env.SLIPPAGE_PERCENT) || 0.05, 5]
-  FEE_PERCENT: parseFloat(process.env.FEE_PERCENT) || 0.1, 5]
-  TP1_CLOSE_PERCENT: parseFloat(process.env.TP1_CLOSE_PERCENT) || 60, 5]
-  ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false', 5]
-  MAX_EXPOSURE_RATIO: parseFloat(process.env.MAX_EXPOSURE_RATIO) || 0.6, 5]
-  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 5, 5]
-  MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10, 5]
-  LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3, 5]
-  MARGIN_MODE: (process.env.MARGIN_MODE || 'ISOLATED').toUpperCase(), 5]
+  ATR_STOP_MULT: parseFloat(process.env.ATR_STOP_MULT) || 2.3, 
+  TP1_MULT: parseFloat(process.env.TP1_MULT) || 1.3, 
+  TP2_MULT: parseFloat(process.env.TP2_MULT) || 2.5, 
+  MAX_HOLD_HOURS: parseFloat(process.env.MAX_HOLD_HOURS) || 4, 
+  ABSOLUTE_MAX_HOLD_HOURS: parseFloat(process.env.ABSOLUTE_MAX_HOLD_HOURS) || 24, 
+  MAX_SAME_DIRECTION: parseInt(process.env.MAX_SAME_DIRECTION, 10) || 2, 
+  TRAILING_STOP_ENABLED: process.env.TRAILING_STOP_ENABLED !== 'false', 
+  TRAILING_ATR_MULT: parseFloat(process.env.TRAILING_ATR_MULT) || 2.2, 
+  DYNAMIC_TRAILING_ATR: process.env.DYNAMIC_TRAILING_ATR !== 'false', 
+  FAST_TRACK_INTERVAL_SECONDS: parseInt(process.env.FAST_TRACK_INTERVAL_SECONDS, 10) || 60, 
+  TICKER_BATCH_SIZE: parseInt(process.env.TICKER_BATCH_SIZE, 10) || 10, 
+  SLIPPAGE_PERCENT: parseFloat(process.env.SLIPPAGE_PERCENT) || 0.05, 
+  FEE_PERCENT: parseFloat(process.env.FEE_PERCENT) || 0.1, 
+  TP1_CLOSE_PERCENT: parseFloat(process.env.TP1_CLOSE_PERCENT) || 60, 
+  ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false', 
+  MAX_EXPOSURE_RATIO: parseFloat(process.env.MAX_EXPOSURE_RATIO) || 0.6, 
+  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 5, 
+  MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10, 
+  LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3, 
+  MARGIN_MODE: (process.env.MARGIN_MODE || 'ISOLATED').toUpperCase(), 
 
-  LOCK_ACQUIRE_RETRIES: parseInt(process.env.LOCK_ACQUIRE_RETRIES, 10) || 8, 5]
-  LOCK_ACQUIRE_RETRY_DELAY_MS: parseInt(process.env.LOCK_ACQUIRE_RETRY_DELAY_MS, 10) || 5000, 5]
-  LOCK_STALE_AFTER_MS: parseInt(process.env.LOCK_STALE_AFTER_MS, 10) || 5 * 60 * 1000, 5]
+  LOCK_ACQUIRE_RETRIES: parseInt(process.env.LOCK_ACQUIRE_RETRIES, 10) || 8, 
+  LOCK_ACQUIRE_RETRY_DELAY_MS: parseInt(process.env.LOCK_ACQUIRE_RETRY_DELAY_MS, 10) || 5000, 
+  LOCK_STALE_AFTER_MS: parseInt(process.env.LOCK_STALE_AFTER_MS, 10) || 5 * 60 * 1000, 
 
-  FUNDING_INTERVAL_HOURS: parseFloat(process.env.FUNDING_INTERVAL_HOURS) || 8, 5]
-  SCAN_STATS_TELEGRAM_EVERY_N_SCANS: parseInt(process.env.SCAN_STATS_TELEGRAM_EVERY_N_SCANS, 10) || 4, 5]
+  FUNDING_INTERVAL_HOURS: parseFloat(process.env.FUNDING_INTERVAL_HOURS) || 8, 
+  SCAN_STATS_TELEGRAM_EVERY_N_SCANS: parseInt(process.env.SCAN_STATS_TELEGRAM_EVERY_N_SCANS, 10) || 4, 
   
-  MAX_KLINES_CACHE_SIZE: parseInt(process.env.MAX_KLINES_CACHE_SIZE, 10) || 200, 5]
-  CACHE_CLEANUP_MINUTES: parseInt(process.env.CACHE_CLEANUP_MINUTES, 10) || 5, 5]
+  MAX_KLINES_CACHE_SIZE: parseInt(process.env.MAX_KLINES_CACHE_SIZE, 10) || 200, 
+  CACHE_CLEANUP_MINUTES: parseInt(process.env.CACHE_CLEANUP_MINUTES, 10) || 5, 
   
-  RISK_WARNING_ENABLED: process.env.RISK_WARNING_ENABLED !== 'false', 5]
-  MAX_WEEKLY_DRAWDOWN_PERCENT: parseFloat(process.env.MAX_WEEKLY_DRAWDOWN_PERCENT) || 10, 5]
-  MAX_CONSECUTIVE_LOSSES: parseInt(process.env.MAX_CONSECUTIVE_LOSSES, 10) || 3, 5]
+  RISK_WARNING_ENABLED: process.env.RISK_WARNING_ENABLED !== 'false', 
+  MAX_WEEKLY_DRAWDOWN_PERCENT: parseFloat(process.env.MAX_WEEKLY_DRAWDOWN_PERCENT) || 10, 
+  MAX_CONSECUTIVE_LOSSES: parseInt(process.env.MAX_CONSECUTIVE_LOSSES, 10) || 3, 
   
-  ENABLE_ADAPTIVE_PARAMS: process.env.ENABLE_ADAPTIVE_PARAMS !== 'false', 5]
-  ENABLE_KELLY_SIZING: process.env.ENABLE_KELLY_SIZING !== 'false', 5]
-  ENABLE_ORDERBOOK_ANALYSIS: process.env.ENABLE_ORDERBOOK_ANALYSIS !== 'false', 5]
-  ENABLE_CORRELATION_LIMITS: process.env.ENABLE_CORRELATION_LIMITS !== 'false', 5]
-  ENABLE_MULTI_TF_DERIVATION: process.env.ENABLE_MULTI_TF_DERIVATION !== 'false', 5]
-  ENABLE_PRELOADING: process.env.ENABLE_PRELOADING !== 'false', 5]
-  ENABLE_BATCH_SIGNALS: process.env.ENABLE_BATCH_SIGNALS !== 'false', 5]
-  ORDERBOOK_DEPTH_LEVELS: parseInt(process.env.ORDERBOOK_DEPTH_LEVELS, 10) || 10, 5]
+  ENABLE_ADAPTIVE_PARAMS: process.env.ENABLE_ADAPTIVE_PARAMS !== 'false', 
+  ENABLE_KELLY_SIZING: process.env.ENABLE_KELLY_SIZING !== 'false', 
+  ENABLE_ORDERBOOK_ANALYSIS: process.env.ENABLE_ORDERBOOK_ANALYSIS !== 'false', 
+  ENABLE_CORRELATION_LIMITS: process.env.ENABLE_CORRELATION_LIMITS !== 'false', 
+  ENABLE_MULTI_TF_DERIVATION: process.env.ENABLE_MULTI_TF_DERIVATION !== 'false', 
+  ENABLE_PRELOADING: process.env.ENABLE_PRELOADING !== 'false', 
+  ENABLE_BATCH_SIGNALS: process.env.ENABLE_BATCH_SIGNALS !== 'false', 
+  ORDERBOOK_DEPTH_LEVELS: parseInt(process.env.ORDERBOOK_DEPTH_LEVELS, 10) || 10, 
   
-  MAX_DRAWDOWN_PERCENT: parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 25, 5]
-  DAILY_PROFIT_TARGET: parseFloat(process.env.DAILY_PROFIT_TARGET) || 500, 5]
-  MONGODB_POOL_SIZE: parseInt(process.env.MONGODB_POOL_SIZE, 10) || 10, 5]
-  DB_BULK_INTERVAL_MS: parseInt(process.env.DB_BULK_INTERVAL_MS, 10) || 5000, 5]
+  MAX_DRAWDOWN_PERCENT: parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 25, 
+  DAILY_PROFIT_TARGET: parseFloat(process.env.DAILY_PROFIT_TARGET) || 500, 
+  MONGODB_POOL_SIZE: parseInt(process.env.MONGODB_POOL_SIZE, 10) || 10, 
+  DB_BULK_INTERVAL_MS: parseInt(process.env.DB_BULK_INTERVAL_MS, 10) || 5000, 
   
-  MAX_SPREAD_PERCENT: parseFloat(process.env.MAX_SPREAD_PERCENT) || 0.15, 5]
-  MAX_CHOP_INDEX: parseFloat(process.env.MAX_CHOP_INDEX) || 61.8, 5]
-  MIN_HURST_EXPONENT: parseFloat(process.env.MIN_HURST_EXPONENT) || 0.52, 5]
+  MAX_SPREAD_PERCENT: parseFloat(process.env.MAX_SPREAD_PERCENT) || 0.15, 
+  MAX_CHOP_INDEX: parseFloat(process.env.MAX_CHOP_INDEX) || 61.8, 
+  MIN_HURST_EXPONENT: parseFloat(process.env.MIN_HURST_EXPONENT) || 0.52, 
 
-  ML_ENABLED: process.env.ML_ENABLED !== 'false', 5]
-  ML_MIN_TRAINING_SAMPLES: parseInt(process.env.ML_MIN_TRAINING_SAMPLES, 10) || 40, 5]
-  ML_MAX_TRAINING_SAMPLES: parseInt(process.env.ML_MAX_TRAINING_SAMPLES, 10) || 2000, 5]
-  ML_MIN_PREDICTION_PROBABILITY: parseFloat(process.env.ML_MIN_PREDICTION_PROBABILITY) || 0.55, 5]
-  ML_STRONG_SIGNAL_PROBABILITY: parseFloat(process.env.ML_STRONG_SIGNAL_PROBABILITY) || 0.70, 5]
-  ML_RETRAIN_HOURS: parseFloat(process.env.ML_RETRAIN_HOURS) || 6, 5]
-  ML_EPOCHS: parseInt(process.env.ML_EPOCHS, 10) || 80, 5]
-  ML_BATCH_SIZE: parseInt(process.env.ML_BATCH_SIZE, 10) || 32, 5]
-}; 5]
+  ML_ENABLED: process.env.ML_ENABLED !== 'false', 
+  ML_MIN_TRAINING_SAMPLES: parseInt(process.env.ML_MIN_TRAINING_SAMPLES, 10) || 40, 
+  ML_MAX_TRAINING_SAMPLES: parseInt(process.env.ML_MAX_TRAINING_SAMPLES, 10) || 2000, 
+  ML_MIN_PREDICTION_PROBABILITY: parseFloat(process.env.ML_MIN_PREDICTION_PROBABILITY) || 0.55, 
+  ML_STRONG_SIGNAL_PROBABILITY: parseFloat(process.env.ML_STRONG_SIGNAL_PROBABILITY) || 0.70, 
+  ML_RETRAIN_HOURS: parseFloat(process.env.ML_RETRAIN_HOURS) || 6, 
+  ML_EPOCHS: parseInt(process.env.ML_EPOCHS, 10) || 80, 
+  ML_BATCH_SIZE: parseInt(process.env.ML_BATCH_SIZE, 10) || 32, 
+}; 
 
 function validateConfig() {
   const numericFields = [
@@ -1351,7 +1351,7 @@ async function fetchKucoinKlines(symbol, timeframe = '15m', limit = 100) {
         const high = safeParseFloat(c[2], 'high', context);
         const low = safeParseFloat(c[3], 'low', context);
         const close = safeParseFloat(c[4], 'close', context);
-        const volume = safeParseFloat(c[5], 'volume', context);
+        const volume = safeParseFloat(c[, 'volume', context);
         if ([open, close, high, low, volume].some(v => v === null) || Number.isNaN(time)) return null;
         return { time, open, close, high, low, volume };
       }).filter(Boolean);
