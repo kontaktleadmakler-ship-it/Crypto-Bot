@@ -1,9 +1,8 @@
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - ULTIMATE v21.7 DYNAMIC VOLATILITY SURFACE EDITION
- * (Mit adaptivem TensorFlow.js ML, globaler Telegram-Queue, State-Persistenz,
- *  Hurst-Exponent, Marktphasen-Logging, Dynamic Filter Control, Cross-Hedging,
- *  Dynamic Volatility Surface & Order Flow / CVD Analyzer)
+ * TRADING SIGNAL BOT - ULTIMATE v21.7 DYNAMIC VOLATILITY SURFACE & DQN EDITION
+ * (Mit adaptivem TensorFlow.js ML, Deep Q-Network Agent, globaler Telegram-Queue,
+ *  State-Persistenz, Hurst-Exponent, Marktphasen-Logging & Dynamic Filter Control)
  * ============================================================================
  */
 
@@ -14,9 +13,10 @@ const axios = require('axios');
 const { MongoClient } = require('mongodb');
 const winston = require('winston');
 const { TensorFlowSignalModel } = require('./ml-engine');
-const { HedgeManager } = require('./hedgeManager'); // <-- HedgeManager Modul eingebunden
-const { VolatilitySurfaceManager } = require('./volatilitySurface'); // <-- VolatilitySurfaceManager Modul eingebunden
-const { OrderFlowAnalyzer } = require('./orderFlowAnalyzer'); // <-- OrderFlowAnalyzer Modul eingebunden
+const { DeepQTheTradingAgent } = require('./rl-engine'); // <-- DQN Agent Modul eingebunden
+const { HedgeManager } = require('./hedgeManager');
+const { VolatilitySurfaceManager } = require('./volatilitySurface');
+const { OrderFlowAnalyzer } = require('./orderFlowAnalyzer');
 const { runBacktest, buildConfig: buildBacktestConfig } = require('./backtest-engine');
 
 // ==========================================
@@ -483,6 +483,9 @@ const config = {
   ML_RETRAIN_HOURS: parseFloat(process.env.ML_RETRAIN_HOURS) || 6,
   ML_EPOCHS: parseInt(process.env.ML_EPOCHS, 10) || 80,
   ML_BATCH_SIZE: parseInt(process.env.ML_BATCH_SIZE, 10) || 32,
+  
+  // DQN spezifische Config
+  DQN_ENABLED: process.env.DQN_ENABLED !== 'false',
 };
 
 function validateConfig() {
@@ -558,6 +561,14 @@ const mlModel = new TensorFlowSignalModel({
   logger
 });
 
+// Initialisierung des DQN-Agents
+const dqnAgent = new DeepQTheTradingAgent({
+  modelDir: process.env.DQN_MODEL_DIR || './models/rl-dqn-model',
+  stateSize: 16,
+  actionSize: 3,
+  logger
+});
+
 // Initialisierung der Manager (inkl. OrderFlowAnalyzer)
 const hedgeManager = new HedgeManager({ logger, thresholdDropPct: -2.5 });
 const volManager = new VolatilitySurfaceManager({ logger });
@@ -570,6 +581,28 @@ function buildMLFeatures(data) {
   return mlModel.buildFeatures(data);
 }
 
+// Hilfsfunktion zum Erstellen des DQN-Zustandsvektors aus Marktdaten
+function buildDQNStateVector(params) {
+  return [
+    params.adx ? params.adx / 50 : 0.5,
+    params.rsi ? params.rsi / 100 : 0.5,
+    params.hurst || 0.5,
+    params.relativeVolume ? Math.min(params.relativeVolume / 5, 1) : 0.2,
+    params.signalScore ? params.signalScore / 100 : 0.5,
+    params.direction === 'LONG' ? 1 : 0,
+    params.marketPhase === 'TRENDING' ? 1 : 0,
+    params.marketPhase === 'RANGING' ? 0.5 : 0,
+    params.atrPct || 0.02,
+    params.pocDistancePct || 0,
+    params.vwapDistancePct || 0,
+    params.orderBookImbalance || 1,
+    params.spreadPct || 0.1,
+    params.volatilityRatio || 1,
+    params.mlProbability || 0.5,
+    0.5
+  ];
+}
+
 async function trainSignalMLModel(force = false) {
   if (!config.ML_ENABLED) return { trained: false, reason: 'disabled' };
   if (!closedTradesCollection || !isDbConnected) return { trained: false, reason: 'db-unavailable' };
@@ -577,6 +610,12 @@ async function trainSignalMLModel(force = false) {
     const result = await mlModel.trainFromTrades(closedTradesCollection, { force });
     isModelTrained = !!result.trained;
     lastMLTrainingStats = result;
+
+    // DQN Training ebenfalls ausführen, wenn DB verfügbar ist
+    if (config.DQN_ENABLED) {
+      await dqnAgent.trainFromClosedTrades(closedTradesCollection);
+    }
+
     return result;
   } catch (e) {
     logger.error(`[TensorFlow.js ML Fehler beim Training]: ${e.message}`);
@@ -590,6 +629,11 @@ async function loadSignalMLModel() {
     const loaded = await mlModel.load();
     isModelTrained = loaded;
     if (loaded) lastMLTrainingStats = mlModel.getStats();
+    
+    if (config.DQN_ENABLED) {
+      await dqnAgent.init();
+    }
+
     return loaded;
   } catch (e) {
     logger.warn(`[TensorFlow.js ML] Kein gespeichertes Modell geladen: ${e.message}`);
@@ -970,7 +1014,6 @@ function checkGlobalDrawdown(currentEquity) {
     isPaused = true;
     persistPauseState();
     persistPeakCapital();
-    // Automatische Push-Warnung entfernt
     return true;
   }
   return false;
@@ -1689,6 +1732,7 @@ function formatScanStatsReport(stats) {
   if (stats.skippedDynamicBlacklist) reasons.push(`KI-Erfahrung (Loss-Blocker): ${stats.skippedDynamicBlacklist}`);
   if (stats.timeBlocked) reasons.push(`Time-Learning Filter (ungünstige Stunde/Tag): ${stats.timeBlocked}`);
   if (stats.mlBlocked) reasons.push(`TensorFlow.js ML-Filter blockiert: ${stats.mlBlocked}`);
+  if (stats.dqnBlocked) reasons.push(`DQN Agent (Reinforcement Learning) blockiert: ${stats.dqnBlocked}`);
   if (stats.hurstBlocked) reasons.push(`Hurst-Exponent (Zufallsmarkt): ${stats.hurstBlocked}`);
   if (stats.adxTooLow) reasons.push(`ADX zu niedrig: ${stats.adxTooLow}`);
   if (stats.marketChoppy) reasons.push(`Markt seitwärts (CHOP): ${stats.marketChoppy}`);
@@ -1718,6 +1762,7 @@ function formatScanStatsReport(stats) {
     (stats.skippedDynamicBlacklist || 0) +
     (stats.timeBlocked || 0) +
     (stats.mlBlocked || 0) +
+    (stats.dqnBlocked || 0) +
     (stats.hurstBlocked || 0) +
     (stats.adxTooLow || 0) +
     (stats.marketChoppy || 0) +
@@ -1831,7 +1876,6 @@ async function checkActiveTrades() {
     if (trackerTimeout) { clearTimeout(trackerTimeout); trackerTimeout = null; }
     lastTrackerCheckTime = Date.now();
 
-    // 🛡️ Cross-Hedging Check für Bitcoin ausführen
     const btcMark = await fetchKucoinMarkPrice('BTC-USDT') || await fetchKucoinTickerPrice('BTC-USDT');
     if (btcMark && activeTrades.size > 0) {
       const hedgeEvaluation = await hedgeManager.evaluateHedgeNeed(activeTrades, btcMark);
@@ -2124,7 +2168,7 @@ function createEmptyScanStats() {
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    timeBlocked: 0, mlBlocked: 0
+    timeBlocked: 0, mlBlocked: 0, dqnBlocked: 0
   };
 }
 
@@ -2134,7 +2178,7 @@ async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.7...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.7 (mit DQN)...`);
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
@@ -2274,7 +2318,6 @@ async function scanMarket() {
         const futuresData = await fetchFuturesData(symbol).catch(() => null);
         const orderBookMetrics = await fetchOrderBookMetrics(symbol).catch(() => ({ spreadPct: 0, bidAskRatio: 1 }));
 
-        // 🌊 Order Flow & CVD Filter-Auswertung einbinden
         const orderFlowEval = orderFlowManager.evaluateOrderFlow(raw15m, orderBookMetrics);
 
         const closes4h = raw4h ? raw4h.map(c => c.close) : [];
@@ -2327,7 +2370,6 @@ async function scanMarket() {
         }
 
         if (direction !== null) {
-          // Zusätzlicher Order Flow Filter-Check
           if (direction === 'LONG' && orderFlowEval.pressure === 'BEARISH_DOMINANT' && orderFlowEval.score < 35) {
             scanStats.orderFlowBlocked++;
             return;
@@ -2389,12 +2431,30 @@ async function scanMarket() {
             return;
           }
 
+          // 🤖 DQN Agent Entscheidung einbinden: Action 0 = Hold (Blockieren), 1 = Long, 2 = Short
+          if (config.DQN_ENABLED && dqnAgent.isInitialized) {
+            const dqnState = buildDQNStateVector({
+              adx, rsi, hurst, relativeVolume, signalScore, direction,
+              marketPhase: currentMarketPhase, atrPct, pocDistancePct,
+              vwapDistancePct, orderBookImbalance: orderBookMetrics.bidAskRatio,
+              spreadPct: orderBookMetrics.spreadPct, volatilityRatio: btcATR > 0 ? atr / btcATR : 1,
+              mlProbability: mlPrediction.probability
+            });
+            const dqnAction = dqnAgent.act(dqnState);
+            const expectedAction = direction === 'LONG' ? 1 : 2;
+
+            // Wenn der DQN Agent (außerhalb der Explorationsphase) strikt "Hold" (0) wählt oder eine entgegengesetzte Richtung erzwingen will:
+            if (dqnAction === 0 && Math.random() >= dqnAgent.epsilon) {
+              scanStats.dqnBlocked++;
+              return;
+            }
+          }
+
           if (shouldSkipSignal(symbol, direction, signalScore)) {
             scanStats.signalHistoryBlocked++;
             return;
           }
 
-          // 🌊 Volatility Surface Evaluierung einbinden
           const volEvaluation = await volManager.evaluateVolatilityMultiplier(symbol, atr, currentPrice);
 
           const entryPrice = applySlippage(currentPrice, direction, 'entry');
@@ -2488,7 +2548,8 @@ async function scanMarket() {
             `TP1: $${tp1.toFixed(6)} | TP2: $${tp2.toFixed(6)}\n` +
             `Größe: ${sizing.contracts} Kontrakte | Risk: $${sizing.riskAmountUSD.toFixed(2)}\n` +
             `ADX: ${adx} | Hurst: ${hurst} | CVD-Score: ${orderFlowEval.score}\n` +
-            `🧠 TensorFlow.js: ${mlPrediction.trained ? (mlPrediction.probability * 100).toFixed(1) + '% Erfolgswahrscheinlichkeit' : 'noch nicht trainiert'}`;
+            `🧠 TensorFlow.js: ${mlPrediction.trained ? (mlPrediction.probability * 100).toFixed(1) + '% Erfolgswahrscheinlichkeit' : 'noch nicht trainiert'}\n` +
+            `🤖 DQN Epsilon: ${dqnAgent.getStats().epsilon}`;
 
           if (config.ENABLE_BATCH_SIGNALS) {
             signalBatch.push({ text: signalText });
@@ -2557,7 +2618,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
-      `<b>🤖 TRADING BOT v21.7 - MODULARES CONTROL SYSTEM</b>\n` +
+      `<b>🤖 TRADING BOT v21.7 - DQN & MODULAR SYSTEM</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
       `<b>⚙️ DYNAMISCHE FILTER-STEUERUNG:</b>\n` +
       `/filters - Zeigt alle Indikator-Status & Werte an\n` +
@@ -2574,9 +2635,10 @@ async function handleTelegramCommand(chatId, text) {
       `/db - MongoDB Verbindungs-Check\n` +
       `/scanstats - Scan-Diagnose & Filter\n` +
       `/logs - Letzte 15 System-Logs anzeigen\n\n` +
-      `<b>🤖 Künstliche Intelligenz (Gemini):</b>\n` +
+      `<b>🤖 Künstliche Intelligenz & DQN:</b>\n` +
       `/ki [Frage] - Marktanalyse per KI abfragen\n` +
-      `/report - Automatisches KI-Trading Briefing\n\n` +
+      `/report - Automatisches KI-Trading Briefing\n` +
+      `/retrain - TensorFlow.js & DQN Agent neu trainieren\n\n` +
       `<b>🚨 Trade-Steuerung:</b>\n` +
       `/close [Symbol] - Einzelnen Trade schließen (z. B. <code>/close BTC-USDT</code>)\n` +
       `/closeall - ALLE aktiven Trades sofort schließen\n` +
@@ -2588,10 +2650,9 @@ async function handleTelegramCommand(chatId, text) {
       `/setrisk [Prozent] - Risiko pro Trade anpassen\n` +
       `/setleverage [1-100] - Hebel anpassen\n` +
       `/setprofile [strict|loose] - Strategie-Profil umschalten\n\n` +
-      `<b>🚫 Blacklist & KI:</b>\n` +
+      `<b>🚫 Blacklist:</b>\n` +
       `/blacklist / /unblacklist [Symbol] - Coins verwalten\n` +
-      `/showblacklist - Gesperrte Coins auflisten\n` +
-      `/retrain - TensorFlow.js KI neu trainieren\n\n` +
+      `/showblacklist - Gesperrte Coins auflisten\n\n` +
       `<b>🎮 System:</b>\n` +
       `/pause | /resume | /scan | /backtest [Symbol] [Days]`
     );
@@ -3028,13 +3089,13 @@ async function handleTelegramCommand(chatId, text) {
   }
 
   if (command === '/retrain') {
-    await sendTelegramReply(chatId, '🧠 <i>Starte manuelles TensorFlow.js KI-Training mit Hyperparameter-Tuning...</i>');
+    await sendTelegramReply(chatId, '🧠 <i>Starte manuelles KI-Training (TensorFlow.js & DQN Agent)...</i>');
     const res = await trainSignalMLModel(true);
+    const dqnStats = dqnAgent.getStats();
     if (res.trained) {
-      const bp = res.bestHyperparameters ? `\n• LR: ${res.bestHyperparameters.learningRate} | Dropout: ${res.bestHyperparameters.dropoutRate}` : '';
-      await sendTelegramReply(chatId, `🟢 <b>KI-Training erfolgreich!</b>\nSamples: ${res.samples} | Epochs: ${res.epochs}${bp}`);
+      await sendTelegramReply(chatId, `🟢 <b>KI & DQN Training erfolgreich!</b>\nSamples: ${res.samples} | DQN Epsilon: ${dqnStats.epsilon}`);
     } else {
-      await sendTelegramReply(chatId, `⚠️ <b>KI-Training nicht durchgeführt:</b> ${escapeHtml(res.reason)}`);
+      await sendTelegramReply(chatId, `⚠️ <b>Training nicht durchgeführt:</b> ${escapeHtml(res.reason)}`);
     }
     return;
   }
@@ -3124,17 +3185,17 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v21.7 ULTIMATE TFJS</b>`);
+    lines.push(`🤖 <b>BOT STATUS v21.7 ULTIMATE DQN</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
     
     const mlStats = mlModel.getStats();
-    let mlInfo = `ML: ${isModelTrained ? '🟢 TensorFlow.js aktiv' : '🟡 nicht trainiert'} | Samples: ${mlStats.samples || 0}`;
-    if (mlStats.bestHyperparameters) {
-      mlInfo += ` | LR: ${mlStats.bestHyperparameters.learningRate}`;
-    }
+    const dqnStats = dqnAgent.getStats();
+    let mlInfo = `ML: ${isModelTrained ? '🟢 Aktiv' : '🟡 Inaktiv'} | Samples: ${mlStats.samples || 0}`;
+    let dqnInfo = `🤖 DQN: Epsilon: ${dqnStats.epsilon} | Memory: ${dqnStats.memorySize}`;
     lines.push(mlInfo);
+    lines.push(dqnInfo);
     
     lines.push(`Scans: ${isPaused ? '⏸️ PAUSIERT' : '▶️ aktiv'}`);
     lines.push(`Kapital: $${config.CAPITAL_USD.toFixed(0)} | Peak: $${peakCapital.toFixed(0)}`);
@@ -3279,7 +3340,7 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v21.7 ULTIMATE TFJS | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v21.7 ULTIMATE DQN | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 app.get('/health', (req, res) => {
@@ -3359,7 +3420,8 @@ app.get('/api/ml/status', (req, res) => {
   res.json({
     enabled: config.ML_ENABLED,
     trained: isModelTrained,
-    ...mlModel.getStats()
+    ...mlModel.getStats(),
+    dqn: dqnAgent.getStats()
   });
 });
 
@@ -3416,7 +3478,7 @@ process.on('unhandledRejection', async (reason) => {
 // 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v21.7 ULTIMATE TFJS (Full Features, TensorFlow.js ML, Time-Learning Filter, Cross-Hedging, Volatility Surface & Order Flow)...');
+  logger.info('🚀 Starte Trading Bot v21.7 ULTIMATE DQN (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
