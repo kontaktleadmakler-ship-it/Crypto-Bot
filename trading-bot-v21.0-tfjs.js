@@ -1,7 +1,8 @@
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - ULTIMATE v21.0 FULL COMPLETE EDITION (PATCHED + RL)
- * (Mit adaptivem TensorFlow.js ML & RL, globaler Telegram-Queue, State-Persistenz & Hurst-Exponent)
+ * TRADING SIGNAL BOT - ULTIMATE v21.6 DYNAMIC FILTER & TIME-LEARNING EDITION
+ * (Mit adaptivem TensorFlow.js ML, globaler Telegram-Queue, State-Persistenz,
+ *  Hurst-Exponent, Marktphasen-Logging, Dynamic Filter Control & Time-Learning)
  * ============================================================================
  */
 
@@ -12,18 +13,36 @@ const axios = require('axios');
 const { MongoClient } = require('mongodb');
 const winston = require('winston');
 const { TensorFlowSignalModel } = require('./ml-engine');
-const { DeepQTheTradingAgent } = require('./rl-engine'); // <-- NEU: RL-Engine Import
+const { runBacktest, buildConfig: buildBacktestConfig } = require('./backtest-engine');
 
 // ==========================================
-// 1. LOGGER & GLOBALE ZUSTÄNDE
+// 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
 // ==========================================
+const { Writable } = require('stream');
+
+const recentLogs = [];
+const memoryStream = new Writable({
+  write(chunk, encoding, callback) {
+    recentLogs.push(chunk.toString().trim());
+    if (recentLogs.length > 50) recentLogs.shift();
+    callback();
+  }
+});
+
+const memoryLogTransport = new winston.transports.Stream({
+  stream: memoryStream
+});
+
 const logger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
     winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
     winston.format.printf(({ timestamp, level, message }) => `[${timestamp}] ${level.toUpperCase()}: ${message}`)
   ),
-  transports: [new winston.transports.Console()]
+  transports: [
+    new winston.transports.Console(),
+    memoryLogTransport
+  ]
 });
 
 let isShuttingDown = false;
@@ -36,7 +55,7 @@ let currentStreak = 0;
 let maxWinStreak = 0;
 let maxLossStreak = 0;
 
-let peakCapital = 10000;
+let peakCapital = parseFloat(process.env.CAPITAL_USD) || 10000;
 let dailyNetPnL = 0;
 let consecutiveLosses = 0;
 
@@ -48,8 +67,31 @@ let kucoinCircuitOpenUntil = 0;
 const KUCOIN_CIRCUIT_THRESHOLD = 3;
 const KUCOIN_CIRCUIT_COOLDOWN_MS = 300000;
 
+const manualBlacklist = new Set();
+
 // ==========================================
-// 2. API LATENZ & RATE LIMITER
+// 2. FILTER REGISTRY & ZENTRALE KONFIGURATION
+// ==========================================
+const FILTER_REGISTRY = {
+  hurst: { configKey: 'MIN_HURST_EXPONENT', name: 'Hurst Exponent', default: 0.52, type: 'numeric', step: 0.02, direction: 'higher_is_harder', min: 0.0, max: 0.95 },
+  adx:   { configKey: 'ADX_MIN',            name: 'ADX Minimum',    default: 20,   type: 'numeric', step: 2.0,  direction: 'higher_is_harder', min: 0,   max: 60 },
+  bos:   { configKey: 'BOS_LOOKBACK',       name: 'BOS Lookback',   default: 10,   type: 'numeric', step: 2,    direction: 'higher_is_harder', min: 2,   max: 50 },
+  relvol:{ configKey: 'MIN_RELATIVE_VOLUME',name: 'Rel. Volumen',   default: 1.2,  type: 'numeric', step: 0.1,  direction: 'higher_is_harder', min: 0.0, max: 10.0 },
+  chop:  { configKey: 'MAX_CHOP_INDEX',     name: 'Max Chop Index', default: 61.8, type: 'numeric', step: 2.0,  direction: 'lower_is_harder',  min: 10,  max: 90 },
+  rsi_long_min:  { configKey: 'RSI_LONG_MIN',  name: 'RSI Long Min',   default: 48,   type: 'numeric', step: 2.0,  direction: 'higher_is_harder', min: 10,  max: 80 },
+  rsi_short_max: { configKey: 'RSI_SHORT_MAX', name: 'RSI Short Max',  default: 52,   type: 'numeric', step: 2.0,  direction: 'lower_is_harder',  min: 20,  max: 90 },
+  trend4h:       { configKey: 'REQUIRE_4H_TREND', name: '4H Trend-Filter', default: true, type: 'boolean' },
+  btctrend:      { configKey: 'ALLOW_COUNTER_BTC_TREND', name: 'Gegen-BTC-Trend', default: false, type: 'boolean' },
+  timetrend:     { configKey: 'ENABLE_TIME_FILTER', name: 'Time-based Learning Filter', default: true, type: 'boolean' }
+};
+
+const filterState = {};
+Object.keys(FILTER_REGISTRY).forEach(key => {
+  filterState[key] = { enabled: true };
+});
+
+// ==========================================
+// 3. API LATENZ & RATE LIMITER
 // ==========================================
 const apiLatencyStats = {
   kucoin: [],
@@ -92,7 +134,7 @@ const apiRateLimiter = {
 };
 
 // ==========================================
-// 3. BULK QUEUE & LRU CACHE
+// 4. BULK QUEUE & LRU CACHE
 // ==========================================
 let dbBulkQueue = [];
 let dbBulkTimer = null;
@@ -134,7 +176,7 @@ class LRUCache {
 }
 
 // ==========================================
-// 4. HELFER & TELEGRAM ENGINE
+// 5. HELFER & TELEGRAM ENGINE
 // ==========================================
 function safeParseFloat(value, fieldName, context) {
   const parsed = parseFloat(value);
@@ -284,7 +326,7 @@ function updateTelegramConfig(token, chatId) {
 }
 
 // ==========================================
-// 5. KORRELATIONS-GRUPPEN
+// 6. KORRELATIONS-GRUPPEN
 // ==========================================
 const CORRELATION_GROUPS = {
   'MAJOR':   ['BTC-USDT', 'ETH-USDT'],
@@ -308,7 +350,7 @@ function checkCorrelationLimit(symbol, direction, activeTrades, enabled = true) 
 }
 
 // ==========================================
-// 6. KONFIGURATION & PROFILE
+// 7. STRATEGIE PROFILES & CONFIG
 // ==========================================
 const STRATEGY_PROFILES = {
   loose: {
@@ -321,7 +363,7 @@ const STRATEGY_PROFILES = {
     RSI_SHORT_MAX: 60,
     MIN_RELATIVE_VOLUME: 0.8,
     BOS_LOOKBACK: 4,
-    TREND_EMA_FAST_15M: 20,
+    TREND_EMA_FAST_15M: 20,        
     TREND_EMA_SLOW_15M: 50,
   },
   strict: {
@@ -339,8 +381,8 @@ const STRATEGY_PROFILES = {
   }
 };
 
-const STRATEGY_PROFILE_NAME = (process.env.STRATEGY_PROFILE || 'strict').toLowerCase();
-const activeProfile = STRATEGY_PROFILES[STRATEGY_PROFILE_NAME] || STRATEGY_PROFILES.strict;
+let STRATEGY_PROFILE_NAME = (process.env.STRATEGY_PROFILE || 'strict').toLowerCase();
+let activeProfile = STRATEGY_PROFILES[STRATEGY_PROFILE_NAME] || STRATEGY_PROFILES.strict;
 
 function envFloatOrProfile(envVal, profileVal) { return envVal !== undefined ? parseFloat(envVal) : profileVal; }
 function envBoolOrProfile(envVal, profileVal, trueLiteral) {
@@ -356,7 +398,7 @@ const config = {
   
   CAPITAL_USD: parseFloat(process.env.CAPITAL_USD) || 10000,
   RISK_PERCENT: parseFloat(process.env.RISK_PERCENT) || 0.75,
-  TOP_COIN_LIMIT: parseInt(process.env.TOP_COIN_LIMIT, 10) || 250,
+  TOP_COIN_LIMIT: parseInt(process.env.TOP_COIN_LIMIT, 10) || 150,
   MAX_SIGNALS_PER_SCAN: parseInt(process.env.MAX_SIGNALS_PER_SCAN, 10) || 5,
   MAX_CONCURRENT_TRADES: parseInt(process.env.MAX_CONCURRENT_TRADES, 10) || 3,
   MAX_DAILY_LOSS_USD: parseFloat(process.env.MAX_DAILY_LOSS_USD) || 250,
@@ -417,6 +459,7 @@ const config = {
   ENABLE_MULTI_TF_DERIVATION: process.env.ENABLE_MULTI_TF_DERIVATION !== 'false',
   ENABLE_PRELOADING: process.env.ENABLE_PRELOADING !== 'false',
   ENABLE_BATCH_SIGNALS: process.env.ENABLE_BATCH_SIGNALS !== 'false',
+  ENABLE_TIME_FILTER: process.env.ENABLE_TIME_FILTER !== 'false',
   ORDERBOOK_DEPTH_LEVELS: parseInt(process.env.ORDERBOOK_DEPTH_LEVELS, 10) || 10,
   
   MAX_DRAWDOWN_PERCENT: parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 25,
@@ -428,7 +471,6 @@ const config = {
   MAX_CHOP_INDEX: parseFloat(process.env.MAX_CHOP_INDEX) || 61.8,
   MIN_HURST_EXPONENT: parseFloat(process.env.MIN_HURST_EXPONENT) || 0.52,
 
-  // TensorFlow.js ML
   ML_ENABLED: process.env.ML_ENABLED !== 'false',
   ML_MIN_TRAINING_SAMPLES: parseInt(process.env.ML_MIN_TRAINING_SAMPLES, 10) || 40,
   ML_MAX_TRAINING_SAMPLES: parseInt(process.env.ML_MAX_TRAINING_SAMPLES, 10) || 2000,
@@ -482,7 +524,7 @@ validateCriticalEnv();
 updateTelegramConfig(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID);
 
 // ==========================================
-// 7. DATENBANK & ADAPTIVES ML-MODELL & RL-AGENT
+// 8. DATENBANK & ADAPTIVES ML-MODELL
 // ==========================================
 const client = new MongoClient(config.MONGODB_URI, {
   maxPoolSize: config.MONGODB_POOL_SIZE,
@@ -493,7 +535,7 @@ const client = new MongoClient(config.MONGODB_URI, {
   family: 4
 });
 
-let tradesCollection, closedTradesCollection, botStateCollection, lockCollection;
+let tradesCollection, closedTradesCollection, botStateCollection, lockCollection, marketPhaseLogsCollection, filterChangeLogCollection;
 const activeTrades = new Map();
 let isDbConnected = false, dbReconnectInterval = null, pendingClosedTrades = [];
 const priceFailureCounts = new Map();
@@ -501,7 +543,6 @@ let isPaused = false, lastScanTime = null, lastTrackerCheckTime = null;
 let trackerLock = false, trackerTimeout = null;
 const signalPerformanceHistory = new Map();
 
-// TensorFlow.js Klassifikations-Modell
 const mlModel = new TensorFlowSignalModel({
   modelDir: process.env.ML_MODEL_DIR || './models/signal-model',
   minSamples: config.ML_MIN_TRAINING_SAMPLES,
@@ -514,12 +555,6 @@ const mlModel = new TensorFlowSignalModel({
 });
 let isModelTrained = false;
 let lastMLTrainingStats = null;
-
-// NEU: Deep Reinforcement Learning Agent (DQN)
-const rlAgent = new DeepQTheTradingAgent({
-  modelDir: process.env.RL_MODEL_DIR || './models/rl-dqn-model',
-  logger
-});
 
 function buildMLFeatures(data) {
   return mlModel.buildFeatures(data);
@@ -685,6 +720,64 @@ function startLockHeartbeat(instanceId) {
   }, 60_000);
 }
 
+async function loadPersistedFilterState() {
+  if (!botStateCollection) return;
+  try {
+    const doc = await botStateCollection.findOne({ _id: 'dynamicFilterState' });
+    if (doc) {
+      if (doc.configValues) {
+        Object.keys(doc.configValues).forEach(key => {
+          config[key] = doc.configValues[key];
+        });
+      }
+      if (doc.filterState) {
+        Object.keys(doc.filterState).forEach(key => {
+          if (filterState[key]) {
+            filterState[key] = doc.filterState[key];
+          }
+        });
+      }
+      logger.info('✅ Dynamische Filter-Konfiguration aus DB geladen');
+    }
+  } catch (e) {
+    logger.error(`Fehler beim Laden des DynamicFilterState: ${e.message}`);
+  }
+}
+
+async function persistFilterState() {
+  if (!botStateCollection || !isDbConnected) return;
+  try {
+    const configValues = {};
+    Object.keys(FILTER_REGISTRY).forEach(k => {
+      const cKey = FILTER_REGISTRY[k].configKey;
+      configValues[cKey] = config[cKey];
+    });
+    await botStateCollection.updateOne(
+      { _id: 'dynamicFilterState' },
+      { $set: { configValues, filterState, lastUpdated: new Date() } },
+      { upsert: true }
+    );
+  } catch (e) {
+    logger.error(`Fehler beim Speichern des FilterState: ${e.message}`);
+  }
+}
+
+async function logFilterChange(filterKey, action, oldValue, newValue, user = 'TelegramUser') {
+  if (filterChangeLogCollection && isDbConnected) {
+    try {
+      await filterChangeLogCollection.insertOne({
+        timestamp: new Date(),
+        filterKey,
+        action,
+        oldValue,
+        newValue,
+        user
+      });
+    } catch (e) {}
+  }
+  logger.info(`⚙️ [FILTER CHANGE] ${filterKey} (${action}): ${oldValue} -> ${newValue}`);
+}
+
 async function initDatabase() {
   try {
     const startTime = Date.now();
@@ -694,6 +787,8 @@ async function initDatabase() {
     closedTradesCollection = db.collection('closedTrades');
     botStateCollection = db.collection('botState');
     lockCollection = db.collection('locks');
+    marketPhaseLogsCollection = db.collection('marketPhaseLogs');
+    filterChangeLogCollection = db.collection('filterChangeLogs');
     isDbConnected = true;
     apiLatencyStats.record('mongodb', Date.now() - startTime);
     logger.info('✅ Datenbank erfolgreich verbunden');
@@ -702,6 +797,8 @@ async function initDatabase() {
       await tradesCollection.createIndex({ symbol: 1 }, { unique: true });
       await closedTradesCollection.createIndex({ closeTime: -1 });
       await closedTradesCollection.createIndex({ symbol: 1, closeTime: -1 });
+      await marketPhaseLogsCollection.createIndex({ timestamp: -1 });
+      await filterChangeLogCollection.createIndex({ timestamp: -1 });
     } catch (e) {}
 
     if (dbReconnectInterval) { clearInterval(dbReconnectInterval); dbReconnectInterval = null; }
@@ -712,8 +809,15 @@ async function initDatabase() {
     if (runtimeDoc) {
       if (runtimeDoc.CAPITAL_USD) config.CAPITAL_USD = runtimeDoc.CAPITAL_USD;
       if (runtimeDoc.LEVERAGE) config.LEVERAGE = runtimeDoc.LEVERAGE;
+      if (runtimeDoc.RISK_PERCENT) config.RISK_PERCENT = runtimeDoc.RISK_PERCENT;
     }
 
+    const blDoc = await botStateCollection.findOne({ _id: 'manualBlacklist' });
+    if (blDoc && Array.isArray(blDoc.symbols)) {
+      blDoc.symbols.forEach(s => manualBlacklist.add(s));
+    }
+
+    await loadPersistedFilterState();
     await loadDailyPnLState();
     await loadPauseState();
 
@@ -765,8 +869,6 @@ async function removeTrade(symbol, closedTradeRecord = null) {
     const finalRecord = closedTradeRecord || { ...trade, closeTime: Date.now(), closeReason: 'manual/unknown' };
     await persistClosedTradeRecord(finalRecord);
     activeTrades.delete(symbol);
-    // NEU: Nach Schließen des Trades direkt RL-Modell im Hintergrund anlernen
-    rlAgent.trainFromClosedTrades(closedTradesCollection).catch(() => {});
   }
   priceFailureCounts.delete(symbol);
   if (tradesCollection && isDbConnected) dbBulkQueue.push({ type: 'removeTrade', symbol });
@@ -810,6 +912,7 @@ function shouldSkipSignal(symbol, direction, score) {
 }
 
 async function isCoinDynamicallyBlacklisted(symbol) {
+  if (manualBlacklist.has(symbol)) return true;
   try {
     if (!closedTradesCollection || !isDbConnected) return false;
     const recentTrades = await closedTradesCollection
@@ -820,8 +923,8 @@ async function isCoinDynamicallyBlacklisted(symbol) {
 
     if (recentTrades.length < 2) return false;
 
-    const consecutiveLosses = recentTrades.every(t => (t.pnlUSD || 0) < 0);
-    if (consecutiveLosses) {
+    const recentConsecutiveLosses = recentTrades.every(t => (t.pnlUSD || 0) < 0);
+    if (recentConsecutiveLosses) {
       const lastCloseTime = new Date(recentTrades[0].closeTime).getTime();
       const hoursSinceLoss = (Date.now() - lastCloseTime) / (1000 * 60 * 60);
 
@@ -835,8 +938,21 @@ async function isCoinDynamicallyBlacklisted(symbol) {
 }
 
 // ==========================================
-// 8. RISIKOMANAGEMENT & DYNAMISCHER ATR
+// 9. RISIKOMANAGEMENT & DYNAMISCHER ATR
 // ==========================================
+function calculateDynamicLeverage(atr, currentPrice, baseLeverage = config.LEVERAGE) {
+  if (!currentPrice || currentPrice === 0 || !atr || atr === 0) return baseLeverage;
+  const volatilityPercent = (atr / currentPrice) * 100;
+  let adjustedLeverage = baseLeverage;
+
+  if (volatilityPercent > 3.0) {
+    adjustedLeverage = Math.max(1, Math.floor(baseLeverage * 0.5));
+  } else if (volatilityPercent > 2.0) {
+    adjustedLeverage = Math.max(1, Math.floor(baseLeverage * 0.75));
+  }
+  return Number(adjustedLeverage);
+}
+
 function checkGlobalDrawdown(currentEquity) {
   peakCapital = Math.max(peakCapital, currentEquity);
   const drawdown = peakCapital > 0 ? (peakCapital - currentEquity) / peakCapital * 100 : 0;
@@ -848,6 +964,21 @@ function checkGlobalDrawdown(currentEquity) {
     return true;
   }
   return false;
+}
+
+async function evaluateFundingAndSentiment(fundingRate, direction) {
+  if (fundingRate === null || fundingRate === undefined) return { allowed: true };
+  
+  if (fundingRate > config.MAX_FUNDING_RATE) {
+    if (direction === 'LONG') {
+      return { allowed: false, reason: 'fundingRateTooHighLongsOvercrowded' };
+    }
+  } else if (fundingRate < config.MIN_FUNDING_RATE) {
+    if (direction === 'SHORT') {
+      return { allowed: false, reason: 'fundingRateTooLowShortsOvercrowded' };
+    }
+  }
+  return { allowed: true };
 }
 
 function checkDailyProfitTarget() {
@@ -952,7 +1083,7 @@ function getFuturesSymbol(spotSymbol) {
 }
 
 // ==========================================
-// 9. INDIKATOREN & HURST-EXPONENT
+// 10. INDIKATOREN & HURST-EXPONENT
 // ==========================================
 function calculateEMA(prices, period) {
   if (!prices || prices.length < period) return prices ? prices[prices.length - 1] : 0;
@@ -1163,7 +1294,7 @@ function calculateSignalScore(params) {
 }
 
 // ==========================================
-// 10. KUCOIN MARKET DATA
+// 11. KUCOIN MARKET DATA
 // ==========================================
 const FUTURES_GRANULARITY_MINUTES = { '1d': 1440, '4h': 240, '1h': 60, '15m': 15, '5m': 5, '1m': 1 };
 
@@ -1259,7 +1390,7 @@ async function fetchFuturesData(symbol) {
   return null;
 }
 
-async function fetchOrderBookImbalance(symbol) {
+async function fetchOrderBookMetrics(symbol) {
   try {
     const futuresSymbol = getFuturesSymbol(symbol);
     if (!futuresSymbol) return null;
@@ -1268,13 +1399,21 @@ async function fetchOrderBookImbalance(symbol) {
     if (res.data?.code === '200000' && res.data.data) {
       const bids = res.data.data.bids || [];
       const asks = res.data.data.asks || [];
+      if (bids.length === 0 || asks.length === 0) return { spreadPct: 0, bidAskRatio: 1 };
+      
+      const bestBid = parseFloat(bids[0][0]);
+      const bestAsk = parseFloat(asks[0][0]);
+      const spreadPct = bestBid > 0 ? ((bestAsk - bestBid) / bestBid) * 100 : 0;
+
       const depth = config.ORDERBOOK_DEPTH_LEVELS || 10;
       const bidVolume = bids.slice(0, depth).reduce((sum, [_, size]) => sum + parseFloat(size || 0), 0);
       const askVolume = asks.slice(0, depth).reduce((sum, [_, size]) => sum + parseFloat(size || 0), 0);
-      return askVolume > 0 ? bidVolume / askVolume : 1;
+      const bidAskRatio = askVolume > 0 ? bidVolume / askVolume : 1;
+
+      return { spreadPct, bidAskRatio };
     }
   } catch (e) {}
-  return null;
+  return { spreadPct: 0, bidAskRatio: 1 };
 }
 
 const contractSpecsCache = new Map();
@@ -1339,7 +1478,7 @@ async function getTopKucoinPairs(limit = 100) {
 }
 
 // ==========================================
-// 11. CACHING & PRELOADING
+// 12. CACHING & PRELOADING
 // ==========================================
 const klinesCache = new LRUCache(config.MAX_KLINES_CACHE_SIZE);
 const preloadQueue = [];
@@ -1379,7 +1518,7 @@ async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
 }
 
 // ==========================================
-// 12. MARKT-REGIME & KELLY SIZING
+// 13. MARKT-REGIME & KELLY SIZING
 // ==========================================
 function detectMarketPhase(btcTrend, btcADX, btcVolatility) {
   if (btcADX > 25 && btcVolatility > 0.03) return 'TRENDING';
@@ -1405,7 +1544,7 @@ function calculateKellyRisk(winRate, avgWin, avgLoss, maxRiskPercent) {
 }
 
 // ==========================================
-// 13. STATISTIK & REPORTS
+// 14. STATISTIK & REPORTS
 // ==========================================
 function formatPeriodPerformanceReport(stats, periodLabel, startDate, endDate) {
   if (!stats || stats.totalTrades === 0) {
@@ -1520,26 +1659,26 @@ async function checkRiskLevels() {
 }
 
 function formatScanStatsReport(stats) {
-  const lines = [`🔎 <b>SCAN-DIAGNOSE v21.0 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
+  const lines = [`🔎 <b>SCAN-DIAGNOSE v21.6 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
   lines.push(`Coins geprüft: ${stats.total} | Signale gesendet: ${stats.signalsSent}`);
   if (stats.avgSignalScore !== undefined) lines.push(`Ø Signal-Score: ${stats.avgSignalScore}/100`);
   lines.push(`Marktphase: ${currentMarketPhase}\n`);
 
-  const trendTotal = (stats.trendMismatch15m || 0) + (stats.trendMismatch1h || 0) + (stats.trendMismatch4h || 0) + (stats.trendMismatch || 0);
+  const trendTotal = (stats.trendMismatch1h || 0) + (stats.trendMismatch4h || 0) + (stats.trendMismatch || 0);
   if (trendTotal > 0) {
     lines.push(`<b>Trend-Filter (${trendTotal}):</b>`);
-    if (stats.trendMismatch15m) lines.push(`  • 15m Trend: ${stats.trendMismatch15m}`);
     if (stats.trendMismatch1h) lines.push(`  • 1h Trend: ${stats.trendMismatch1h}`);
     if (stats.trendMismatch4h) lines.push(`  • 4h Trend: ${stats.trendMismatch4h}`);
     lines.push('');
   }
 
   const reasons = [];
+  if (stats.missingKlines) reasons.push(`Fehlende/Zu wenige Kerzen (missingKlines): ${stats.missingKlines}`);
   if (stats.skippedActiveTrade) reasons.push(`Offener Trade: ${stats.skippedActiveTrade}`);
   if (stats.skippedMaxSignals) reasons.push(`Max. Signale: ${stats.skippedMaxSignals}`);
   if (stats.skippedDynamicBlacklist) reasons.push(`KI-Erfahrung (Loss-Blocker): ${stats.skippedDynamicBlacklist}`);
+  if (stats.timeBlocked) reasons.push(`Time-Learning Filter (ungünstige Stunde/Tag): ${stats.timeBlocked}`);
   if (stats.mlBlocked) reasons.push(`TensorFlow.js ML-Filter blockiert: ${stats.mlBlocked}`);
-  if (stats.rlBlocked) reasons.push(`Deep RL-Agent blockiert (Hold): ${stats.rlBlocked}`); // <-- NEU: RL-Statistik
   if (stats.hurstBlocked) reasons.push(`Hurst-Exponent (Zufallsmarkt): ${stats.hurstBlocked}`);
   if (stats.adxTooLow) reasons.push(`ADX zu niedrig: ${stats.adxTooLow}`);
   if (stats.marketChoppy) reasons.push(`Markt seitwärts (CHOP): ${stats.marketChoppy}`);
@@ -1553,11 +1692,51 @@ function formatScanStatsReport(stats) {
   if (stats.correlationBlocked) reasons.push(`Korrelations-Limit: ${stats.correlationBlocked}`);
   if (stats.orderBookBlocked) reasons.push(`Orderbuch Imbalance: ${stats.orderBookBlocked}`);
   if (stats.spreadTooHigh) reasons.push(`Orderbuch Spread zu hoch: ${stats.spreadTooHigh}`);
+  if (stats.cooldownActive) reasons.push(`Signal-Cooldown aktiv: ${stats.cooldownActive}`);
+  if (stats.positionTooSmallForLot) reasons.push(`Position zu klein für Min-Lot: ${stats.positionTooSmallForLot}`);
 
   if (reasons.length > 0) {
     lines.push(`<b>Ausschlussgründe:</b>`);
     reasons.forEach(r => lines.push(`• ${r}`));
   }
+
+  const accountedFor = (stats.signalsSent || 0) +
+    (stats.missingKlines || 0) +
+    (stats.skippedActiveTrade || 0) +
+    (stats.skippedMaxSignals || 0) +
+    (stats.skippedDynamicBlacklist || 0) +
+    (stats.timeBlocked || 0) +
+    (stats.mlBlocked || 0) +
+    (stats.hurstBlocked || 0) +
+    (stats.adxTooLow || 0) +
+    (stats.marketChoppy || 0) +
+    (stats.noBOS || 0) +
+    (stats.rsiTooLow || 0) +
+    (stats.rsiTooHigh || 0) +
+    (stats.pocVwapFail || 0) +
+    (stats.macdFail || 0) +
+    (stats.fundingBlocked || 0) +
+    (stats.relVolTooLow || 0) +
+    (stats.correlationBlocked || 0) +
+    (stats.orderBookBlocked || 0) +
+    (stats.spreadTooHigh || 0) +
+    (stats.signalHistoryBlocked || 0) +
+    (stats.cooldownActive || 0) +
+    (stats.positionTooSmallForLot || 0) +
+    (stats.skippedDbDisconnected || 0) +
+    (stats.skippedMaxConcurrentTrades || 0) +
+    (stats.skippedDailyLossLimit || 0) +
+    (stats.skippedMaxSameDirection || 0) +
+    (stats.skippedExposureLimit || 0) +
+    (stats.skippedMaxDrawdown || 0) +
+    (stats.btcCounterTrendBlocked || 0) +
+    trendTotal;
+
+  const unaccounted = stats.total - accountedFor;
+  if (unaccounted > 0) {
+    lines.push(`\n⚠️ <b>Unklare Verwerfungen:</b> ${unaccounted} Coins`);
+  }
+
   return lines.join('\n');
 }
 
@@ -1598,7 +1777,7 @@ async function getDailyPerformanceStats() {
 }
 
 // ==========================================
-// 14. TRACKER SCHLEIFE
+// 15. TRACKER SCHLEIFE
 // ==========================================
 async function fetchMarkPricesBatched(symbols) {
   const priceMap = new Map();
@@ -1823,7 +2002,7 @@ async function checkActiveTrades() {
 }
 
 // ==========================================
-// 15. SCANNER ENGINE
+// 16. SCANNER ENGINE & EVALUATION GATES
 // ==========================================
 async function getBitcoinTrend() {
   const rawData = await fetchKucoinKlines('BTC-USDT', '1d', 50);
@@ -1849,7 +2028,8 @@ async function asyncPool(concurrency, items, iteratorFn) {
 
 function evaluateDirectionGates(dir, p) {
   const isLong = dir === 'LONG';
-  if (config.REQUIRE_4H_TREND) {
+
+  if (filterState.trend4h.enabled && config.REQUIRE_4H_TREND) {
     const trendOk4h = isLong ? p.trend4h === 'BULLISH' : p.trend4h === 'BEARISH';
     if (!trendOk4h) return 'trendMismatch4h';
   }
@@ -1857,30 +2037,35 @@ function evaluateDirectionGates(dir, p) {
   const trend1hOk = isLong ? p.trend1h === 'BULLISH' : p.trend1h === 'BEARISH';
   if (!trend1hOk) return 'trendMismatch1h';
 
-  const trend15mOk = isLong ? p.trend15m === 'BULLISH' : p.trend15m === 'BEARISH';
-  if (!trend15mOk) return 'trendMismatch15m';
-
-  if (!config.ALLOW_COUNTER_BTC_TREND) {
+  if (filterState.btctrend.enabled && !config.ALLOW_COUNTER_BTC_TREND) {
     const against = (p.btcTrend === 'BEARISH' && isLong) || (p.btcTrend === 'BULLISH' && !isLong);
     if (against) return 'btcCounterTrendBlocked';
   }
 
-  const effectiveADX = p.adaptiveADX || config.ADX_MIN;
-  if (p.adx < effectiveADX) return 'adxTooLow';
+  if (filterState.adx.enabled) {
+    const effectiveADX = p.adaptiveADX || config.ADX_MIN;
+    if (p.adx < effectiveADX) return 'adxTooLow';
+  }
 
-  if (p.hurst < config.MIN_HURST_EXPONENT) return 'hurstBlocked';
+  if (filterState.hurst.enabled) {
+    if (p.hurst < config.MIN_HURST_EXPONENT) return 'hurstBlocked';
+  }
 
-  if (p.chop && p.chop > config.MAX_CHOP_INDEX) return 'marketChoppy';
+  if (filterState.chop.enabled) {
+    if (p.chop && p.chop > config.MAX_CHOP_INDEX) return 'marketChoppy';
+  }
 
-  const bos = isLong ? p.bosBullish : p.bosBearish;
-  if (!bos) return 'noBOS';
+  if (filterState.bos.enabled) {
+    const bos = isLong ? p.bosBullish : p.bosBearish;
+    if (!bos) return 'noBOS';
+  }
 
   if (isLong) {
-    if (p.rsi < config.RSI_LONG_MIN) return 'rsiTooLow';
+    if (filterState.rsi_long_min.enabled && p.rsi < config.RSI_LONG_MIN) return 'rsiTooLow';
     if (p.rsi > config.RSI_LONG_MAX) return 'rsiTooHigh';
   } else {
     if (p.rsi < config.RSI_SHORT_MIN) return 'rsiTooLow';
-    if (p.rsi > config.RSI_SHORT_MAX) return 'rsiTooHigh';
+    if (filterState.rsi_short_max.enabled && p.rsi > config.RSI_SHORT_MAX) return 'rsiTooHigh';
   }
 
   const priceOk = p.poc && p.vwap && (isLong ? (p.currentPrice >= p.poc && p.currentPrice >= p.vwap) : (p.currentPrice <= p.poc && p.currentPrice <= p.vwap));
@@ -1892,8 +2077,10 @@ function evaluateDirectionGates(dir, p) {
   const fundingOk = isLong ? p.fundingRate <= config.MAX_FUNDING_RATE : p.fundingRate >= config.MIN_FUNDING_RATE;
   if (!fundingOk) return 'fundingBlocked';
 
-  const effectiveVolume = p.adaptiveVolume || config.MIN_RELATIVE_VOLUME;
-  if (effectiveVolume > 0 && p.relativeVolume < effectiveVolume) return 'relVolTooLow';
+  if (filterState.relvol.enabled) {
+    const effectiveVolume = p.adaptiveVolume || config.MIN_RELATIVE_VOLUME;
+    if (effectiveVolume > 0 && p.relativeVolume < effectiveVolume) return 'relVolTooLow';
+  }
 
   return null;
 }
@@ -1904,12 +2091,12 @@ function createEmptyScanStats() {
     skippedActiveTrade: 0, skippedMaxSignals: 0, skippedDbDisconnected: 0,
     skippedMaxConcurrentTrades: 0, skippedDailyLossLimit: 0, skippedMaxSameDirection: 0,
     skippedExposureLimit: 0, skippedMaxDrawdown: 0, missingKlines: 0,
-    trendMismatch: 0, trendMismatch1h: 0, trendMismatch4h: 0, trendMismatch15m: 0,
+    trendMismatch: 0, trendMismatch1h: 0, trendMismatch4h: 0,
     btcCounterTrendBlocked: 0, adxTooLow: 0, hurstBlocked: 0, marketChoppy: 0, noBOS: 0, rsiOutOfRange: 0,
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    mlBlocked: 0, rlBlocked: 0 // <-- NEU: RL-Statistik
+    timeBlocked: 0, mlBlocked: 0
   };
 }
 
@@ -1919,7 +2106,7 @@ async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.0...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.6...`);
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
@@ -1951,13 +2138,29 @@ async function scanMarket() {
     let adaptiveRisk = config.RISK_PERCENT;
     if (config.ENABLE_KELLY_SIZING) {
       const weekStats = await getPeriodPerformanceStats(7).catch(() => null);
-      if (weekStats && weekStats.totalTrades >= 5) {
+      if (weekStats && weekStats.totalTrades >= 20) {
         adaptiveRisk = calculateKellyRisk(
           parseFloat(weekStats.winRate), 
           weekStats.avgWin, 
           Math.abs(weekStats.avgLoss), 
           config.RISK_PERCENT
         ) * 100;
+      }
+    }
+
+    // Time-based Learning Filter Check
+    let timeFilterBlocked = false;
+    if (filterState.timetrend.enabled && config.ENABLE_TIME_FILTER) {
+      const timeStats = await getTimeBasedAnalysis();
+      if (timeStats) {
+        const currentHour = new Date().getUTCHours();
+        const currentDay = new Date().getUTCDay();
+        const hStat = timeStats.hourlyStats[currentHour];
+        const dStat = timeStats.dailyStats[currentDay];
+        if ((hStat && hStat.trades >= 3 && hStat.pnl < 0) || (dStat && dStat.trades >= 5 && dStat.pnl < 0)) {
+          timeFilterBlocked = true;
+          logger.info(`⏰ [Time-Filter] Aktuelle Stunde (${currentHour} UTC) oder Wochentag (${currentDay}) historisch im Minus. Signale werden gedrosselt.`);
+        }
       }
     }
 
@@ -1990,6 +2193,11 @@ async function scanMarket() {
 
       if (await isCoinDynamicallyBlacklisted(symbol)) {
         scanStats.skippedDynamicBlacklist++;
+        return;
+      }
+
+      if (timeFilterBlocked) {
+        scanStats.timeBlocked++;
         return;
       }
 
@@ -2037,6 +2245,7 @@ async function scanMarket() {
         }
 
         const futuresData = await fetchFuturesData(symbol).catch(() => null);
+        const orderBookMetrics = await fetchOrderBookMetrics(symbol).catch(() => ({ spreadPct: 0, bidAskRatio: 1 }));
 
         const closes4h = raw4h ? raw4h.map(c => c.close) : [];
         const closes1h = raw1h.map(c => c.close);
@@ -2051,6 +2260,7 @@ async function scanMarket() {
 
         const adx = calculateADX(raw15m, 14);
         const hurst = calculateHurstExponent(closes15m);
+        const chop = calculateChoppinessIndex(raw15m, 14);
         const rsi = calculateRSI(closes15m, 14);
         const atr = calculateATR(raw15m, 14);
         const poc = calculateVolumeProfilePOC(raw15m, 30);
@@ -2061,12 +2271,12 @@ async function scanMarket() {
         const fundingRate = futuresData ? futuresData.fundingRate : 0;
 
         const gateParams = {
-          trend4h, trend1h, trend15m, btcTrend, adx, hurst, bosBullish, bosBearish,
+          trend4h, trend1h, trend15m, btcTrend, adx, hurst, chop, bosBullish, bosBearish,
           rsi, poc, vwap, currentPrice, macd, fundingRate, relativeVolume,
           adaptiveADX, adaptiveVolume
         };
 
-        let direction = null;
+        var direction = null;
         const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
         let primaryFail = evaluateDirectionGates(primaryDir, gateParams);
 
@@ -2086,7 +2296,13 @@ async function scanMarket() {
           scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
         }
 
-        if (direction) {
+        if (direction !== null) {
+          const sentimentCheck = await evaluateFundingAndSentiment(fundingRate, direction);
+          if (!sentimentCheck.allowed) {
+            scanStats.fundingBlocked = (scanStats.fundingBlocked || 0) + 1;
+            return;
+          }
+
           const cooldownKey = `${symbol}_${direction}`;
           const lastSent = await getAlertTimestamp(cooldownKey);
           if (Date.now() - lastSent <= 2 * 3_600_000) {
@@ -2103,15 +2319,11 @@ async function scanMarket() {
             adx, rsi, relativeVolume, trend1h, trend4h, direction
           });
 
-          let orderBookImbalance = null;
           if (config.ENABLE_ORDERBOOK_ANALYSIS && signalScore > 60) {
-            orderBookImbalance = await fetchOrderBookImbalance(symbol).catch(() => null);
-            if (orderBookImbalance !== null) {
-              const obOk = direction === 'LONG' ? orderBookImbalance > 0.9 : orderBookImbalance < 1.1;
-              if (!obOk) {
-                scanStats.orderBookBlocked++;
-                return;
-              }
+            const obOk = direction === 'LONG' ? orderBookMetrics.bidAskRatio > 0.9 : orderBookMetrics.bidAskRatio < 1.1;
+            if (!obOk) {
+              scanStats.orderBookBlocked++;
+              return;
             }
           }
 
@@ -2126,29 +2338,14 @@ async function scanMarket() {
             fundingRate, openInterest: futuresData?.openInterest || 0,
             trend4h, trend1h, trend15m, btcTrend, direction,
             marketPhase: currentMarketPhase,
-            orderBookImbalance
+            orderBookImbalance: orderBookMetrics.bidAskRatio,
+            spreadPct: orderBookMetrics.spreadPct,
+            volatilityRatio: btcATR > 0 ? atr / btcATR : 1
           });
 
           const mlPrediction = predictSignalSuccess(mlFeatures);
           if (mlPrediction.trained && mlPrediction.probability < config.ML_MIN_PREDICTION_PROBABILITY) {
             scanStats.mlBlocked++;
-            return;
-          }
-
-          // NEU: Deep Reinforcement Learning (DQN) Filterprüfung
-          const stateVector = [
-            adx / 50, rsi / 100, hurst, Math.min(relativeVolume / 5, 1),
-            signalScore / 100, direction === 'LONG' ? 1 : 0,
-            currentMarketPhase === 'TRENDING' ? 1 : 0,
-            currentMarketPhase === 'RANGING' ? 0.5 : 0,
-            atrPct, pocDistancePct, vwapDistancePct,
-            orderBookImbalance || 1, 0.1,
-            btcATR > 0 ? atr / btcATR : 1, mlPrediction.probability, 0.5
-          ];
-          const rlAction = rlAgent.act(stateVector);
-          // Wenn der RL-Agent eingearbeitet ist (Epsilon < 0.4) und "Hold" (0) wählt:
-          if (rlAgent.getStats().epsilon < 0.4 && rlAction === 0) {
-            scanStats.rlBlocked++;
             return;
           }
 
@@ -2192,6 +2389,8 @@ async function scanMarket() {
           scanStats.signalsSent++;
           scanStats.totalSignalScore += signalScore;
 
+          const dynamicLeverage = calculateDynamicLeverage(atr, currentPrice, config.LEVERAGE);
+
           await upsertTrade(symbol, {
             symbol, direction, entry: entryPrice, stopLoss, tp1, tp2,
             positionSizeUnits: sizing.positionSizeUnits,
@@ -2212,7 +2411,7 @@ async function scanMarket() {
             trend1hAtEntry: trend1h,
             trend15mAtEntry: trend15m,
             btcTrendAtEntry: btcTrend,
-            leverage: config.LEVERAGE,
+            leverage: dynamicLeverage,
             marginMode: config.MARGIN_MODE,
             tp1Hit: false,
             partiallyClosed: false,
@@ -2227,7 +2426,9 @@ async function scanMarket() {
             pocDistancePctAtEntry: pocDistancePct,
             vwapDistancePctAtEntry: vwapDistancePct,
             atrPctAtEntry: atrPct,
-            orderBookImbalanceAtEntry: orderBookImbalance,
+            orderBookImbalanceAtEntry: orderBookMetrics.bidAskRatio,
+            spreadPctAtEntry: orderBookMetrics.spreadPct,
+            volatilityRatioAtEntry: btcATR > 0 ? atr / btcATR : 1,
             mlProbabilityAtEntry: mlPrediction.probability,
             mlConfidenceAtEntry: mlPrediction.confidence,
             mlModelVersionAtEntry: mlModel.getStats().modelVersion || null
@@ -2262,6 +2463,19 @@ async function scanMarket() {
     }
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
+    
+    if (marketPhaseLogsCollection && isDbConnected) {
+      await marketPhaseLogsCollection.insertOne({
+        timestamp: new Date(),
+        marketPhase: currentMarketPhase,
+        totalCoinsChecked: scanStats.total,
+        signalsSent: scanStats.signalsSent,
+        avgSignalScore: scanStats.avgSignalScore || 0,
+        reasons: scanStats
+      }).catch(err => logger.error(`[MARKET PHASE LOG ERROR] ${err.message}`));
+    }
+    logger.info(`📈 [PHASE-LOG] Phase: ${currentMarketPhase} | Gecheckt: ${scanStats.total} | Signale: ${signalsSent}`);
+
     lastScanStats = scanStats;
     scanCounter++;
 
@@ -2280,7 +2494,7 @@ async function scanMarket() {
 }
 
 // ==========================================
-// 16. TELEGRAM COMMANDS & POLLING
+// 17. TELEGRAM COMMANDS & POLLING
 // ==========================================
 function isAuthorizedChat(chatId) {
   const targetIds = configTelegram.chatId || config.TELEGRAM_CHAT_ID || '';
@@ -2296,23 +2510,265 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
-      `<b>🤖 TRADING BOT v21.0 ULTIMATE TFJS + RL - BEFEHLE</b>\n` +
+      `<b>🤖 TRADING BOT v21.6 - MODULARES CONTROL SYSTEM</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `<b>⚙️ DYNAMISCHE FILTER-STEUERUNG:</b>\n` +
+      `/filters - Zeigt alle Indikator-Status & Werte an\n` +
+      `/filter on/off [key] - Filter aktivieren/deaktivieren\n` +
+      `/filter soft/hard [key] - Schwelle weicher/härter stellen\n` +
+      `/filter reset [key] - Einen Filter auf Standard zurücksetzen\n` +
+      `/filter reset all confirm - ALLE Filter auf Profil-Standard\n\n` +
       `<b>📊 Performance & Status:</b>\n` +
       `/stats - Performance heute (UTC)\n` +
       `/week - 7-Tage Performance Report\n` +
       `/month - 30-Tage Performance Report\n` +
       `/status - Gesamt-Status des Bots\n` +
       `/db - MongoDB Verbindungs-Check\n` +
-      `/scanstats - Scan-Diagnose & Filter\n\n` +
-      `<b>⚙️ Parameter anpassen:</b>\n` +
-      `/setcapital [Betrag] - Z.B. <code>/setcapital 15000</code>\n` +
-      `/setleverage [1-100] - Z.B. <code>/setleverage 5</code>\n\n` +
-      `<b>🎮 Steuerung:</b>\n` +
-      `/pause - Bot pausieren\n` +
-      `/resume - Bot fortsetzen\n` +
-      `/scan - Sofortigen Scan ausführen`
+      `/scanstats - Scan-Diagnose & Filter\n` +
+      `/logs - Letzte 15 System-Logs anzeigen\n\n` +
+      `<b>🤖 Künstliche Intelligenz (Gemini):</b>\n` +
+      `/ki [Frage] - Marktanalyse per KI abfragen\n` +
+      `/report - Automatisches KI-Trading Briefing\n\n` +
+      `<b>🚨 Trade-Steuerung:</b>\n` +
+      `/close [Symbol] - Einzelnen Trade schließen (z. B. <code>/close BTC-USDT</code>)\n` +
+      `/closeall - ALLE aktiven Trades sofort schließen\n` +
+      `/setsl [Symbol] [Preis] - SL anpassen\n` +
+      `/settp [Symbol] [tp1|tp2] [Preis] - TP anpassen\n\n` +
+      `<b>⚙️ Parameter & Risikomanagement:</b>\n` +
+      `/setcapital [Betrag] - Startkapital ändern\n` +
+      `/setpeak [Betrag] - Peak Capital manuell setzen\n` +
+      `/setrisk [Prozent] - Risiko pro Trade anpassen\n` +
+      `/setleverage [1-100] - Hebel anpassen\n` +
+      `/setprofile [strict|loose] - Strategie-Profil umschalten\n\n` +
+      `<b>🚫 Blacklist & KI:</b>\n` +
+      `/blacklist / /unblacklist [Symbol] - Coins verwalten\n` +
+      `/showblacklist - Gesperrte Coins auflisten\n` +
+      `/retrain - TensorFlow.js KI neu trainieren\n\n` +
+      `<b>🎮 System:</b>\n` +
+      `/pause | /resume | /scan | /backtest [Symbol] [Days]`
     );
+    return;
+  }
+
+  if (command === '/ki' || command === '/gemini') {
+    const promptText = args.join(' ') || 'Wie schätzt du die allgemeine Lage von Bitcoin und dem Kryptomarkt heute ein? Antworte kurz und präzise.';
+    
+    await sendTelegramReply(chatId, `🧠 <i>Frage Gemini nach einer Marktanalyse...</i>`);
+    
+    try {
+      const { GoogleGenAI } = require('@google/genai');
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.5-flash-lite',
+        contents: promptText,
+      });
+
+      const aiAnswer = response.text || 'Keine Antwort erhalten.';
+      
+      let report = `🤖 <b>GEMINI MARKTANALYSE</b>\n`;
+      report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+      report += `${escapeHtml(aiAnswer)}`;
+      
+      await sendTelegramReply(chatId, report);
+    } catch (e) {
+      logger.error(`Gemini API Fehler: ${e.message}`);
+      await sendTelegramReply(chatId, `⚠️ <b>Gemini ist momentan überlastet (503 Service Unavailable).</b>\nBitte versuche es in ein paar Minuten noch einmal!`);
+    }
+    return;
+  }
+
+  if (command === '/report' || command === '/briefing') {
+    await sendTelegramReply(chatId, `📊 <i>Sammle Marktdaten und erstelle KI-Briefing...</i>`);
+    
+    try {
+      const { GoogleGenAI } = require('@google/genai');
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      
+      const currentEquity = config.CAPITAL_USD + dailyNetPnL;
+      const openTradesCount = activeTrades.size;
+      
+      let tradesSummary = 'Keine offene Trades.';
+      if (openTradesCount > 0) {
+        tradesSummary = [...activeTrades.entries()].map(([sym, t]) => `${sym} (${t.direction}, Entry: ${t.entry})`).join(', ');
+      }
+
+      const prompt = `Erstelle einen professionellen Trading-Lagebericht basierend auf diesen Daten:
+      - Aktuelle Marktphase des Bots: ${currentMarketPhase}
+      - Heutige Netto-PnL: $${dailyNetPnL.toFixed(2)}
+      - Aktuelles Kapital: $${currentEquity.toFixed(2)}
+      - Offene Trades (${openTradesCount}): ${tradesSummary}
+      
+      Analysiere das kurz, professionell und motivierend auf Deutsch.`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.5-flash-lite',
+        contents: prompt,
+      });
+
+      const aiAnswer = response.text || 'Keine Analyse erhalten.';
+      
+      let report = `📈 <b>KI-TRADING BRIEFING</b>\n`;
+      report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+      report += `${escapeHtml(aiAnswer)}`;
+      
+      await sendTelegramReply(chatId, report);
+    } catch (e) {
+      logger.error(`Gemini Briefing Fehler: ${e.message}`);
+      await sendTelegramReply(chatId, `⚠️ <b>Briefing fehlgeschlagen:</b> Die KI ist momentan überlastet oder nicht erreichbar.`);
+    }
+    return;
+  }
+
+  if (command === '/backtest') {
+    const symbol = args[0] ? args[0].toUpperCase() : 'BTC-USDT';
+    const days = args[1] ? Number(args[1]) : 30;
+    
+    await sendTelegramReply(chatId, `🔄 Starte Backtest für ${symbol} (${days} Tage)... Bitte einen Moment Geduld.`);
+    
+    try {
+      const cfg = buildBacktestConfig(process.env);
+      const result = await runBacktest({ symbol, days, cfg, useML: true, walkForward: true });
+      const m = result.metrics;
+      
+      const emoji = m.netProfit >= 0 ? '🟢' : '🔴';
+      let report = `📊 <b>BACKTEST ERGEBNIS (${result.symbol} | ${result.days} Tage)</b>\n`;
+      report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+      report += `${emoji} <b>Net Profit: $${m.netProfit.toFixed(2)} (${m.returnPct.toFixed(2)}%)</b>\n`;
+      report += `• Ausgeführte Trades: ${result.trades} (Win-Rate: ${m.winRate.toFixed(2)}%)\n`;
+      report += `• Profit Factor: ${Number.isFinite(m.profitFactor) ? m.profitFactor.toFixed(2) : '∞'}\n`;
+      report += `• Max Drawdown: ${m.maxDrawdownPct.toFixed(2)}%\n`;
+      report += `• Sharpe Ratio: ${m.sharpe.toFixed(2)}\n`;
+      report += `• ML Retrains: ${result.mlRetrains} | Blocked: ${result.mlBlocked}`;
+      
+      await sendTelegramReply(chatId, report);
+    } catch (e) {
+      await sendTelegramReply(chatId, `❌ Backtest fehlgeschlagen: ${escapeHtml(e.message)}`);
+    }
+    return;
+  }
+
+  if (command === '/filters') {
+    let msg = `<b>⚙️ DYNAMISCHE FILTER ÜBERSICHT</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+    Object.keys(FILTER_REGISTRY).forEach(key => {
+      const reg = FILTER_REGISTRY[key];
+      const state = filterState[key];
+      const currentVal = config[reg.configKey];
+      const statusEmoji = state.enabled ? '🟢' : '🔴';
+      
+      let diffStr = '';
+      if (reg.type === 'numeric') {
+        const diff = currentVal - reg.default;
+        if (diff !== 0) {
+          diffStr = ` (<i>${diff > 0 ? '+' : ''}${diff.toFixed(2)} vs Default ${reg.default}</i>)`;
+        } else {
+          diffStr = ` (<i>Default</i>)`;
+        }
+      }
+
+      msg += `${statusEmoji} <b>${reg.name}</b> (<code>${key}</code>):\n`;
+      msg += `   • Wert: <b>${currentVal}</b>${diffStr}\n`;
+      msg += `   • Status: ${state.enabled ? 'Aktiv' : '<b>DEAKTIVIERT</b>'}\n\n`;
+    });
+    msg += `<i>Nutze /filter soft/hard/on/off [key] zum Anpassen.</i>`;
+    await sendTelegramReply(chatId, msg);
+    return;
+  }
+
+  if (command === '/filter') {
+    const subAction = args[0] ? args[0].toLowerCase() : null;
+    const filterKey = args[1] ? args[1].toLowerCase() : null;
+    const confirmFlag = args[2] ? args[2].toLowerCase() : null;
+
+    if (!subAction) {
+      await sendTelegramReply(chatId, '⚠️ Syntax: <code>/filter [on|off|soft|hard|reset] [key]</code>\nBeispiel: <code>/filter soft adx</code>');
+      return;
+    }
+
+    if (subAction === 'reset' && (filterKey === 'all' || !filterKey)) {
+      if (filterKey === 'all' && confirmFlag === 'confirm') {
+        Object.keys(FILTER_REGISTRY).forEach(k => {
+          const reg = FILTER_REGISTRY[k];
+          const oldVal = config[reg.configKey];
+          config[reg.configKey] = reg.default;
+          filterState[k].enabled = true;
+          logFilterChange(k, 'RESET_ALL', oldVal, reg.default);
+        });
+        await persistFilterState();
+        await sendTelegramReply(chatId, '🔄 <b>ALLE FILTER WURDEN AUF STANDARD ZURÜCKGESETZT!</b>');
+        return;
+      } else {
+        await sendTelegramReply(chatId, '⚠️ <b>SICHERHEITSABFRAGE:</b> Um ALLE Filter auf Standard zurückzusetzen, tippe:\n<code>/filter reset all confirm</code>');
+        return;
+      }
+    }
+
+    if (!filterKey || !FILTER_REGISTRY[filterKey]) {
+      const validKeys = Object.keys(FILTER_REGISTRY).map(k => `<code>${k}</code>`).join(', ');
+      await sendTelegramReply(chatId, `⚠️ Ungültiger Filter-Key: <b>${escapeHtml(filterKey || '')}</b>\nGültige Keys: ${validKeys}`);
+      return;
+    }
+
+    const reg = FILTER_REGISTRY[filterKey];
+    const cKey = reg.configKey;
+    const oldVal = config[cKey];
+
+    if (subAction === 'on') {
+      filterState[filterKey].enabled = true;
+      await persistFilterState();
+      await logFilterChange(filterKey, 'ENABLE', 'DISABLED', 'ENABLED');
+      await sendTelegramReply(chatId, `🟢 Filter <b>${reg.name}</b> wurde <b>AKTIVIERT</b>.`);
+      return;
+    }
+
+    if (subAction === 'off') {
+      filterState[filterKey].enabled = false;
+      await persistFilterState();
+      await logFilterChange(filterKey, 'DISABLE', 'ENABLED', 'DISABLED');
+      await sendTelegramReply(chatId, `🔴 Filter <b>${reg.name}</b> wurde <b>DEAKTIVIERT</b> (Gate wird übersprungen).`);
+      return;
+    }
+
+    if (subAction === 'reset') {
+      config[cKey] = reg.default;
+      filterState[filterKey].enabled = true;
+      await persistFilterState();
+      await logFilterChange(filterKey, 'RESET_SINGLE', oldVal, reg.default);
+      await sendTelegramReply(chatId, `🔄 Filter <b>${reg.name}</b> auf Standard zurückgesetzt (<b>${reg.default}</b>).`);
+      return;
+    }
+
+    if (subAction === 'soft' || subAction === 'hard') {
+      if (reg.type === 'boolean') {
+        const newVal = subAction === 'soft' ? !reg.default : reg.default;
+        config[cKey] = newVal;
+        await persistFilterState();
+        await logFilterChange(filterKey, subAction.toUpperCase(), oldVal, newVal);
+        await sendTelegramReply(chatId, `⚙️ Boolean-Filter <b>${reg.name}</b> geändert: <b>${oldVal}</b> ➔ <b>${newVal}</b>`);
+        return;
+      }
+
+      let delta = reg.step;
+      if (subAction === 'soft') {
+        delta = reg.direction === 'higher_is_harder' ? -reg.step : reg.step;
+      } else {
+        delta = reg.direction === 'higher_is_harder' ? reg.step : -reg.step;
+      }
+
+      let newVal = parseFloat((config[cKey] + delta).toFixed(4));
+      if (reg.min !== undefined) newVal = Math.max(reg.min, newVal);
+      if (reg.max !== undefined) newVal = Math.min(reg.max, newVal);
+
+      config[cKey] = newVal;
+      await persistFilterState();
+      await logFilterChange(filterKey, subAction.toUpperCase(), oldVal, newVal);
+
+      const actionText = subAction === 'soft' ? '🟢 Weicher gestellt' : '🔴 Härter gestellt';
+      await sendTelegramReply(chatId, `${actionText}: <b>${reg.name}</b>\n• Alter Wert: ${oldVal}\n• Neuer Wert: <b>${newVal}</b> (Limit: ${reg.min} - ${reg.max})`);
+      return;
+    }
+
+    await sendTelegramReply(chatId, `⚠️ Unbekannte Filter-Aktion: <b>${escapeHtml(subAction)}</b>. Nutze /help.`);
     return;
   }
 
@@ -2338,6 +2794,198 @@ async function handleTelegramCommand(chatId, text) {
     return;
   }
 
+  if (command === '/close') {
+    const symbolArg = args[0] ? args[0].toUpperCase() : null;
+    if (!symbolArg) {
+      await sendTelegramReply(chatId, '⚠️ Syntax: <code>/close BTC-USDT</code>');
+      return;
+    }
+    const fullSymbol = symbolArg.endsWith('-USDT') ? symbolArg : `${symbolArg}-USDT`;
+    if (!activeTrades.has(fullSymbol)) {
+      await sendTelegramReply(chatId, `⚠️ Kein aktiver Trade für <b>${escapeHtml(fullSymbol)}</b> gefunden.`);
+      return;
+    }
+    const trade = activeTrades.get(fullSymbol);
+    const currentPrice = (await fetchKucoinMarkPrice(fullSymbol)) || trade.entry;
+    const exitPrice = applySlippage(currentPrice, trade.direction, 'exit');
+    const pnlPerUnit = trade.direction === 'LONG' ? exitPrice - trade.entry : trade.entry - exitPrice;
+    const pnlUSD = pnlPerUnit * trade.positionSizeUnits - applyFees(trade.notionalUSD) - (trade.fundingCostUSD || 0);
+
+    await recordTradePnL(pnlUSD);
+    await removeTrade(fullSymbol, {
+      symbol: fullSymbol,
+      direction: trade.direction,
+      closeTime: Date.now(),
+      closeReason: 'manual-telegram-close',
+      pnlUSD,
+      exitPrice
+    });
+    await sendTelegramReply(chatId, `🛑 Trade für <b>${escapeHtml(fullSymbol)}</b> manuell geschlossen. PnL: $${pnlUSD.toFixed(2)}`);
+    return;
+  }
+
+  if (command === '/closeall') {
+    if (activeTrades.size === 0) {
+      await sendTelegramReply(chatId, 'ℹ️ Keine aktiven Trades zum Schließen vorhanden.');
+      return;
+    }
+    const count = activeTrades.size;
+    for (const [symbol, trade] of activeTrades.entries()) {
+      const currentPrice = (await fetchKucoinMarkPrice(symbol)) || trade.entry;
+      const exitPrice = applySlippage(currentPrice, trade.direction, 'exit');
+      const pnlPerUnit = trade.direction === 'LONG' ? exitPrice - trade.entry : trade.entry - exitPrice;
+      const pnlUSD = pnlPerUnit * trade.positionSizeUnits - applyFees(trade.notionalUSD) - (trade.fundingCostUSD || 0);
+      await recordTradePnL(pnlUSD);
+      await removeTrade(symbol, {
+        symbol,
+        direction: trade.direction,
+        closeTime: Date.now(),
+        closeReason: 'manual-telegram-closeall',
+        pnlUSD,
+        exitPrice
+      });
+    }
+    await sendTelegramReply(chatId, `🚨 Alle <b>${count}</b> aktiven Trades wurden manuell geschlossen!`);
+    return;
+  }
+
+  if (command === '/setsl') {
+    const symbolArg = args[0] ? args[0].toUpperCase() : null;
+    const newSl = parseFloat(args[1]);
+    if (!symbolArg || isNaN(newSl)) {
+      await sendTelegramReply(chatId, '⚠️ Syntax: <code>/setsl BTC-USDT 65000</code>');
+      return;
+    }
+    const fullSymbol = symbolArg.endsWith('-USDT') ? symbolArg : `${symbolArg}-USDT`;
+    if (!activeTrades.has(fullSymbol)) {
+      await sendTelegramReply(chatId, `⚠️ Kein aktiver Trade für <b>${escapeHtml(fullSymbol)}</b>.`);
+      return;
+    }
+    const trade = activeTrades.get(fullSymbol);
+    trade.stopLoss = newSl;
+    await upsertTrade(fullSymbol, trade);
+    await sendTelegramReply(chatId, `✅ Stop-Loss für <b>${escapeHtml(fullSymbol)}</b> auf <b>$${newSl}</b> angepasst.`);
+    return;
+  }
+
+  if (command === '/settp') {
+    const symbolArg = args[0] ? args[0].toUpperCase() : null;
+    const target = args[1] ? args[1].toLowerCase() : null;
+    const newTp = parseFloat(args[2]);
+    if (!symbolArg || !['tp1', 'tp2'].includes(target) || isNaN(newTp)) {
+      await sendTelegramReply(chatId, '⚠️ Syntax: <code>/settp BTC-USDT tp1 68000</code>');
+      return;
+    }
+    const fullSymbol = symbolArg.endsWith('-USDT') ? symbolArg : `${symbolArg}-USDT`;
+    if (!activeTrades.has(fullSymbol)) {
+      await sendTelegramReply(chatId, `⚠️ Kein aktiver Trade für <b>${escapeHtml(fullSymbol)}</b>.`);
+      return;
+    }
+    const trade = activeTrades.get(fullSymbol);
+    trade[target] = newTp;
+    await upsertTrade(fullSymbol, trade);
+    await sendTelegramReply(chatId, `✅ <b>${target.toUpperCase()}</b> für <b>${escapeHtml(fullSymbol)}</b> auf <b>$${newTp}</b> angepasst.`);
+    return;
+  }
+
+  if (command === '/setrisk') {
+    const newRisk = parseFloat(args[0]);
+    if (isNaN(newRisk) || newRisk <= 0 || newRisk > 10) {
+      await sendTelegramReply(chatId, '⚠️ Ungültiger Risikowert (erlaubt: 0.1% bis 10.0%). Beispiel: <code>/setrisk 0.5</code>');
+      return;
+    }
+    config.RISK_PERCENT = newRisk;
+    if (botStateCollection && isDbConnected) {
+      await botStateCollection.updateOne({ _id: 'runtimeConfig' }, { $set: { RISK_PERCENT: newRisk } }, { upsert: true });
+    }
+    await sendTelegramReply(chatId, `⚙️ Risiko pro Trade angepasst auf: <b>${newRisk}%</b>`);
+    return;
+  }
+
+  if (command === '/setprofile') {
+    const profileArg = args[0] ? args[0].toLowerCase() : null;
+    if (!profileArg || !STRATEGY_PROFILES[profileArg]) {
+      await sendTelegramReply(chatId, '⚠️ Syntax: <code>/setprofile strict</code> oder <code>/setprofile loose</code>');
+      return;
+    }
+    STRATEGY_PROFILE_NAME = profileArg;
+    activeProfile = STRATEGY_PROFILES[profileArg];
+    config.ALLOW_COUNTER_BTC_TREND = activeProfile.ALLOW_COUNTER_BTC_TREND;
+    config.REQUIRE_4H_TREND = activeProfile.REQUIRE_4H_TREND;
+    config.ADX_MIN = activeProfile.ADX_MIN;
+    config.RSI_LONG_MIN = activeProfile.RSI_LONG_MIN;
+    config.RSI_LONG_MAX = activeProfile.RSI_LONG_MAX;
+    config.RSI_SHORT_MIN = activeProfile.RSI_SHORT_MIN;
+    config.RSI_SHORT_MAX = activeProfile.RSI_SHORT_MAX;
+    config.MIN_RELATIVE_VOLUME = activeProfile.MIN_RELATIVE_VOLUME;
+    config.BOS_LOOKBACK = activeProfile.BOS_LOOKBACK;
+
+    await sendTelegramReply(chatId, `🔄 Strategie-Profil gewechselt auf: <b>${profileArg.toUpperCase()}</b>`);
+    return;
+  }
+
+  if (command === '/blacklist') {
+    const symbolArg = args[0] ? args[0].toUpperCase() : null;
+    if (!symbolArg) {
+      await sendTelegramReply(chatId, '⚠️ Syntax: <code>/blacklist DOGE-USDT</code>');
+      return;
+    }
+    const fullSymbol = symbolArg.endsWith('-USDT') ? symbolArg : `${symbolArg}-USDT`;
+    manualBlacklist.add(fullSymbol);
+    if (botStateCollection && isDbConnected) {
+      await botStateCollection.updateOne({ _id: 'manualBlacklist' }, { $set: { symbols: [...manualBlacklist] } }, { upsert: true });
+    }
+    await sendTelegramReply(chatId, `🚫 <b>${escapeHtml(fullSymbol)}</b> wurde zur manuellen Blacklist hinzugefügt.`);
+    return;
+  }
+
+  if (command === '/unblacklist') {
+    const symbolArg = args[0] ? args[0].toUpperCase() : null;
+    if (!symbolArg) {
+      await sendTelegramReply(chatId, '⚠️ Syntax: <code>/unblacklist DOGE-USDT</code>');
+      return;
+    }
+    const fullSymbol = symbolArg.endsWith('-USDT') ? symbolArg : `${symbolArg}-USDT`;
+    manualBlacklist.delete(fullSymbol);
+    if (botStateCollection && isDbConnected) {
+      await botStateCollection.updateOne({ _id: 'manualBlacklist' }, { $set: { symbols: [...manualBlacklist] } }, { upsert: true });
+    }
+    await sendTelegramReply(chatId, `✅ <b>${escapeHtml(fullSymbol)}</b> wurde von der Blacklist entfernt.`);
+    return;
+  }
+
+  if (command === '/showblacklist') {
+    const list = [...manualBlacklist];
+    let msg = `📜 <b>MANUELLE BLACKLIST (${list.length}):</b>\n`;
+    if (list.length === 0) msg += '<i>Keine Coins manuell gesperrt.</i>';
+    else msg += list.map(s => `• <code>${escapeHtml(s)}</code>`).join('\n');
+    await sendTelegramReply(chatId, msg);
+    return;
+  }
+
+  if (command === '/retrain') {
+    await sendTelegramReply(chatId, '🧠 <i>Starte manuelles TensorFlow.js KI-Training mit Hyperparameter-Tuning...</i>');
+    const res = await trainSignalMLModel(true);
+    if (res.trained) {
+      const bp = res.bestHyperparameters ? `\n• LR: ${res.bestHyperparameters.learningRate} | Dropout: ${res.bestHyperparameters.dropoutRate}` : '';
+      await sendTelegramReply(chatId, `🟢 <b>KI-Training erfolgreich!</b>\nSamples: ${res.samples} | Epochs: ${res.epochs}${bp}`);
+    } else {
+      await sendTelegramReply(chatId, `⚠️ <b>KI-Training nicht durchgeführt:</b> ${escapeHtml(res.reason)}`);
+    }
+    return;
+  }
+
+  if (command === '/logs') {
+    const logsToShow = recentLogs.slice(-15);
+    if (logsToShow.length === 0) {
+      await sendTelegramReply(chatId, '📋 Keine Logs verfügbar.');
+      return;
+    }
+    const logText = escapeHtml(logsToShow.join('\n'));
+    await sendTelegramReply(chatId, `📋 <b>LETZTE LOGS (15):</b>\n<pre>${logText}</pre>`);
+    return;
+  }
+
   if (command === '/setcapital') {
     if (!args[0]) {
       await sendTelegramReply(chatId, `⚠️ Bitte gib einen Betrag an.\nBeispiel: <code>/setcapital 15000</code>`);
@@ -2360,6 +3008,27 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, 
       `✅ <b>Kapital erfolgreich angepasst!</b>\n` +
       `• Neues Startkapital: <b>$${newCapital.toFixed(2)}</b>\n` +
+      `• Neues Peak Capital: <b>$${peakCapital.toFixed(2)}</b>`
+    );
+    return;
+  }
+
+  if (command === '/setpeak' || command === '/setpeakcapital') {
+    if (!args[0]) {
+      await sendTelegramReply(chatId, `⚠️ Bitte gib einen Betrag an.\nBeispiel: <code>/setpeak 12000</code>`);
+      return;
+    }
+    const newPeak = parseFloat(args[0]);
+    if (isNaN(newPeak) || newPeak <= 0) {
+      await sendTelegramReply(chatId, `❌ Ungültiger Betrag: <b>${args[0]}</b>`);
+      return;
+    }
+
+    peakCapital = newPeak;
+    await persistPeakCapital();
+
+    await sendTelegramReply(chatId, 
+      `✅ <b>Peak Capital erfolgreich angepasst!</b>\n` +
       `• Neues Peak Capital: <b>$${peakCapital.toFixed(2)}</b>`
     );
     return;
@@ -2391,18 +3060,18 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v21.0 ULTIMATE TFJS + RL</b>`);
+    lines.push(`🤖 <b>BOT STATUS v21.6 ULTIMATE TFJS</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
     
     const mlStats = mlModel.getStats();
-    lines.push(`ML: ${isModelTrained ? '🟢 TFJS aktiv' : '🟡 unformiert'} | Samples: ${mlStats.samples || 0}`);
+    let mlInfo = `ML: ${isModelTrained ? '🟢 TensorFlow.js aktiv' : '🟡 nicht trainiert'} | Samples: ${mlStats.samples || 0}`;
+    if (mlStats.bestHyperparameters) {
+      mlInfo += ` | LR: ${mlStats.bestHyperparameters.learningRate}`;
+    }
+    lines.push(mlInfo);
     
-    // NEU: RL Agent Status im Telegram Statusbefehl
-    const rlStats = rlAgent.getStats();
-    lines.push(`RL-Agent: 🟢 DQN aktiv | Epsilon: ${rlStats.epsilon} | Memory: ${rlStats.memorySize}`);
-
     lines.push(`Scans: ${isPaused ? '⏸️ PAUSIERT' : '▶️ aktiv'}`);
     lines.push(`Kapital: $${config.CAPITAL_USD.toFixed(0)} | Peak: $${peakCapital.toFixed(0)}`);
     lines.push(`Hebel: ${config.LEVERAGE}x | Risk/Trade: ${config.RISK_PERCENT}%`);
@@ -2540,20 +3209,20 @@ async function pollTelegramUpdates() {
 }
 
 // ==========================================
-// 17. EXPRESS ENDPOINTS & GRAFANA METRICS
+// 18. EXPRESS ENDPOINTS & WEB-BACKTEST
 // ==========================================
 const app = express();
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v21.0 ULTIMATE TFJS + RL | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v21.6 ULTIMATE TFJS | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 app.get('/health', (req, res) => {
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
   const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : '0';
   res.status(isDbConnected ? 200 : 503).json({
-    status: isDbConnected ? 'ok' : 'degraded', version: '21.0', dbConnected: isDbConnected,
+    status: isDbConnected ? 'ok' : 'degraded', version: '21.6', dbConnected: isDbConnected,
     isPaused, activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, currentEquity, peakCapital, drawdownPercent
   });
 });
@@ -2576,6 +3245,22 @@ app.get('/metrics', (req, res) => {
   ].join('\n');
   res.setHeader('Content-Type', 'text/plain');
   res.send(metrics);
+});
+
+app.get('/backtest', async (req, res) => {
+  try {
+    const symbol = req.query.symbol || 'BTC-USDT';
+    const days = Number(req.query.days || 30);
+    const cfg = buildBacktestConfig(process.env);
+    const useML = req.query.noml !== 'true';
+
+    logger.info(`🚀 Starte Web-Backtest für ${symbol} (${days} Tage)...`);
+    const result = await runBacktest({ symbol, days, cfg, useML, walkForward: true });
+    res.json(result);
+  } catch (e) {
+    logger.error(`❌ Web-Backtest Fehler: ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/trades', (req, res) => {
@@ -2610,25 +3295,19 @@ app.get('/api/ml/status', (req, res) => {
   res.json({
     enabled: config.ML_ENABLED,
     trained: isModelTrained,
-    ...mlModel.getStats(),
-    rl: rlAgent.getStats() // <-- NEU: Status des RL-Agenten mit ausgeben
+    ...mlModel.getStats()
   });
 });
 
-const server = app.listen(config.PORT, () => { logger.info(`[SERVER] Port ${config.PORT}`); });
+const server = app.listen(config.PORT, '0.0.0.0', () => { 
+  logger.info(`🌐 Webserver bindet sich an Port ${config.PORT} für Render...`); 
+});
 
 // ==========================================
-// 18. TIMERS & SHUTDOWN
+// 19. TIMERS & SHUTDOWN
 // ==========================================
 const cronJobs = [];
 const intervalTimers = [];
-
-let isScanningInterval = false;
-cronJobs.push(cron.schedule('*/15 * * * *', async () => {
-  if (isScanningInterval) return;
-  isScanningInterval = true;
-  try { await scanMarket(); } finally { isScanningInterval = false; }
-}, { timezone: 'UTC' }));
 
 intervalTimers.push(setInterval(async () => { await checkActiveTrades(); }, config.FAST_TRACK_INTERVAL_SECONDS * 1000));
 intervalTimers.push(setInterval(() => { klinesCache.cleanup(config.CACHE_CLEANUP_MINUTES * 60 * 1000); }, config.CACHE_CLEANUP_MINUTES * 60 * 1000));
@@ -2642,7 +3321,6 @@ cronJobs.push(cron.schedule('59 23 * * *', async () => {
 cronJobs.push(cron.schedule('0 */6 * * *', async () => {
   await loadFuturesContractSpecs();
   await trainSignalMLModel();
-  await rlAgent.trainFromClosedTrades(closedTradesCollection); // NEU: Regelmäßiges RL-Retraining per Cron
 }, { timezone: 'UTC' }));
 
 async function gracefulShutdown(signal) {
@@ -2671,23 +3349,33 @@ process.on('unhandledRejection', async (reason) => {
 });
 
 // ==========================================
-// 19. BOT START (ASYNCHRON & ABSICHERT)
+// 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v21.0 ULTIMATE TFJS + RL (Full Features, TensorFlow.js ML, DQN RL & Hurst Filter)...');
+  logger.info('🚀 Starte Trading Bot v21.6 ULTIMATE TFJS (Full Features, TensorFlow.js ML, Time-Learning Filter & Dynamic Filter Engine)...');
+  
   await initDatabase();
   await loadFuturesContractSpecs();
   await loadSignalMLModel();
   if (!isModelTrained) await trainSignalMLModel(true);
-
-  // NEU: RL Agent beim Start initialisieren & mit historischen Trades trainieren
-  await rlAgent.init();
-  await rlAgent.trainFromClosedTrades(closedTradesCollection);
-
   pollTelegramUpdates();
-  if (isDbConnected) {
-    scanMarket();
-  } else {
-    logger.warn('⚠️ Erster Scan verzögert, warte auf DB-Reconnect...');
-  }
+
+  const runScanCycle = async () => {
+    try {
+      if (isDbConnected) {
+        await scanMarket();
+      } else {
+        logger.warn('⚠️ Scan übersprungen, warte auf DB-Reconnect...');
+      }
+    } catch (error) {
+      logger.error(`Fehler im Scan-Zyklus: ${error.message}`);
+    }
+  };
+
+  await runScanCycle();
+
+  const SCAN_INTERVAL_MS = 5 * 60 * 1000; 
+  setInterval(runScanCycle, SCAN_INTERVAL_MS);
+  
+  logger.info(`🔄 Bot-Dauerschleife aktiv. Nächster Scan in ${SCAN_INTERVAL_MS / 60000} Minuten.`);
 })();
