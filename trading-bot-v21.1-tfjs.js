@@ -4,480 +4,515 @@
  * (Mit adaptivem TensorFlow.js ML, globaler Telegram-Queue, State-Persistenz,
  *  Hurst-Exponent, Marktphasen-Logging, Dynamic Filter Control & Web-Backtest)
  * ============================================================================
- */
+ */[cite: 5]
 
-require('dotenv').config();
-const express = require('express');
-const cron = require('node-cron');
-const axios = require('axios');
-const { MongoClient } = require('mongodb');
-const winston = require('winston');
-const { TensorFlowSignalModel } = require('./ml-engine');
-const { runBacktest, buildConfig: buildBacktestConfig } = require('./backtest-engine');
+require('dotenv').config();[cite: 5]
+const express = require('express');[cite: 5]
+const cron = require('node-cron');[cite: 5]
+const axios = require('axios');[cite: 5]
+const { MongoClient } = require('mongodb');[cite: 5]
+const winston = require('winston');[cite: 5]
+const { TensorFlowSignalModel } = require('./ml-engine');[cite: 5]
+const { runBacktest, buildConfig: buildBacktestConfig } = require('./backtest-engine');[cite: 5]
 
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
 // ==========================================
-const { Writable } = require('stream');
+const { Writable } = require('stream');[cite: 5]
 
-const recentLogs = [];
-const memoryStream = new Writable({
-  write(chunk, encoding, callback) {
-    recentLogs.push(chunk.toString().trim());
-    if (recentLogs.length > 50) recentLogs.shift();
-    callback();
-  }
-});
+const recentLogs = [];[cite: 5]
+const memoryStream = new Writable({[cite: 5]
+  write(chunk, encoding, callback) {[cite: 5]
+    recentLogs.push(chunk.toString().trim());[cite: 5]
+    if (recentLogs.length > 50) recentLogs.shift();[cite: 5]
+    callback();[cite: 5]
+  }[cite: 5]
+});[cite: 5]
 
-const memoryLogTransport = new winston.transports.Stream({
-  stream: memoryStream
-});
+const memoryLogTransport = new winston.transports.Stream({[cite: 5]
+  stream: memoryStream[cite: 5]
+});[cite: 5]
 
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-    winston.format.printf(({ timestamp, level, message }) => `[${timestamp}] ${level.toUpperCase()}: ${message}`)
-  ),
-  transports: [
-    new winston.transports.Console(),
-    memoryLogTransport
-  ]
-});
+const logger = winston.createLogger({[cite: 5]
+  level: 'info',[cite: 5]
+  format: winston.format.combine([cite: 5]
+    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),[cite: 5]
+    winston.format.printf(({ timestamp, level, message }) => `[${timestamp}] ${level.toUpperCase()}: ${message}`)[cite: 5]
+  ),[cite: 5]
+  transports: [[cite: 5]
+    new winston.transports.Console(),[cite: 5]
+    memoryLogTransport[cite: 5]
+  ][cite: 5]
+});[cite: 5]
 
-let isShuttingDown = false;
-let currentMarketPhase = 'RANGING';
-let adaptiveConfig = null;
-let lastScanStats = null;
-let scanCounter = 0;
+let isShuttingDown = false;[cite: 5]
+let currentMarketPhase = 'RANGING';[cite: 5]
+let adaptiveConfig = null;[cite: 5]
+let lastScanStats = null;[cite: 5]
+let scanCounter = 0;[cite: 5]
 
-let currentStreak = 0;
-let maxWinStreak = 0;
-let maxLossStreak = 0;
+let currentStreak = 0;[cite: 5]
+let maxWinStreak = 0;[cite: 5]
+let maxLossStreak = 0;[cite: 5]
 
-let peakCapital = parseFloat(process.env.CAPITAL_USD) || 10000;
-let dailyNetPnL = 0;
-let consecutiveLosses = 0;
+let peakCapital = parseFloat(process.env.CAPITAL_USD) || 10000;[cite: 5]
+let dailyNetPnL = 0;[cite: 5]
+let consecutiveLosses = 0;[cite: 5]
 
-const MAX_DRAWDOWN_PERCENT = parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 25;
-const DAILY_PROFIT_TARGET = parseFloat(process.env.DAILY_PROFIT_TARGET) || 500;
+const MAX_DRAWDOWN_PERCENT = parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 25;[cite: 5]
+const DAILY_PROFIT_TARGET = parseFloat(process.env.DAILY_PROFIT_TARGET) || 500;[cite: 5]
 
-let kucoinErrorCount = 0;
-let kucoinCircuitOpenUntil = 0;
-const KUCOIN_CIRCUIT_THRESHOLD = 3;
-const KUCOIN_CIRCUIT_COOLDOWN_MS = 300000;
+let kucoinErrorCount = 0;[cite: 5]
+let kucoinCircuitOpenUntil = 0;[cite: 5]
+const KUCOIN_CIRCUIT_THRESHOLD = 3;[cite: 5]
+const KUCOIN_CIRCUIT_COOLDOWN_MS = 300000;[cite: 5]
 
-const manualBlacklist = new Set();
+const manualBlacklist = new Set();[cite: 5]
 
 // ==========================================
 // 2. FILTER REGISTRY & ZENTRALE KONFIGURATION
 // ==========================================
-const FILTER_REGISTRY = {
-  hurst: { configKey: 'MIN_HURST_EXPONENT', name: 'Hurst Exponent', default: 0.52, type: 'numeric', step: 0.02, direction: 'higher_is_harder', min: 0.0, max: 0.95 },
-  adx:   { configKey: 'ADX_MIN',            name: 'ADX Minimum',    default: 20,   type: 'numeric', step: 2.0,  direction: 'higher_is_harder', min: 0,   max: 60 },
-  bos:   { configKey: 'BOS_LOOKBACK',       name: 'BOS Lookback',   default: 10,   type: 'numeric', step: 2,    direction: 'higher_is_harder', min: 2,   max: 50 },
-  relvol:{ configKey: 'MIN_RELATIVE_VOLUME',name: 'Rel. Volumen',   default: 1.2,  type: 'numeric', step: 0.1,  direction: 'higher_is_harder', min: 0.0, max: 10.0 },
-  chop:  { configKey: 'MAX_CHOP_INDEX',     name: 'Max Chop Index', default: 61.8, type: 'numeric', step: 2.0,  direction: 'lower_is_harder',  min: 10,  max: 90 },
-  rsi_long_min:  { configKey: 'RSI_LONG_MIN',  name: 'RSI Long Min',   default: 48,   type: 'numeric', step: 2.0,  direction: 'higher_is_harder', min: 10,  max: 80 },
-  rsi_short_max: { configKey: 'RSI_SHORT_MAX', name: 'RSI Short Max',  default: 52,   type: 'numeric', step: 2.0,  direction: 'lower_is_harder',  min: 20,  max: 90 },
-  trend4h:       { configKey: 'REQUIRE_4H_TREND', name: '4H Trend-Filter', default: true, type: 'boolean' },
-  btctrend:      { configKey: 'ALLOW_COUNTER_BTC_TREND', name: 'Gegen-BTC-Trend', default: false, type: 'boolean' }
-};
+const FILTER_REGISTRY = {[cite: 5]
+  hurst: { configKey: 'MIN_HURST_EXPONENT', name: 'Hurst Exponent', default: 0.52, type: 'numeric', step: 0.02, direction: 'higher_is_harder', min: 0.0, max: 0.95 },[cite: 5]
+  adx:   { configKey: 'ADX_MIN',            name: 'ADX Minimum',    default: 20,   type: 'numeric', step: 2.0,  direction: 'higher_is_harder', min: 0,   max: 60 },[cite: 5]
+  bos:   { configKey: 'BOS_LOOKBACK',       name: 'BOS Lookback',   default: 10,   type: 'numeric', step: 2,    direction: 'higher_is_harder', min: 2,   max: 50 },[cite: 5]
+  relvol:{ configKey: 'MIN_RELATIVE_VOLUME',name: 'Rel. Volumen',   default: 1.2,  type: 'numeric', step: 0.1,  direction: 'higher_is_harder', min: 0.0, max: 10.0 },[cite: 5]
+  chop:  { configKey: 'MAX_CHOP_INDEX',     name: 'Max Chop Index', default: 61.8, type: 'numeric', step: 2.0,  direction: 'lower_is_harder',  min: 10,  max: 90 },[cite: 5]
+  rsi_long_min:  { configKey: 'RSI_LONG_MIN',  name: 'RSI Long Min',   default: 48,   type: 'numeric', step: 2.0,  direction: 'higher_is_harder', min: 10,  max: 80 },[cite: 5]
+  rsi_short_max: { configKey: 'RSI_SHORT_MAX', name: 'RSI Short Max',  default: 52,   type: 'numeric', step: 2.0,  direction: 'lower_is_harder',  min: 20,  max: 90 },[cite: 5]
+  trend4h:       { configKey: 'REQUIRE_4H_TREND', name: '4H Trend-Filter', default: true, type: 'boolean' },[cite: 5]
+  btctrend:      { configKey: 'ALLOW_COUNTER_BTC_TREND', name: 'Gegen-BTC-Trend', default: false, type: 'boolean' }[cite: 5]
+};[cite: 5]
 
-const filterState = {};
-Object.keys(FILTER_REGISTRY).forEach(key => {
-  filterState[key] = { enabled: true };
-});
+const filterState = {};[cite: 5]
+Object.keys(FILTER_REGISTRY).forEach(key => {[cite: 5]
+  filterState[key] = { enabled: true };[cite: 5]
+});[cite: 5]
 
 // ==========================================
 // 3. API LATENZ & RATE LIMITER
 // ==========================================
-const apiLatencyStats = {
-  kucoin: [],
-  telegram: [],
-  mongodb: [],
+const apiLatencyStats = {[cite: 5]
+  kucoin: [],[cite: 5]
+  telegram: [],[cite: 5]
+  mongodb: [],[cite: 5]
   
-  record(service, latencyMs) {
-    if (!this[service]) this[service] = [];
-    this[service].push({ time: Date.now(), latency: latencyMs });
-    if (this[service].length > 100) this[service].shift();
-  },
+  record(service, latencyMs) {[cite: 5]
+    if (!this[service]) this[service] = [];[cite: 5]
+    this[service].push({ time: Date.now(), latency: latencyMs });[cite: 5]
+    if (this[service].length > 100) this[service].shift();[cite: 5]
+  },[cite: 5]
   
-  getAverage(service) {
-    if (!this[service] || this[service].length === 0) return 0;
-    return this[service].reduce((sum, e) => sum + e.latency, 0) / this[service].length;
-  }
-};
+  getAverage(service) {[cite: 5]
+    if (!this[service] || this[service].length === 0) return 0;[cite: 5]
+    return this[service].reduce((sum, e) => sum + e.latency, 0) / this[service].length;[cite: 5]
+  }[cite: 5]
+};[cite: 5]
 
-const apiRateLimiter = {
-  requests: 0,
-  windowStart: Date.now(),
-  maxRequests: 1800,
-  windowMs: 60000,
+const apiRateLimiter = {[cite: 5]
+  requests: 0,[cite: 5]
+  windowStart: Date.now(),[cite: 5]
+  maxRequests: 1800,[cite: 5]
+  windowMs: 60000,[cite: 5]
   
-  async checkLimit() {
-    const now = Date.now();
-    if (now - this.windowStart > this.windowMs) {
-      this.requests = 0;
-      this.windowStart = now;
-    }
-    if (this.requests >= this.maxRequests) {
-      const waitMs = this.windowMs - (now - this.windowStart) + 100;
-      logger.warn(`⚠️ API Rate-Limit erreicht (${this.requests}/${this.maxRequests}), warte ${waitMs}ms`);
-      await sleep(waitMs);
-      this.requests = 0;
-      this.windowStart = Date.now();
-    }
-    this.requests++;
-  }
-};
+  async checkLimit() {[cite: 5]
+    const now = Date.now();[cite: 5]
+    if (now - this.windowStart > this.windowMs) {[cite: 5]
+      this.requests = 0;[cite: 5]
+      this.windowStart = now;[cite: 5]
+    }[cite: 5]
+    if (this.requests >= this.maxRequests) {[cite: 5]
+      const waitMs = this.windowMs - (now - this.windowStart) + 100;[cite: 5]
+      logger.warn(`⚠️ API Rate-Limit erreicht (${this.requests}/${this.maxRequests}), warte ${waitMs}ms`);[cite: 5]
+      await sleep(waitMs);[cite: 5]
+      this.requests = 0;[cite: 5]
+      this.windowStart = Date.now();[cite: 5]
+    }[cite: 5]
+    this.requests++;[cite: 5]
+  }[cite: 5]
+};[cite: 5]
 
 // ==========================================
 // 4. BULK QUEUE & LRU CACHE
 // ==========================================
-let dbBulkQueue = [];
-let dbBulkTimer = null;
+let dbBulkQueue = [];[cite: 5]
+let dbBulkTimer = null;[cite: 5]
 
-class LRUCache {
-  constructor(maxSize) {
-    this.maxSize = maxSize;
-    this.cache = new Map();
-  }
+class LRUCache {[cite: 5]
+  constructor(maxSize) {[cite: 5]
+    this.maxSize = maxSize;[cite: 5]
+    this.cache = new Map();[cite: 5]
+  }[cite: 5]
   
-  get(key) {
-    if (!this.cache.has(key)) return null;
-    const value = this.cache.get(key);
-    this.cache.delete(key);
-    this.cache.set(key, value);
-    return value;
-  }
+  get(key) {[cite: 5]
+    if (!this.cache.has(key)) return null;[cite: 5]
+    const value = this.cache.get(key);[cite: 5]
+    this.cache.delete(key);[cite: 5]
+    this.cache.set(key, value);[cite: 5]
+    return value;[cite: 5]
+  }[cite: 5]
   
-  set(key, value) {
-    if (this.cache.has(key)) {
-      this.cache.delete(key);
-    } else if (this.cache.size >= this.maxSize) {
-      const firstKey = this.cache.keys().next().value;
-      this.cache.delete(firstKey);
-    }
-    this.cache.set(key, value);
-  }
+  set(key, value) {[cite: 5]
+    if (this.cache.has(key)) {[cite: 5]
+      this.cache.delete(key);[cite: 5]
+    } else if (this.cache.size >= this.maxSize) {[cite: 5]
+      const firstKey = this.cache.keys().next().value;[cite: 5]
+      this.cache.delete(firstKey);[cite: 5]
+    }[cite: 5]
+    this.cache.set(key, value);[cite: 5]
+  }[cite: 5]
   
-  delete(key) { this.cache.delete(key); }
-  has(key) { return this.cache.has(key); }
-  get size() { return this.cache.size; }
+  delete(key) { this.cache.delete(key); }[cite: 5]
+  has(key) { return this.cache.has(key); }[cite: 5]
+  get size() { return this.cache.size; }[cite: 5]
   
-  cleanup(maxAge) {
-    const now = Date.now();
-    for (const [key, value] of this.cache.entries()) {
-      if (now - value.timestamp > maxAge) this.cache.delete(key);
-    }
-  }
-}
+  cleanup(maxAge) {[cite: 5]
+    const now = Date.now();[cite: 5]
+    for (const [key, value] of this.cache.entries()) {[cite: 5]
+      if (now - value.timestamp > maxAge) this.cache.delete(key);[cite: 5]
+    }[cite: 5]
+  }[cite: 5]
+}[cite: 5]
 
 // ==========================================
 // 5. HELFER & TELEGRAM ENGINE
 // ==========================================
-function safeParseFloat(value, fieldName, context) {
-  const parsed = parseFloat(value);
-  if (!Number.isFinite(parsed)) {
-    logger.error(`[DATA ERROR] ${fieldName} bei ${context}: ${JSON.stringify(value)}`);
-    return null;
-  }
-  return parsed;
-}
+function safeParseFloat(value, fieldName, context) {[cite: 5]
+  const parsed = parseFloat(value);[cite: 5]
+  if (!Number.isFinite(parsed)) {[cite: 5]
+    logger.error(`[DATA ERROR] ${fieldName} bei ${context}: ${JSON.stringify(value)}`);[cite: 5]
+    return null;[cite: 5]
+  }[cite: 5]
+  return parsed;[cite: 5]
+}[cite: 5]
 
-function escapeHtml(value) {
-  return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
+function escapeHtml(value) {[cite: 5]
+  return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');[cite: 5]
+}[cite: 5]
 
-function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-function todayUTCString() { return new Date().toISOString().slice(0, 10); }
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }[cite: 5]
+function todayUTCString() { return new Date().toISOString().slice(0, 10); }[cite: 5]
 
-const configTelegram = {
-  botToken: process.env.TELEGRAM_BOT_TOKEN || '',
-  chatId: process.env.TELEGRAM_CHAT_ID || ''
-};
+const configTelegram = {[cite: 5]
+  botToken: process.env.TELEGRAM_BOT_TOKEN || '',[cite: 5]
+  chatId: process.env.TELEGRAM_CHAT_ID || ''[cite: 5]
+};[cite: 5]
 
-let telegramQueue = Promise.resolve();
+let telegramQueue = Promise.resolve();[cite: 5]
 
-function queueTelegramMessage(taskFn) {
-  telegramQueue = telegramQueue.then(async () => {
-    try {
-      await taskFn();
-    } catch (e) {}
-  });
-  return telegramQueue;
-}
+function queueTelegramMessage(taskFn) {[cite: 5]
+  telegramQueue = telegramQueue.then(async () => {[cite: 5]
+    try {[cite: 5]
+      await taskFn();[cite: 5]
+    } catch (e) {}[cite: 5]
+  });[cite: 5]
+  return telegramQueue;[cite: 5]
+}[cite: 5]
 
-async function sendTelegramAlert(text) {
-  if (!configTelegram.botToken || !configTelegram.chatId) return;
-  const startTime = Date.now();
-  const chatIds = configTelegram.chatId.split(',').map(id => id.trim()).filter(Boolean);
+async function sendTelegramAlert(text) {[cite: 5]
+  if (!configTelegram.botToken || !configTelegram.chatId) return;[cite: 5]
+  const startTime = Date.now();[cite: 5]
+  const chatIds = configTelegram.chatId.split(',').map(id => id.trim()).filter(Boolean);[cite: 5]
 
-  for (const chatId of chatIds) {
-    await queueTelegramMessage(async () => {
-      let success = false;
-      let attempts = 0;
-      let delay = 3000;
+  for (const chatId of chatIds) {[cite: 5]
+    await queueTelegramMessage(async () => {[cite: 5]
+      let success = false;[cite: 5]
+      let attempts = 0;[cite: 5]
+      let delay = 3000;[cite: 5]
 
-      while (!success && attempts < 3) {
-        try {
-          attempts++;
-          await axios.post(
-            `https://api.telegram.org/bot${configTelegram.botToken}/sendMessage`,
-            { chat_id: chatId, text: text, parse_mode: 'HTML' },
-            { timeout: 10000 }
-          );
-          success = true;
-          await sleep(500);
-        } catch (e) {
-          if (e.response && e.response.status === 429) {
-            logger.warn(`⚠️ Telegram Rate-Limit (429) für Chat ${chatId}. Warte ${delay}ms...`);
-            await sleep(delay);
-            delay *= 2;
-          } else {
-            logger.error(`Telegram (${chatId}): ${e.message}`);
-            break;
-          }
-        }
-      }
+      while (!success && attempts < 3) {[cite: 5]
+        try {[cite: 5]
+          attempts++;[cite: 5]
+          await axios.post([cite: 5]
+            `https://api.telegram.org/bot${configTelegram.botToken}/sendMessage`,[cite: 5]
+            { chat_id: chatId, text: text, parse_mode: 'HTML' },[cite: 5]
+            { timeout: 10000 }[cite: 5]
+          );[cite: 5]
+          success = true;[cite: 5]
+          await sleep(500);[cite: 5]
+        } catch (e) {[cite: 5]
+          if (e.response && e.response.status === 429) {[cite: 5]
+            logger.warn(`⚠️ Telegram Rate-Limit (429) für Chat ${chatId}. Warte ${delay}ms...`);[cite: 5]
+            await sleep(delay);[cite: 5]
+            delay *= 2;[cite: 5]
+          } else {[cite: 5]
+            logger.error(`Telegram (${chatId}): ${e.message}`);[cite: 5]
+            break;[cite: 5]
+          }[cite: 5]
+        }[cite: 5]
+      }[cite: 5]
+    });[cite: 5]
+  }[cite: 5]
+  apiLatencyStats.record('telegram', Date.now() - startTime);[cite: 5]
+}[cite: 5]
+
+async function sendTelegramReply(chatId, text) {[cite: 5]
+  if (!configTelegram.botToken || !chatId) return;[cite: 5]
+  await queueTelegramMessage(async () => {[cite: 5]
+    let success = false;[cite: 5]
+    let attempts = 0;[cite: 5]
+    let delay = 3000;[cite: 5]
+
+    while (!success && attempts < 3) {[cite: 5]
+      try {[cite: 5]
+        attempts++;[cite: 5]
+        await axios.post([cite: 5]
+          `https://api.telegram.org/bot${configTelegram.botToken}/sendMessage`,[cite: 5]
+          { chat_id: chatId, text: text, parse_mode: 'HTML' },[cite: 5]
+          { timeout: 10000 }[cite: 5]
+        );[cite: 5]
+        success = true;[cite: 5]
+        await sleep(500);[cite: 5]
+      } catch (e) {[cite: 5]
+        if (e.response && e.response.status === 429) {[cite: 5]
+          logger.warn(`⚠️ Telegram Reply Rate-Limit (429) für Chat ${chatId}. Warte ${delay}ms...`);[cite: 5]
+          await sleep(delay);[cite: 5]
+          delay *= 2;[cite: 5]
+        } else {[cite: 5]
+          logger.error(`Telegram Reply (${chatId}): ${e.message}`);[cite: 5]
+          break;[cite: 5]
+        }[cite: 5]
+      }[cite: 5]
+    }[cite: 5]
+  });[cite: 5]
+}[cite: 5]
+
+async function getAlertTimestamp(key) {[cite: 5]
+  if (!botStateCollection || !isDbConnected) return 0;[cite: 5]
+  try {[cite: 5]
+    const doc = await botStateCollection.findOne({ _id: `alert_${key}` });[cite: 5]
+    return doc ? doc.lastSent : 0;[cite: 5]
+  } catch (e) {[cite: 5]
+    return 0;[cite: 5]
+  }[cite: 5]
+}[cite: 5]
+
+async function persistAlertHistoryEntry(key, timestamp) {[cite: 5]
+  if (!botStateCollection || !isDbConnected) return;[cite: 5]
+  try {[cite: 5]
+    await botStateCollection.updateOne([cite: 5]
+      { _id: `alert_${key}` },[cite: 5]
+      { $set: { lastSent: timestamp } },[cite: 5]
+      { upsert: true }[cite: 5]
+    );[cite: 5]
+  } catch (e) {}[cite: 5]
+}[cite: 5]
+
+async function sendDeduplicatedAlert(key, text, cooldownMs = 300000) {[cite: 5]
+  const lastSent = await getAlertTimestamp(key);[cite: 5]
+  if (Date.now() - lastSent < cooldownMs) return;[cite: 5]
+  await persistAlertHistoryEntry(key, Date.now());[cite: 5]
+  await sendTelegramAlert(text);[cite: 5]
+}[cite: 5]
+
+async function sendBatchedSignalAlert(signals) {[cite: 5]
+  if (signals.length === 0) return;[cite: 5]
+  if (signals.length === 1) {[cite: 5]
+    await sendTelegramAlert(signals[0].text);[cite: 5]
+    return;[cite: 5]
+  }[cite: 5]
+  let batchText = `🚀 <b>${signals.length} NEUE SIGNALE</b>\n━━━━━━━━━━━━━━━━━━\n\n`;[cite: 5]
+  signals.forEach((signal, index) => {[cite: 5]
+    batchText += `${index + 1}. ${signal.text}\n\n`;[cite: 5]
+  });[cite: 5]
+  batchText += `⚠️ <b>Mehrere Signale - Position Sizing beachten!</b>`;[cite: 5]
+  await sendTelegramAlert(batchText);[cite: 5]
+}[cite: 5]
+
+function updateTelegramConfig(token, chatId) {[cite: 5]
+  configTelegram.botToken = token;[cite: 5]
+  configTelegram.chatId = chatId;[cite: 5]
+}[cite: 5]
+
+// ==========================================
+// 5.1 NEU: AUTOMATISCHER GEMINI-RISIKO-CHECK
+// ==========================================
+async function evaluateSignalWithGemini(symbol, direction, score, marketPhase, mlProbability) {
+  if (!process.env.GEMINI_API_KEY) return { approved: true, reason: 'no-api-key' };
+  
+  try {
+    const { GoogleGenAI } = require('@google/genai');
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    
+    const prompt = `Du bist ein strenger Chef-Risikomanager im Krypto-Trading. 
+    Analysiere folgendes Setup und entscheide, ob es freigegeben wird:
+    - Coin: ${symbol}
+    - Richtung: ${direction}
+    - Technischer Score: ${score}/100
+    - Marktphase: ${marketPhase}
+    - ML-Modell Erfolgswahrscheinlichkeit: ${(mlProbability * 100).toFixed(1)}%
+    
+    Antworte EXAKT im folgenden JSON-Format ohne Markdown-Code-Blocks drumherum:
+    {"approved": true/false, "reason": "Kurze Begründung auf Deutsch"}`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.5-flash-lite',
+      contents: prompt,
     });
-  }
-  apiLatencyStats.record('telegram', Date.now() - startTime);
-}
 
-async function sendTelegramReply(chatId, text) {
-  if (!configTelegram.botToken || !chatId) return;
-  await queueTelegramMessage(async () => {
-    let success = false;
-    let attempts = 0;
-    let delay = 3000;
-
-    while (!success && attempts < 3) {
-      try {
-        attempts++;
-        await axios.post(
-          `https://api.telegram.org/bot${configTelegram.botToken}/sendMessage`,
-          { chat_id: chatId, text: text, parse_mode: 'HTML' },
-          { timeout: 10000 }
-        );
-        success = true;
-        await sleep(500);
-      } catch (e) {
-        if (e.response && e.response.status === 429) {
-          logger.warn(`⚠️ Telegram Reply Rate-Limit (429) für Chat ${chatId}. Warte ${delay}ms...`);
-          await sleep(delay);
-          delay *= 2;
-        } else {
-          logger.error(`Telegram Reply (${chatId}): ${e.message}`);
-          break;
-        }
-      }
-    }
-  });
-}
-
-async function getAlertTimestamp(key) {
-  if (!botStateCollection || !isDbConnected) return 0;
-  try {
-    const doc = await botStateCollection.findOne({ _id: `alert_${key}` });
-    return doc ? doc.lastSent : 0;
+    const text = response.text.trim();
+    const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    return JSON.parse(cleanText);
   } catch (e) {
-    return 0;
+    logger.warn(`[Gemini Risk Check] Fehler bei API-Abfrage: ${e.message}. Signal wird im Zweifel zugelassen.`);
+    return { approved: true, reason: 'api-error-fallback' };
   }
-}
-
-async function persistAlertHistoryEntry(key, timestamp) {
-  if (!botStateCollection || !isDbConnected) return;
-  try {
-    await botStateCollection.updateOne(
-      { _id: `alert_${key}` },
-      { $set: { lastSent: timestamp } },
-      { upsert: true }
-    );
-  } catch (e) {}
-}
-
-async function sendDeduplicatedAlert(key, text, cooldownMs = 300000) {
-  const lastSent = await getAlertTimestamp(key);
-  if (Date.now() - lastSent < cooldownMs) return;
-  await persistAlertHistoryEntry(key, Date.now());
-  await sendTelegramAlert(text);
-}
-
-async function sendBatchedSignalAlert(signals) {
-  if (signals.length === 0) return;
-  if (signals.length === 1) {
-    await sendTelegramAlert(signals[0].text);
-    return;
-  }
-  let batchText = `🚀 <b>${signals.length} NEUE SIGNALE</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
-  signals.forEach((signal, index) => {
-    batchText += `${index + 1}. ${signal.text}\n\n`;
-  });
-  batchText += `⚠️ <b>Mehrere Signale - Position Sizing beachten!</b>`;
-  await sendTelegramAlert(batchText);
-}
-
-function updateTelegramConfig(token, chatId) {
-  configTelegram.botToken = token;
-  configTelegram.chatId = chatId;
 }
 
 // ==========================================
 // 6. KORRELATIONS-GRUPPEN
 // ==========================================
-const CORRELATION_GROUPS = {
-  'MAJOR':   ['BTC-USDT', 'ETH-USDT'],
-  'DEFI':    ['UNI-USDT', 'AAVE-USDT', 'MKR-USDT', 'COMP-USDT', 'CRV-USDT', 'SNX-USDT'],
-  'L1':      ['SOL-USDT', 'AVAX-USDT', 'NEAR-USDT', 'APT-USDT', 'SUI-USDT', 'SEI-USDT'],
-  'L2':      ['ARB-USDT', 'OP-USDT', 'MATIC-USDT', 'IMX-USDT', 'STRK-USDT'],
-  'MEME':    ['DOGE-USDT', 'SHIB-USDT', 'PEPE-USDT', 'WIF-USDT', 'BONK-USDT'],
-  'AI':      ['FET-USDT', 'AGIX-USDT', 'OCEAN-USDT', 'WLD-USDT', 'RNDR-USDT'],
-  'GAMING':  ['GALA-USDT', 'SAND-USDT', 'MANA-USDT', 'AXS-USDT'],
-};
+const CORRELATION_GROUPS = {[cite: 5]
+  'MAJOR':   ['BTC-USDT', 'ETH-USDT'],[cite: 5]
+  'DEFI':    ['UNI-USDT', 'AAVE-USDT', 'MKR-USDT', 'COMP-USDT', 'CRV-USDT', 'SNX-USDT'],[cite: 5]
+  'L1':      ['SOL-USDT', 'AVAX-USDT', 'NEAR-USDT', 'APT-USDT', 'SUI-USDT', 'SEI-USDT'],[cite: 5]
+  'L2':      ['ARB-USDT', 'OP-USDT', 'MATIC-USDT', 'IMX-USDT', 'STRK-USDT'],[cite: 5]
+  'MEME':    ['DOGE-USDT', 'SHIB-USDT', 'PEPE-USDT', 'WIF-USDT', 'BONK-USDT'],[cite: 5]
+  'AI':      ['FET-USDT', 'AGIX-USDT', 'OCEAN-USDT', 'WLD-USDT', 'RNDR-USDT'],[cite: 5]
+  'GAMING':  ['GALA-USDT', 'SAND-USDT', 'MANA-USDT', 'AXS-USDT'],[cite: 5]
+};[cite: 5]
 
-function checkCorrelationLimit(symbol, direction, activeTrades, enabled = true) {
-  if (!enabled) return true;
-  for (const [group, coins] of Object.entries(CORRELATION_GROUPS)) {
-    if (coins.includes(symbol)) {
-      const sameInGroup = [...activeTrades.values()].filter(t => coins.includes(t.symbol) && t.direction === direction).length;
-      return sameInGroup === 0;
-    }
-  }
-  return true;
-}
+function checkCorrelationLimit(symbol, direction, activeTrades, enabled = true) {[cite: 5]
+  if (!enabled) return true;[cite: 5]
+  for (const [group, coins] of Object.entries(CORRELATION_GROUPS)) {[cite: 5]
+    if (coins.includes(symbol)) {[cite: 5]
+      const sameInGroup = [...activeTrades.values()].filter(t => coins.includes(t.symbol) && t.direction === direction).length;[cite: 5]
+      return sameInGroup === 0;[cite: 5]
+    }[cite: 5]
+  }[cite: 5]
+  return true;[cite: 5]
+}[cite: 5]
 
 // ==========================================
 // 7. STRATEGIE PROFILES & CONFIG
 // ==========================================
-const STRATEGY_PROFILES = {
-  loose: {
-    ALLOW_COUNTER_BTC_TREND: true,
-    REQUIRE_4H_TREND: false,
-    ADX_MIN: 15,
-    RSI_LONG_MIN: 40,
-    RSI_LONG_MAX: 75,
-    RSI_SHORT_MIN: 25,
-    RSI_SHORT_MAX: 60,
-    MIN_RELATIVE_VOLUME: 0.8,
-    BOS_LOOKBACK: 4,
-    TREND_EMA_FAST_15M: 20,        
-    TREND_EMA_SLOW_15M: 50,
-  },
-  strict: {
-    ALLOW_COUNTER_BTC_TREND: false,
-    REQUIRE_4H_TREND: true,
-    ADX_MIN: 20,
-    RSI_LONG_MIN: 48,
-    RSI_LONG_MAX: 68,
-    RSI_SHORT_MIN: 32,
-    RSI_SHORT_MAX: 52,
-    MIN_RELATIVE_VOLUME: 1.2,
-    BOS_LOOKBACK: 10,
-    TREND_EMA_FAST_15M: 20,
-    TREND_EMA_SLOW_15M: 50,
-  }
-};
+const STRATEGY_PROFILES = {[cite: 5]
+  loose: {[cite: 5]
+    ALLOW_COUNTER_BTC_TREND: true,[cite: 5]
+    REQUIRE_4H_TREND: false,[cite: 5]
+    ADX_MIN: 15,[cite: 5]
+    RSI_LONG_MIN: 40,[cite: 5]
+    RSI_LONG_MAX: 75,[cite: 5]
+    RSI_SHORT_MIN: 25,[cite: 5]
+    RSI_SHORT_MAX: 60,[cite: 5]
+    MIN_RELATIVE_VOLUME: 0.8,[cite: 5]
+    BOS_LOOKBACK: 4,[cite: 5]
+    TREND_EMA_FAST_15M: 20,       [cite: 5]
+    TREND_EMA_SLOW_15M: 50,[cite: 5]
+  },[cite: 5]
+  strict: {[cite: 5]
+    ALLOW_COUNTER_BTC_TREND: false,[cite: 5]
+    REQUIRE_4H_TREND: true,[cite: 5]
+    ADX_MIN: 20,[cite: 5]
+    RSI_LONG_MIN: 48,[cite: 5]
+    RSI_LONG_MAX: 68,[cite: 5]
+    RSI_SHORT_MIN: 32,[cite: 5]
+    RSI_SHORT_MAX: 52,[cite: 5]
+    MIN_RELATIVE_VOLUME: 1.2,[cite: 5]
+    BOS_LOOKBACK: 10,[cite: 5]
+    TREND_EMA_FAST_15M: 20,[cite: 5]
+    TREND_EMA_SLOW_15M: 50,[cite: 5]
+  }[cite: 5]
+};[cite: 5]
 
-let STRATEGY_PROFILE_NAME = (process.env.STRATEGY_PROFILE || 'strict').toLowerCase();
-let activeProfile = STRATEGY_PROFILES[STRATEGY_PROFILE_NAME] || STRATEGY_PROFILES.strict;
+let STRATEGY_PROFILE_NAME = (process.env.STRATEGY_PROFILE || 'strict').toLowerCase();[cite: 5]
+let activeProfile = STRATEGY_PROFILES[STRATEGY_PROFILE_NAME] || STRATEGY_PROFILES.strict;[cite: 5]
 
-function envFloatOrProfile(envVal, profileVal) { return envVal !== undefined ? parseFloat(envVal) : profileVal; }
-function envBoolOrProfile(envVal, profileVal, trueLiteral) {
-  if (envVal === undefined) return profileVal;
-  return trueLiteral ? envVal === 'true' : envVal !== 'false';
-}
+function envFloatOrProfile(envVal, profileVal) { return envVal !== undefined ? parseFloat(envVal) : profileVal; }[cite: 5]
+function envBoolOrProfile(envVal, profileVal, trueLiteral) {[cite: 5]
+  if (envVal === undefined) return profileVal;[cite: 5]
+  return trueLiteral ? envVal === 'true' : envVal !== 'false';[cite: 5]
+}[cite: 5]
 
-const config = {
-  PORT: parseInt(process.env.PORT, 10) || 10000,
-  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
-  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
-  MONGODB_URI: process.env.MONGODB_URI || '',
+const config = {[cite: 5]
+  PORT: parseInt(process.env.PORT, 10) || 10000,[cite: 5]
+  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',[cite: 5]
+  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',[cite: 5]
+  MONGODB_URI: process.env.MONGODB_URI || '',[cite: 5]
   
-  CAPITAL_USD: parseFloat(process.env.CAPITAL_USD) || 10000,
-  RISK_PERCENT: parseFloat(process.env.RISK_PERCENT) || 0.75,
-  TOP_COIN_LIMIT: parseInt(process.env.TOP_COIN_LIMIT, 10) || 150,
-  MAX_SIGNALS_PER_SCAN: parseInt(process.env.MAX_SIGNALS_PER_SCAN, 10) || 5,
-  MAX_CONCURRENT_TRADES: parseInt(process.env.MAX_CONCURRENT_TRADES, 10) || 3,
-  MAX_DAILY_LOSS_USD: parseFloat(process.env.MAX_DAILY_LOSS_USD) || 250,
-  MAX_FUNDING_RATE: parseFloat(process.env.MAX_FUNDING_RATE) || 0.0005,
-  MIN_FUNDING_RATE: parseFloat(process.env.MIN_FUNDING_RATE) || -0.0005,
+  CAPITAL_USD: parseFloat(process.env.CAPITAL_USD) || 10000,[cite: 5]
+  RISK_PERCENT: parseFloat(process.env.RISK_PERCENT) || 0.75,[cite: 5]
+  TOP_COIN_LIMIT: parseInt(process.env.TOP_COIN_LIMIT, 10) || 150,[cite: 5]
+  MAX_SIGNALS_PER_SCAN: parseInt(process.env.MAX_SIGNALS_PER_SCAN, 10) || 5,[cite: 5]
+  MAX_CONCURRENT_TRADES: parseInt(process.env.MAX_CONCURRENT_TRADES, 10) || 3,[cite: 5]
+  MAX_DAILY_LOSS_USD: parseFloat(process.env.MAX_DAILY_LOSS_USD) || 250,[cite: 5]
+  MAX_FUNDING_RATE: parseFloat(process.env.MAX_FUNDING_RATE) || 0.0005,[cite: 5]
+  MIN_FUNDING_RATE: parseFloat(process.env.MIN_FUNDING_RATE) || -0.0005,[cite: 5]
 
-  ALLOW_COUNTER_BTC_TREND: envBoolOrProfile(process.env.ALLOW_COUNTER_BTC_TREND, activeProfile.ALLOW_COUNTER_BTC_TREND, false),
-  REQUIRE_4H_TREND: envBoolOrProfile(process.env.REQUIRE_4H_TREND, activeProfile.REQUIRE_4H_TREND, true),
-  ADX_MIN: envFloatOrProfile(process.env.ADX_MIN, activeProfile.ADX_MIN),
-  RSI_LONG_MIN: envFloatOrProfile(process.env.RSI_LONG_MIN, activeProfile.RSI_LONG_MIN),
-  RSI_LONG_MAX: envFloatOrProfile(process.env.RSI_LONG_MAX, activeProfile.RSI_LONG_MAX),
-  RSI_SHORT_MIN: envFloatOrProfile(process.env.RSI_SHORT_MIN, activeProfile.RSI_SHORT_MIN),
-  RSI_SHORT_MAX: envFloatOrProfile(process.env.RSI_SHORT_MAX, activeProfile.RSI_SHORT_MAX),
-  MIN_RELATIVE_VOLUME: envFloatOrProfile(process.env.MIN_RELATIVE_VOLUME, activeProfile.MIN_RELATIVE_VOLUME),
-  BOS_LOOKBACK: process.env.BOS_LOOKBACK !== undefined ? parseInt(process.env.BOS_LOOKBACK, 10) : activeProfile.BOS_LOOKBACK,
-  TREND_EMA_FAST_15M: process.env.TREND_EMA_FAST_15M !== undefined ? parseInt(process.env.TREND_EMA_FAST_15M, 10) : activeProfile.TREND_EMA_FAST_15M,
-  TREND_EMA_SLOW_15M: process.env.TREND_EMA_SLOW_15M !== undefined ? parseInt(process.env.TREND_EMA_SLOW_15M, 10) : activeProfile.TREND_EMA_SLOW_15M,
+  ALLOW_COUNTER_BTC_TREND: envBoolOrProfile(process.env.ALLOW_COUNTER_BTC_TREND, activeProfile.ALLOW_COUNTER_BTC_TREND, false),[cite: 5]
+  REQUIRE_4H_TREND: envBoolOrProfile(process.env.REQUIRE_4H_TREND, activeProfile.REQUIRE_4H_TREND, true),[cite: 5]
+  ADX_MIN: envFloatOrProfile(process.env.ADX_MIN, activeProfile.ADX_MIN),[cite: 5]
+  RSI_LONG_MIN: envFloatOrProfile(process.env.RSI_LONG_MIN, activeProfile.RSI_LONG_MIN),[cite: 5]
+  RSI_LONG_MAX: envFloatOrProfile(process.env.RSI_LONG_MAX, activeProfile.RSI_LONG_MAX),[cite: 5]
+  RSI_SHORT_MIN: envFloatOrProfile(process.env.RSI_SHORT_MIN, activeProfile.RSI_SHORT_MIN),[cite: 5]
+  RSI_SHORT_MAX: envFloatOrProfile(process.env.RSI_SHORT_MAX, activeProfile.RSI_SHORT_MAX),[cite: 5]
+  MIN_RELATIVE_VOLUME: envFloatOrProfile(process.env.MIN_RELATIVE_VOLUME, activeProfile.MIN_RELATIVE_VOLUME),[cite: 5]
+  BOS_LOOKBACK: process.env.BOS_LOOKBACK !== undefined ? parseInt(process.env.BOS_LOOKBACK, 10) : activeProfile.BOS_LOOKBACK,[cite: 5]
+  TREND_EMA_FAST_15M: process.env.TREND_EMA_FAST_15M !== undefined ? parseInt(process.env.TREND_EMA_FAST_15M, 10) : activeProfile.TREND_EMA_FAST_15M,[cite: 5]
+  TREND_EMA_SLOW_15M: process.env.TREND_EMA_SLOW_15M !== undefined ? parseInt(process.env.TREND_EMA_SLOW_15M, 10) : activeProfile.TREND_EMA_SLOW_15M,[cite: 5]
 
-  ATR_STOP_MULT: parseFloat(process.env.ATR_STOP_MULT) || 2.3,
-  TP1_MULT: parseFloat(process.env.TP1_MULT) || 1.3,
-  TP2_MULT: parseFloat(process.env.TP2_MULT) || 2.5,
-  MAX_HOLD_HOURS: parseFloat(process.env.MAX_HOLD_HOURS) || 4,
-  ABSOLUTE_MAX_HOLD_HOURS: parseFloat(process.env.ABSOLUTE_MAX_HOLD_HOURS) || 24,
-  MAX_SAME_DIRECTION: parseInt(process.env.MAX_SAME_DIRECTION, 10) || 2,
-  TRAILING_STOP_ENABLED: process.env.TRAILING_STOP_ENABLED !== 'false',
-  TRAILING_ATR_MULT: parseFloat(process.env.TRAILING_ATR_MULT) || 2.2,
-  DYNAMIC_TRAILING_ATR: process.env.DYNAMIC_TRAILING_ATR !== 'false',
-  FAST_TRACK_INTERVAL_SECONDS: parseInt(process.env.FAST_TRACK_INTERVAL_SECONDS, 10) || 60,
-  TICKER_BATCH_SIZE: parseInt(process.env.TICKER_BATCH_SIZE, 10) || 10,
-  SLIPPAGE_PERCENT: parseFloat(process.env.SLIPPAGE_PERCENT) || 0.05,
-  FEE_PERCENT: parseFloat(process.env.FEE_PERCENT) || 0.1,
-  TP1_CLOSE_PERCENT: parseFloat(process.env.TP1_CLOSE_PERCENT) || 60,
-  ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false',
-  MAX_EXPOSURE_RATIO: parseFloat(process.env.MAX_EXPOSURE_RATIO) || 0.6,
-  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 5,
-  MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,
-  LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3,
-  MARGIN_MODE: (process.env.MARGIN_MODE || 'ISOLATED').toUpperCase(),
+  ATR_STOP_MULT: parseFloat(process.env.ATR_STOP_MULT) || 2.3,[cite: 5]
+  TP1_MULT: parseFloat(process.env.TP1_MULT) || 1.3,[cite: 5]
+  TP2_MULT: parseFloat(process.env.TP2_MULT) || 2.5,[cite: 5]
+  MAX_HOLD_HOURS: parseFloat(process.env.MAX_HOLD_HOURS) || 4,[cite: 5]
+  ABSOLUTE_MAX_HOLD_HOURS: parseFloat(process.env.ABSOLUTE_MAX_HOLD_HOURS) || 24,[cite: 5]
+  MAX_SAME_DIRECTION: parseInt(process.env.MAX_SAME_DIRECTION, 10) || 2,[cite: 5]
+  TRAILING_STOP_ENABLED: process.env.TRAILING_STOP_ENABLED !== 'false',[cite: 5]
+  TRAILING_ATR_MULT: parseFloat(process.env.TRAILING_ATR_MULT) || 2.2,[cite: 5]
+  DYNAMIC_TRAILING_ATR: process.env.DYNAMIC_TRAILING_ATR !== 'false',[cite: 5]
+  FAST_TRACK_INTERVAL_SECONDS: parseInt(process.env.FAST_TRACK_INTERVAL_SECONDS, 10) || 60,[cite: 5]
+  TICKER_BATCH_SIZE: parseInt(process.env.TICKER_BATCH_SIZE, 10) || 10,[cite: 5]
+  SLIPPAGE_PERCENT: parseFloat(process.env.SLIPPAGE_PERCENT) || 0.05,[cite: 5]
+  FEE_PERCENT: parseFloat(process.env.FEE_PERCENT) || 0.1,[cite: 5]
+  TP1_CLOSE_PERCENT: parseFloat(process.env.TP1_CLOSE_PERCENT) || 60,[cite: 5]
+  ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false',[cite: 5]
+  MAX_EXPOSURE_RATIO: parseFloat(process.env.MAX_EXPOSURE_RATIO) || 0.6,[cite: 5]
+  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 5,[cite: 5]
+  MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,[cite: 5]
+  LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3,[cite: 5]
+  MARGIN_MODE: (process.env.MARGIN_MODE || 'ISOLATED').toUpperCase(),[cite: 5]
 
-  LOCK_ACQUIRE_RETRIES: parseInt(process.env.LOCK_ACQUIRE_RETRIES, 10) || 8,
-  LOCK_ACQUIRE_RETRY_DELAY_MS: parseInt(process.env.LOCK_ACQUIRE_RETRY_DELAY_MS, 10) || 5000,
-  LOCK_STALE_AFTER_MS: parseInt(process.env.LOCK_STALE_AFTER_MS, 10) || 5 * 60 * 1000,
+  LOCK_ACQUIRE_RETRIES: parseInt(process.env.LOCK_ACQUIRE_RETRIES, 10) || 8,[cite: 5]
+  LOCK_ACQUIRE_RETRY_DELAY_MS: parseInt(process.env.LOCK_ACQUIRE_RETRY_DELAY_MS, 10) || 5000,[cite: 5]
+  LOCK_STALE_AFTER_MS: parseInt(process.env.LOCK_STALE_AFTER_MS, 10) || 5 * 60 * 1000,[cite: 5]
 
-  FUNDING_INTERVAL_HOURS: parseFloat(process.env.FUNDING_INTERVAL_HOURS) || 8,
-  SCAN_STATS_TELEGRAM_EVERY_N_SCANS: parseInt(process.env.SCAN_STATS_TELEGRAM_EVERY_N_SCANS, 10) || 4,
+  FUNDING_INTERVAL_HOURS: parseFloat(process.env.FUNDING_INTERVAL_HOURS) || 8,[cite: 5]
+  SCAN_STATS_TELEGRAM_EVERY_N_SCANS: parseInt(process.env.SCAN_STATS_TELEGRAM_EVERY_N_SCANS, 10) || 4,[cite: 5]
   
-  MAX_KLINES_CACHE_SIZE: parseInt(process.env.MAX_KLINES_CACHE_SIZE, 10) || 200,
-  CACHE_CLEANUP_MINUTES: parseInt(process.env.CACHE_CLEANUP_MINUTES, 10) || 5,
+  MAX_KLINES_CACHE_SIZE: parseInt(process.env.MAX_KLINES_CACHE_SIZE, 10) || 200,[cite: 5]
+  CACHE_CLEANUP_MINUTES: parseInt(process.env.CACHE_CLEANUP_MINUTES, 10) || 5,[cite: 5]
   
-  RISK_WARNING_ENABLED: process.env.RISK_WARNING_ENABLED !== 'false',
-  MAX_WEEKLY_DRAWDOWN_PERCENT: parseFloat(process.env.MAX_WEEKLY_DRAWDOWN_PERCENT) || 10,
-  MAX_CONSECUTIVE_LOSSES: parseInt(process.env.MAX_CONSECUTIVE_LOSSES, 10) || 3,
+  RISK_WARNING_ENABLED: process.env.RISK_WARNING_ENABLED !== 'false',[cite: 5]
+  MAX_WEEKLY_DRAWDOWN_PERCENT: parseFloat(process.env.MAX_WEEKLY_DRAWDOWN_PERCENT) || 10,[cite: 5]
+  MAX_CONSECUTIVE_LOSSES: parseInt(process.env.MAX_CONSECUTIVE_LOSSES, 10) || 3,[cite: 5]
   
-  ENABLE_ADAPTIVE_PARAMS: process.env.ENABLE_ADAPTIVE_PARAMS !== 'false',
-  ENABLE_KELLY_SIZING: process.env.ENABLE_KELLY_SIZING !== 'false',
-  ENABLE_ORDERBOOK_ANALYSIS: process.env.ENABLE_ORDERBOOK_ANALYSIS !== 'false',
-  ENABLE_CORRELATION_LIMITS: process.env.ENABLE_CORRELATION_LIMITS !== 'false',
-  ENABLE_MULTI_TF_DERIVATION: process.env.ENABLE_MULTI_TF_DERIVATION !== 'false',
-  ENABLE_PRELOADING: process.env.ENABLE_PRELOADING !== 'false',
-  ENABLE_BATCH_SIGNALS: process.env.ENABLE_BATCH_SIGNALS !== 'false',
-  ORDERBOOK_DEPTH_LEVELS: parseInt(process.env.ORDERBOOK_DEPTH_LEVELS, 10) || 10,
+  ENABLE_ADAPTIVE_PARAMS: process.env.ENABLE_ADAPTIVE_PARAMS !== 'false',[cite: 5]
+  ENABLE_KELLY_SIZING: process.env.ENABLE_KELLY_SIZING !== 'false',[cite: 5]
+  ENABLE_ORDERBOOK_ANALYSIS: process.env.ENABLE_ORDERBOOK_ANALYSIS !== 'false',[cite: 5]
+  ENABLE_CORRELATION_LIMITS: process.env.ENABLE_CORRELATION_LIMITS !== 'false',[cite: 5]
+  ENABLE_MULTI_TF_DERIVATION: process.env.ENABLE_MULTI_TF_DERIVATION !== 'false',[cite: 5]
+  ENABLE_PRELOADING: process.env.ENABLE_PRELOADING !== 'false',[cite: 5]
+  ENABLE_BATCH_SIGNALS: process.env.ENABLE_BATCH_SIGNALS !== 'false',[cite: 5]
+  ORDERBOOK_DEPTH_LEVELS: parseInt(process.env.ORDERBOOK_DEPTH_LEVELS, 10) || 10,[cite: 5]
   
-  MAX_DRAWDOWN_PERCENT: parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 25,
-  DAILY_PROFIT_TARGET: parseFloat(process.env.DAILY_PROFIT_TARGET) || 500,
-  MONGODB_POOL_SIZE: parseInt(process.env.MONGODB_POOL_SIZE, 10) || 10,
-  DB_BULK_INTERVAL_MS: parseInt(process.env.DB_BULK_INTERVAL_MS, 10) || 5000,
+  MAX_DRAWDOWN_PERCENT: parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 25,[cite: 5]
+  DAILY_PROFIT_TARGET: parseFloat(process.env.DAILY_PROFIT_TARGET) || 500,[cite: 5]
+  MONGODB_POOL_SIZE: parseInt(process.env.MONGODB_POOL_SIZE, 10) || 10,[cite: 5]
+  DB_BULK_INTERVAL_MS: parseInt(process.env.DB_BULK_INTERVAL_MS, 10) || 5000,[cite: 5]
   
-  MAX_SPREAD_PERCENT: parseFloat(process.env.MAX_SPREAD_PERCENT) || 0.15,
-  MAX_CHOP_INDEX: parseFloat(process.env.MAX_CHOP_INDEX) || 61.8,
-  MIN_HURST_EXPONENT: parseFloat(process.env.MIN_HURST_EXPONENT) || 0.52,
+  MAX_SPREAD_PERCENT: parseFloat(process.env.MAX_SPREAD_PERCENT) || 0.15,[cite: 5]
+  MAX_CHOP_INDEX: parseFloat(process.env.MAX_CHOP_INDEX) || 61.8,[cite: 5]
+  MIN_HURST_EXPONENT: parseFloat(process.env.MIN_HURST_EXPONENT) || 0.52,[cite: 5]
 
-  ML_ENABLED: process.env.ML_ENABLED !== 'false',
-  ML_MIN_TRAINING_SAMPLES: parseInt(process.env.ML_MIN_TRAINING_SAMPLES, 10) || 40,
-  ML_MAX_TRAINING_SAMPLES: parseInt(process.env.ML_MAX_TRAINING_SAMPLES, 10) || 2000,
-  ML_MIN_PREDICTION_PROBABILITY: parseFloat(process.env.ML_MIN_PREDICTION_PROBABILITY) || 0.55,
-  ML_STRONG_SIGNAL_PROBABILITY: parseFloat(process.env.ML_STRONG_SIGNAL_PROBABILITY) || 0.70,
-  ML_RETRAIN_HOURS: parseFloat(process.env.ML_RETRAIN_HOURS) || 6,
-  ML_EPOCHS: parseInt(process.env.ML_EPOCHS, 10) || 80,
-  ML_BATCH_SIZE: parseInt(process.env.ML_BATCH_SIZE, 10) || 32,
-};
+  ML_ENABLED: process.env.ML_ENABLED !== 'false',[cite: 5]
+  ML_MIN_TRAINING_SAMPLES: parseInt(process.env.ML_MIN_TRAINING_SAMPLES, 10) || 40,[cite: 5]
+  ML_MAX_TRAINING_SAMPLES: parseInt(process.env.ML_MAX_TRAINING_SAMPLES, 10) || 2000,[cite: 5]
+  ML_MIN_PREDICTION_PROBABILITY: parseFloat(process.env.ML_MIN_PREDICTION_PROBABILITY) || 0.55,[cite: 5]
+  ML_STRONG_SIGNAL_PROBABILITY: parseFloat(process.env.ML_STRONG_SIGNAL_PROBABILITY) || 0.70,[cite: 5]
+  ML_RETRAIN_HOURS: parseFloat(process.env.ML_RETRAIN_HOURS) || 6,[cite: 5]
+  ML_EPOCHS: parseInt(process.env.ML_EPOCHS, 10) || 80,[cite: 5]
+  ML_BATCH_SIZE: parseInt(process.env.ML_BATCH_SIZE, 10) || 32,[cite: 5]
+};[cite: 5]
 
 function validateConfig() {
   const numericFields = [
@@ -1676,6 +1711,7 @@ function formatScanStatsReport(stats) {
   if (stats.skippedMaxSignals) reasons.push(`Max. Signale: ${stats.skippedMaxSignals}`);
   if (stats.skippedDynamicBlacklist) reasons.push(`KI-Erfahrung (Loss-Blocker): ${stats.skippedDynamicBlacklist}`);
   if (stats.mlBlocked) reasons.push(`TensorFlow.js ML-Filter blockiert: ${stats.mlBlocked}`);
+  if (stats.geminiBlocked) reasons.push(`Gemini Risk Officer blockiert: ${stats.geminiBlocked}`);
   if (stats.hurstBlocked) reasons.push(`Hurst-Exponent (Zufallsmarkt): ${stats.hurstBlocked}`);
   if (stats.adxTooLow) reasons.push(`ADX zu niedrig: ${stats.adxTooLow}`);
   if (stats.marketChoppy) reasons.push(`Markt seitwärts (CHOP): ${stats.marketChoppy}`);
@@ -1703,6 +1739,7 @@ function formatScanStatsReport(stats) {
     (stats.skippedMaxSignals || 0) +
     (stats.skippedDynamicBlacklist || 0) +
     (stats.mlBlocked || 0) +
+    (stats.geminiBlocked || 0) +
     (stats.hurstBlocked || 0) +
     (stats.adxTooLow || 0) +
     (stats.marketChoppy || 0) +
@@ -2092,7 +2129,7 @@ function createEmptyScanStats() {
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    mlBlocked: 0
+    mlBlocked: 0, geminiBlocked: 0
   };
 }
 
@@ -2329,6 +2366,16 @@ async function scanMarket() {
             return;
           }
 
+          // ==========================================
+          // NEU: GEMINI RISIKO-CHECK ALS FINALE HÜRDE
+          // ==========================================
+          const geminiCheck = await evaluateSignalWithGemini(symbol, direction, signalScore, currentMarketPhase, mlPrediction.probability);
+          if (!geminiCheck.approved) {
+            logger.info(`🤖 [Gemini Risk Officer] Signal für ${symbol} (${direction}) abgelehnt: ${geminiCheck.reason}`);
+            scanStats.geminiBlocked++;
+            return;
+          }
+
           const entryPrice = applySlippage(currentPrice, direction, 'entry');
           const stopDistance = atr * adaptiveATR;
           const stopLoss = direction === 'LONG' ? entryPrice - stopDistance : entryPrice + stopDistance;
@@ -2416,7 +2463,8 @@ async function scanMarket() {
             `TP1: $${tp1.toFixed(6)} | TP2: $${tp2.toFixed(6)}\n` +
             `Größe: ${sizing.contracts} Kontrakte | Risk: $${sizing.riskAmountUSD.toFixed(2)}\n` +
             `ADX: ${adx} | Hurst: ${hurst} | RSI: ${rsi.toFixed(1)} | Phase: ${currentMarketPhase}\n` +
-            `🧠 TensorFlow.js: ${mlPrediction.trained ? (mlPrediction.probability * 100).toFixed(1) + '% Erfolgswahrscheinlichkeit' : 'noch nicht trainiert'}`;
+            `🧠 TensorFlow.js: ${mlPrediction.trained ? (mlPrediction.probability * 100).toFixed(1) + '% Erfolgswahrscheinlichkeit' : 'noch nicht trainiert'}\n` +
+            `🤖 Gemini Risk Officer: Freigegeben (${geminiCheck.reason})`;
 
           if (config.ENABLE_BATCH_SIGNALS) {
             signalBatch.push({ text: signalText });
