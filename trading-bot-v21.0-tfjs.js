@@ -1,7 +1,7 @@
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - ULTIMATE v20.8 FULL COMPLETE EDITION (PATCHED)
- * (Mit adaptivem TensorFlow.js ML, globaler Telegram-Queue, State-Persistenz & Hurst-Exponent)
+ * TRADING SIGNAL BOT - ULTIMATE v21.0 FULL COMPLETE EDITION (PATCHED + RL)
+ * (Mit adaptivem TensorFlow.js ML & RL, globaler Telegram-Queue, State-Persistenz & Hurst-Exponent)
  * ============================================================================
  */
 
@@ -12,6 +12,7 @@ const axios = require('axios');
 const { MongoClient } = require('mongodb');
 const winston = require('winston');
 const { TensorFlowSignalModel } = require('./ml-engine');
+const { DeepQTheTradingAgent } = require('./rl-engine'); // <-- NEU: RL-Engine Import
 
 // ==========================================
 // 1. LOGGER & GLOBALE ZUSTÄNDE
@@ -37,7 +38,7 @@ let maxLossStreak = 0;
 
 let peakCapital = 10000;
 let dailyNetPnL = 0;
-let consecutiveLosses = 0;                     // <-- NEU für MAX_CONSECUTIVE_LOSSES
+let consecutiveLosses = 0;
 
 const MAX_DRAWDOWN_PERCENT = parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 25;
 const DAILY_PROFIT_TARGET = parseFloat(process.env.DAILY_PROFIT_TARGET) || 500;
@@ -235,7 +236,6 @@ async function sendTelegramReply(chatId, text) {
   });
 }
 
-// ---- NEUE ATOMARE ALERT-HISTORY (ersetzt alte getAlertHistoryMap / persistAlertHistory) ----
 async function getAlertTimestamp(key) {
   if (!botStateCollection || !isDbConnected) return 0;
   try {
@@ -256,9 +256,7 @@ async function persistAlertHistoryEntry(key, timestamp) {
     );
   } catch (e) {}
 }
-// ---- ENDE NEUE ATOMARE FUNKTIONEN ----
 
-// sendDeduplicatedAlert jetzt mit atomaren Funktionen
 async function sendDeduplicatedAlert(key, text, cooldownMs = 300000) {
   const lastSent = await getAlertTimestamp(key);
   if (Date.now() - lastSent < cooldownMs) return;
@@ -284,6 +282,7 @@ function updateTelegramConfig(token, chatId) {
   configTelegram.botToken = token;
   configTelegram.chatId = chatId;
 }
+
 // ==========================================
 // 5. KORRELATIONS-GRUPPEN
 // ==========================================
@@ -483,7 +482,7 @@ validateCriticalEnv();
 updateTelegramConfig(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID);
 
 // ==========================================
-// 7. DATENBANK & ADAPTIVES ML-MODELL
+// 7. DATENBANK & ADAPTIVES ML-MODELL & RL-AGENT
 // ==========================================
 const client = new MongoClient(config.MONGODB_URI, {
   maxPoolSize: config.MONGODB_POOL_SIZE,
@@ -502,8 +501,7 @@ let isPaused = false, lastScanTime = null, lastTrackerCheckTime = null;
 let trackerLock = false, trackerTimeout = null;
 const signalPerformanceHistory = new Map();
 
-// TensorFlow.js ML-Engine: trainiert ausschließlich auf bereits abgeschlossenen Trades.
-// Die Engine wird bewusst getrennt gehalten, damit das Trading-/Risk-Management unverändert bleibt.
+// TensorFlow.js Klassifikations-Modell
 const mlModel = new TensorFlowSignalModel({
   modelDir: process.env.ML_MODEL_DIR || './models/signal-model',
   minSamples: config.ML_MIN_TRAINING_SAMPLES,
@@ -516,6 +514,12 @@ const mlModel = new TensorFlowSignalModel({
 });
 let isModelTrained = false;
 let lastMLTrainingStats = null;
+
+// NEU: Deep Reinforcement Learning Agent (DQN)
+const rlAgent = new DeepQTheTradingAgent({
+  modelDir: process.env.RL_MODEL_DIR || './models/rl-dqn-model',
+  logger
+});
 
 function buildMLFeatures(data) {
   return mlModel.buildFeatures(data);
@@ -657,7 +661,6 @@ async function acquireInstanceLock() {
       if (acquired) { currentInstanceId = instanceId; return instanceId; }
       if (attempt < config.LOCK_ACQUIRE_RETRIES) await sleep(config.LOCK_ACQUIRE_RETRY_DELAY_MS);
     }
-    // ---- FIX: Harter Exit, wenn Lock nicht erworben werden konnte ----
     logger.error('🔴 Konnte Instance-Lock nicht erwerben – beende Prozess.');
     await sendTelegramAlert('🚨 <b>Instance-Lock fehlgeschlagen!</b> Bot wird beendet.');
     process.exit(1);
@@ -762,6 +765,8 @@ async function removeTrade(symbol, closedTradeRecord = null) {
     const finalRecord = closedTradeRecord || { ...trade, closeTime: Date.now(), closeReason: 'manual/unknown' };
     await persistClosedTradeRecord(finalRecord);
     activeTrades.delete(symbol);
+    // NEU: Nach Schließen des Trades direkt RL-Modell im Hintergrund anlernen
+    rlAgent.trainFromClosedTrades(closedTradesCollection).catch(() => {});
   }
   priceFailureCounts.delete(symbol);
   if (tradesCollection && isDbConnected) dbBulkQueue.push({ type: 'removeTrade', symbol });
@@ -839,7 +844,6 @@ function checkGlobalDrawdown(currentEquity) {
     isPaused = true;
     persistPauseState();
     persistPeakCapital();
-    // ---- FIX: Deduplizierte Nachricht statt sendTelegramAlert ----
     sendDeduplicatedAlert('global_drawdown', `🔴 <b>MAX DRAWDOWN ERREICHT: ${drawdown.toFixed(1)}%!</b>\nBot wurde pausiert.`);
     return true;
   }
@@ -864,7 +868,6 @@ async function recordTradePnL(pnlUSD) {
     peakCapital = currentEquity;
     await persistPeakCapital();
   }
-  // ---- FIX: MAX_CONSECUTIVE_LOSSES ----
   if (pnlUSD < 0) {
     consecutiveLosses++;
     if (config.MAX_CONSECUTIVE_LOSSES > 0 && consecutiveLosses >= config.MAX_CONSECUTIVE_LOSSES) {
@@ -1158,6 +1161,7 @@ function calculateSignalScore(params) {
   if (params.trend4h === (params.direction === 'LONG' ? 'BULLISH' : 'BEARISH')) score += 15;
   return Math.round(Math.min(score, 100));
 }
+
 // ==========================================
 // 10. KUCOIN MARKET DATA
 // ==========================================
@@ -1516,7 +1520,7 @@ async function checkRiskLevels() {
 }
 
 function formatScanStatsReport(stats) {
-  const lines = [`🔎 <b>SCAN-DIAGNOSE v20.8 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
+  const lines = [`🔎 <b>SCAN-DIAGNOSE v21.0 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
   lines.push(`Coins geprüft: ${stats.total} | Signale gesendet: ${stats.signalsSent}`);
   if (stats.avgSignalScore !== undefined) lines.push(`Ø Signal-Score: ${stats.avgSignalScore}/100`);
   lines.push(`Marktphase: ${currentMarketPhase}\n`);
@@ -1535,6 +1539,7 @@ function formatScanStatsReport(stats) {
   if (stats.skippedMaxSignals) reasons.push(`Max. Signale: ${stats.skippedMaxSignals}`);
   if (stats.skippedDynamicBlacklist) reasons.push(`KI-Erfahrung (Loss-Blocker): ${stats.skippedDynamicBlacklist}`);
   if (stats.mlBlocked) reasons.push(`TensorFlow.js ML-Filter blockiert: ${stats.mlBlocked}`);
+  if (stats.rlBlocked) reasons.push(`Deep RL-Agent blockiert (Hold): ${stats.rlBlocked}`); // <-- NEU: RL-Statistik
   if (stats.hurstBlocked) reasons.push(`Hurst-Exponent (Zufallsmarkt): ${stats.hurstBlocked}`);
   if (stats.adxTooLow) reasons.push(`ADX zu niedrig: ${stats.adxTooLow}`);
   if (stats.marketChoppy) reasons.push(`Markt seitwärts (CHOP): ${stats.marketChoppy}`);
@@ -1904,7 +1909,7 @@ function createEmptyScanStats() {
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    mlBlocked: 0
+    mlBlocked: 0, rlBlocked: 0 // <-- NEU: RL-Statistik
   };
 }
 
@@ -1914,7 +1919,7 @@ async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v20.8...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.0...`);
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
@@ -1974,8 +1979,6 @@ async function scanMarket() {
     }
 
     let signalsSent = 0;
-    // ---- FIX: Atomare Cooldown-Abfrage statt globaler Map ----
-    // (kein alertHistoryMap mehr, wird direkt in der Schleife über getAlertTimestamp erledigt)
 
     await asyncPool(config.SCAN_CONCURRENCY, dynamicWatchlist, async (symbol) => {
       scanStats.total++;
@@ -2021,7 +2024,6 @@ async function scanMarket() {
           return; 
         }
 
-        // ---- FIX: Multi‑TF‑Fallback für 4h ----
         let raw4h = null;
         if (config.REQUIRE_4H_TREND) {
           if (config.ENABLE_MULTI_TF_DERIVATION) {
@@ -2086,7 +2088,6 @@ async function scanMarket() {
 
         if (direction) {
           const cooldownKey = `${symbol}_${direction}`;
-          // ---- FIX: Atomare Cooldown-Prüfung ----
           const lastSent = await getAlertTimestamp(cooldownKey);
           if (Date.now() - lastSent <= 2 * 3_600_000) {
             scanStats.cooldownActive++;
@@ -2102,7 +2103,6 @@ async function scanMarket() {
             adx, rsi, relativeVolume, trend1h, trend4h, direction
           });
 
-          // Orderbook wird vor der ML-Entscheidung geladen, damit es als Feature dienen kann.
           let orderBookImbalance = null;
           if (config.ENABLE_ORDERBOOK_ANALYSIS && signalScore > 60) {
             orderBookImbalance = await fetchOrderBookImbalance(symbol).catch(() => null);
@@ -2132,6 +2132,23 @@ async function scanMarket() {
           const mlPrediction = predictSignalSuccess(mlFeatures);
           if (mlPrediction.trained && mlPrediction.probability < config.ML_MIN_PREDICTION_PROBABILITY) {
             scanStats.mlBlocked++;
+            return;
+          }
+
+          // NEU: Deep Reinforcement Learning (DQN) Filterprüfung
+          const stateVector = [
+            adx / 50, rsi / 100, hurst, Math.min(relativeVolume / 5, 1),
+            signalScore / 100, direction === 'LONG' ? 1 : 0,
+            currentMarketPhase === 'TRENDING' ? 1 : 0,
+            currentMarketPhase === 'RANGING' ? 0.5 : 0,
+            atrPct, pocDistancePct, vwapDistancePct,
+            orderBookImbalance || 1, 0.1,
+            btcATR > 0 ? atr / btcATR : 1, mlPrediction.probability, 0.5
+          ];
+          const rlAction = rlAgent.act(stateVector);
+          // Wenn der RL-Agent eingearbeitet ist (Epsilon < 0.4) und "Hold" (0) wählt:
+          if (rlAgent.getStats().epsilon < 0.4 && rlAction === 0) {
+            scanStats.rlBlocked++;
             return;
           }
 
@@ -2170,7 +2187,6 @@ async function scanMarket() {
             return;
           }
 
-          // ---- FIX: Atomare Cooldown-Persistenz ----
           await persistAlertHistoryEntry(cooldownKey, Date.now());
           signalsSent++;
           scanStats.signalsSent++;
@@ -2206,7 +2222,6 @@ async function scanMarket() {
             signalScore,
             marketPhase: currentMarketPhase,
             adaptiveRisk,
-            // TensorFlow.js feature snapshot for reproducible future training
             hurstAtEntry: hurst,
             macdHistogramAtEntry: macd.histogram,
             pocDistancePctAtEntry: pocDistancePct,
@@ -2281,7 +2296,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
-      `<b>🤖 TRADING BOT v21.0 ULTIMATE TFJS - BEFEHLE</b>\n` +
+      `<b>🤖 TRADING BOT v21.0 ULTIMATE TFJS + RL - BEFEHLE</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
       `<b>📊 Performance & Status:</b>\n` +
       `/stats - Performance heute (UTC)\n` +
@@ -2376,12 +2391,18 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v21.0 ULTIMATE TFJS</b>`);
+    lines.push(`🤖 <b>BOT STATUS v21.0 ULTIMATE TFJS + RL</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
+    
     const mlStats = mlModel.getStats();
-    lines.push(`ML: ${isModelTrained ? '🟢 TensorFlow.js aktiv' : '🟡 nicht trainiert'} | Samples: ${mlStats.samples || 0} | Acc: ${mlStats.validationAccuracy ? (mlStats.validationAccuracy * 100).toFixed(1) + '%' : 'n/a'}`);
+    lines.push(`ML: ${isModelTrained ? '🟢 TFJS aktiv' : '🟡 unformiert'} | Samples: ${mlStats.samples || 0}`);
+    
+    // NEU: RL Agent Status im Telegram Statusbefehl
+    const rlStats = rlAgent.getStats();
+    lines.push(`RL-Agent: 🟢 DQN aktiv | Epsilon: ${rlStats.epsilon} | Memory: ${rlStats.memorySize}`);
+
     lines.push(`Scans: ${isPaused ? '⏸️ PAUSIERT' : '▶️ aktiv'}`);
     lines.push(`Kapital: $${config.CAPITAL_USD.toFixed(0)} | Peak: $${peakCapital.toFixed(0)}`);
     lines.push(`Hebel: ${config.LEVERAGE}x | Risk/Trade: ${config.RISK_PERCENT}%`);
@@ -2487,11 +2508,9 @@ async function handleTelegramCommand(chatId, text) {
 let telegramOffset = 0;
 
 async function pollTelegramUpdates() {
-  // Am Anfang von pollTelegramUpdates einfügen:
-setInterval(() => {
-  if (!isShuttingDown) logger.info('💓 Telegram polling alive');
-}, 1800000);
-  
+  setInterval(() => {
+    if (!isShuttingDown) logger.info('💓 Telegram polling alive');
+  }, 1800000);
   
   const token = configTelegram.botToken || config.TELEGRAM_BOT_TOKEN;
   if (!token) return;
@@ -2511,16 +2530,15 @@ setInterval(() => {
         await handleTelegramCommand(msg.chat.id, msg.text);
       }
     } catch (e) {
-      // Bei 409 (Webhook-Konflikt) Webhook löschen
       if (e.response?.status === 409) {
         try { await axios.get(`https://api.telegram.org/bot${token}/deleteWebhook`); } catch (e2) {}
       }
       logger.error(`Telegram poll error: ${e.message}`);
       await sleep(5000);
-      // WICHTIG: Schleife läuft weiter
     }
   }
 }
+
 // ==========================================
 // 17. EXPRESS ENDPOINTS & GRAFANA METRICS
 // ==========================================
@@ -2528,14 +2546,14 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v21.0 ULTIMATE TFJS | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v21.0 ULTIMATE TFJS + RL | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 app.get('/health', (req, res) => {
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
   const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : '0';
   res.status(isDbConnected ? 200 : 503).json({
-    status: isDbConnected ? 'ok' : 'degraded', version: '20.8', dbConnected: isDbConnected,
+    status: isDbConnected ? 'ok' : 'degraded', version: '21.0', dbConnected: isDbConnected,
     isPaused, activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, currentEquity, peakCapital, drawdownPercent
   });
 });
@@ -2592,7 +2610,8 @@ app.get('/api/ml/status', (req, res) => {
   res.json({
     enabled: config.ML_ENABLED,
     trained: isModelTrained,
-    ...mlModel.getStats()
+    ...mlModel.getStats(),
+    rl: rlAgent.getStats() // <-- NEU: Status des RL-Agenten mit ausgeben
   });
 });
 
@@ -2623,6 +2642,7 @@ cronJobs.push(cron.schedule('59 23 * * *', async () => {
 cronJobs.push(cron.schedule('0 */6 * * *', async () => {
   await loadFuturesContractSpecs();
   await trainSignalMLModel();
+  await rlAgent.trainFromClosedTrades(closedTradesCollection); // NEU: Regelmäßiges RL-Retraining per Cron
 }, { timezone: 'UTC' }));
 
 async function gracefulShutdown(signal) {
@@ -2639,7 +2659,6 @@ async function gracefulShutdown(signal) {
   process.exit(0);
 }
 
-// ---- FIX: Crash-Handler rufen gracefulShutdown auf ----
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('uncaughtException', async (err) => {
@@ -2655,11 +2674,16 @@ process.on('unhandledRejection', async (reason) => {
 // 19. BOT START (ASYNCHRON & ABSICHERT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v21.0 ULTIMATE TFJS (Full Features, TensorFlow.js ML & Hurst Filter)...');
+  logger.info('🚀 Starte Trading Bot v21.0 ULTIMATE TFJS + RL (Full Features, TensorFlow.js ML, DQN RL & Hurst Filter)...');
   await initDatabase();
   await loadFuturesContractSpecs();
   await loadSignalMLModel();
   if (!isModelTrained) await trainSignalMLModel(true);
+
+  // NEU: RL Agent beim Start initialisieren & mit historischen Trades trainieren
+  await rlAgent.init();
+  await rlAgent.trainFromClosedTrades(closedTradesCollection);
+
   pollTelegramUpdates();
   if (isDbConnected) {
     scanMarket();
