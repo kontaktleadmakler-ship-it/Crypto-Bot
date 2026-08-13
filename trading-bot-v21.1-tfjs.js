@@ -17,7 +17,7 @@ const { DeepQTheTradingAgent } = require('./rl-engine'); // <-- DQN Agent Modul 
 const { HedgeManager } = require('./hedgeManager');
 const { VolatilitySurfaceManager } = require('./volatilitySurface');
 const { OrderFlowAnalyzer } = require('./orderFlowAnalyzer');
-const { runBacktest, buildConfig: buildBacktestConfig } = require('./backtest-engine');
+const { runBacktest, buildConfig: buildBacktestConfig, optimizeHyperparameters } = require('./backtest-engine');
 
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
@@ -561,7 +561,6 @@ const mlModel = new TensorFlowSignalModel({
   logger
 });
 
-// Initialisierung des DQN-Agents
 const dqnAgent = new DeepQTheTradingAgent({
   modelDir: process.env.DQN_MODEL_DIR || './models/rl-dqn-model',
   stateSize: 16,
@@ -569,7 +568,6 @@ const dqnAgent = new DeepQTheTradingAgent({
   logger
 });
 
-// Initialisierung der Manager (inkl. OrderFlowAnalyzer)
 const hedgeManager = new HedgeManager({ logger, thresholdDropPct: -2.5 });
 const volManager = new VolatilitySurfaceManager({ logger });
 const orderFlowManager = new OrderFlowAnalyzer({ logger });
@@ -581,7 +579,6 @@ function buildMLFeatures(data) {
   return mlModel.buildFeatures(data);
 }
 
-// Hilfsfunktion zum Erstellen des DQN-Zustandsvektors aus Marktdaten
 function buildDQNStateVector(params) {
   return [
     params.adx ? params.adx / 50 : 0.5,
@@ -611,7 +608,6 @@ async function trainSignalMLModel(force = false) {
     isModelTrained = !!result.trained;
     lastMLTrainingStats = result;
 
-    // DQN Training ebenfalls ausführen, wenn DB verfügbar ist
     if (config.DQN_ENABLED) {
       await dqnAgent.trainFromClosedTrades(closedTradesCollection);
     }
@@ -1755,45 +1751,6 @@ function formatScanStatsReport(stats) {
     reasons.forEach(r => lines.push(`• ${r}`));
   }
 
-  const accountedFor = (stats.signalsSent || 0) +
-    (stats.missingKlines || 0) +
-    (stats.skippedActiveTrade || 0) +
-    (stats.skippedMaxSignals || 0) +
-    (stats.skippedDynamicBlacklist || 0) +
-    (stats.timeBlocked || 0) +
-    (stats.mlBlocked || 0) +
-    (stats.dqnBlocked || 0) +
-    (stats.hurstBlocked || 0) +
-    (stats.adxTooLow || 0) +
-    (stats.marketChoppy || 0) +
-    (stats.noBOS || 0) +
-    (stats.rsiTooLow || 0) +
-    (stats.rsiTooHigh || 0) +
-    (stats.pocVwapFail || 0) +
-    (stats.macdFail || 0) +
-    (stats.fundingBlocked || 0) +
-    (stats.relVolTooLow || 0) +
-    (stats.correlationBlocked || 0) +
-    (stats.orderBookBlocked || 0) +
-    (stats.orderFlowBlocked || 0) +
-    (stats.spreadTooHigh || 0) +
-    (stats.signalHistoryBlocked || 0) +
-    (stats.cooldownActive || 0) +
-    (stats.positionTooSmallForLot || 0) +
-    (stats.skippedDbDisconnected || 0) +
-    (stats.skippedMaxConcurrentTrades || 0) +
-    (stats.skippedDailyLossLimit || 0) +
-    (stats.skippedMaxSameDirection || 0) +
-    (stats.skippedExposureLimit || 0) +
-    (stats.skippedMaxDrawdown || 0) +
-    (stats.btcCounterTrendBlocked || 0) +
-    trendTotal;
-
-  const unaccounted = stats.total - accountedFor;
-  if (unaccounted > 0) {
-    lines.push(`\n⚠️ <b>Unklare Verwerfungen:</b> ${unaccounted} Coins`);
-  }
-
   return lines.join('\n');
 }
 
@@ -2431,7 +2388,6 @@ async function scanMarket() {
             return;
           }
 
-          // 🤖 DQN Agent Entscheidung einbinden: Action 0 = Hold (Blockieren), 1 = Long, 2 = Short
           if (config.DQN_ENABLED && dqnAgent.isInitialized) {
             const dqnState = buildDQNStateVector({
               adx, rsi, hurst, relativeVolume, signalScore, direction,
@@ -2441,9 +2397,7 @@ async function scanMarket() {
               mlProbability: mlPrediction.probability
             });
             const dqnAction = dqnAgent.act(dqnState);
-            const expectedAction = direction === 'LONG' ? 1 : 2;
 
-            // Wenn der DQN Agent (außerhalb der Explorationsphase) strikt "Hold" (0) wählt oder eine entgegengesetzte Richtung erzwingen will:
             if (dqnAction === 0 && Math.random() >= dqnAgent.epsilon) {
               scanStats.dqnBlocked++;
               return;
@@ -2625,10 +2579,11 @@ async function handleTelegramCommand(chatId, text) {
       `/filter on/off [key] - Filter aktivieren/deaktivieren\n` +
       `/filter soft/hard [key] - Schwelle weicher/härter stellen\n` +
       `/filter reset [key] - Einen Filter auf Standard zurücksetzen\n` +
-      `/filter reset all confirm - ALLE Filter auf Profil-Standard\n\n` +
+      `/filter reset all confirm - ALLE Filter auf Profil-Standard\n` +
+      `/optimize [Symbol] [Tage] - Automatisches Hyperparameter-Tuning\n\n` +
       `<b>📊 Performance & Status:</b>\n` +
       `/stats - Performance heute (UTC)\n` +
-      `/drawndown (oder /dd) - Aktuellen Drawdown anzeigen\n` +
+      `/drawndown (또는 /dd) - Aktuellen Drawdown anzeigen\n` +
       `/week - 7-Tage Performance Report\n` +
       `/month - 30-Tage Performance Report\n` +
       `/status - Gesamt-Status des Bots\n` +
@@ -2666,13 +2621,10 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, `🧬 <b>Starte Hyperparameter-Optimierung</b> für ${symbolArg} (${days} Tage)... Das kann einen Moment dauern.`);
     
     try {
-      const { optimizeHyperparameters, buildConfig: buildBtcConfig } = require('./backtest-engine');
-      const cfg = buildBtcConfig(process.env);
-      
+      const cfg = buildBacktestConfig(process.env);
       const best = await optimizeHyperparameters(symbolArg, days, cfg);
       
       if (best) {
-        // Übernehme die besten Werte direkt in die Live-Konfiguration des Bots
         config.ATR_STOP_MULT = best.atrMultiplier;
         config.ADX_MIN = best.adxMin;
         
