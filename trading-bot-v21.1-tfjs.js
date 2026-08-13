@@ -970,7 +970,7 @@ function checkGlobalDrawdown(currentEquity) {
     isPaused = true;
     persistPauseState();
     persistPeakCapital();
-    sendDeduplicatedAlert('global_drawdown', `🔴 <b>MAX DRAWDOWN ERREICHT: ${drawdown.toFixed(1)}%!</b>\nBot wurde pausiert.`);
+    // Automatische Push-Warnung entfernt
     return true;
   }
   return false;
@@ -2567,6 +2567,7 @@ async function handleTelegramCommand(chatId, text) {
       `/filter reset all confirm - ALLE Filter auf Profil-Standard\n\n` +
       `<b>📊 Performance & Status:</b>\n` +
       `/stats - Performance heute (UTC)\n` +
+      `/drawndown (oder /dd) - Aktuellen Drawdown anzeigen\n` +
       `/week - 7-Tage Performance Report\n` +
       `/month - 30-Tage Performance Report\n` +
       `/status - Gesamt-Status des Bots\n` +
@@ -2594,6 +2595,22 @@ async function handleTelegramCommand(chatId, text) {
       `<b>🎮 System:</b>\n` +
       `/pause | /resume | /scan | /backtest [Symbol] [Days]`
     );
+    return;
+  }
+
+  if (command === '/drawndown' || command === '/dd') {
+    const currentEquity = config.CAPITAL_USD + dailyNetPnL;
+    const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(2) : 0;
+    const maxAllowed = config.MAX_DRAWDOWN_PERCENT;
+
+    let msg = `📉 <b>AKTUELLER DRAWDOWN STATUS</b>\n━━━━━━━━━━━━━━━━━━━━\n`;
+    msg += `• Aktuelles Kapital: <b>$${currentEquity.toFixed(2)}</b>\n`;
+    msg += `• Peak Kapital: <b>$${peakCapital.toFixed(2)}</b>\n`;
+    msg += `• Aktueller Drawdown: <b>${drawdownPercent}%</b>\n`;
+    msg += `• Max. Erlaubter Drawdown: <b>${maxAllowed}%</b>\n`;
+    msg += `• Bot-Status: ${isPaused ? '⏸️ Pausiert' : '▶️ Aktiv'}`;
+
+    await sendTelegramReply(chatId, msg);
     return;
   }
 
