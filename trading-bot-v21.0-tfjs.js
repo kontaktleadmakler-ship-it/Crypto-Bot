@@ -13,6 +13,7 @@ const axios = require('axios');
 const { MongoClient } = require('mongodb');
 const winston = require('winston');
 const { DeepQTheTradingAgent } = require('./rl-engine');
+const { MacroFilterEngine } = require('./macroFilter'); // <-- Makro & Sentiment Filter eingebunden[cite: 4]
 const { runBacktest, buildConfig: buildBacktestConfig } = require('./backtest-engine');
 
 // ==========================================
@@ -588,7 +589,7 @@ validateCriticalEnv();
 updateTelegramConfig(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID);
 
 // ==========================================
-// 9. DATENBANK & RL-AGENT (DEEP Q-NETWORK)
+// 9. DATENBANK, RL-AGENT & MAKRO-FILTER
 // ==========================================
 const client = new MongoClient(config.MONGODB_URI, {
   maxPoolSize: config.MONGODB_POOL_SIZE,
@@ -615,6 +616,10 @@ const rlAgent = new DeepQTheTradingAgent({
   learningRate: 0.001,
   logger
 });
+
+// Initialisierung des Makro- & Sentiment-Filters
+const macroEngine = new MacroFilterEngine({ logger });
+
 let isModelTrained = false;
 let lastMLTrainingStats = null;
 
@@ -1904,7 +1909,6 @@ async function checkActiveTrades() {
         }
 
         if (config.TRAILING_STOP_ENABLED && trade.tp1Hit) {
-          // ATR-basierten Trailing-Stop anwenden
           const updatedStop = updateDynamicTrailingStop(trade, currentPrice, trailingATR);
           if (updatedStop !== trade.stopLoss) {
             trade.stopLoss = updatedStop;
@@ -2099,7 +2103,8 @@ function createEmptyScanStats() {
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    timeBlocked: 0, mlBlocked: 0, confluenceBlocked: 0, skippedPortfolioExposureLimit: 0
+    timeBlocked: 0, mlBlocked: 0, confluenceBlocked: 0, skippedPortfolioExposureLimit: 0,
+    macroBlocked: 0
   };
 }
 
@@ -2113,6 +2118,14 @@ async function scanMarket() {
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
+    isScanning = false;
+    return;
+  }
+
+  // Makro & Sentiment Check vor dem Scan ausführen
+  const macroStatus = await macroEngine.evaluateMacroEnvironment();
+  if (!macroStatus.safe) {
+    logger.warn(`⚠️ Scan wegen Makro-Risiko ausgesetzt (Sentiment: ${macroStatus.sentimentClass}, Wert: ${macroStatus.sentimentValue}).`);
     isScanning = false;
     return;
   }
@@ -2138,7 +2151,8 @@ async function scanMarket() {
     const adaptiveTP1 = config.TP1_MULT + adaptiveConfig.TP1_MULT_ADJ;
     const adaptiveVolume = config.MIN_RELATIVE_VOLUME * adaptiveConfig.VOLUME_MULT;
 
-    let adaptiveRisk = config.RISK_PERCENT;
+    // Dynamisches Risiko anhand von Kelly & Makro-Multiplikator anpassen
+    let adaptiveRisk = config.RISK_PERCENT * macroStatus.riskMultiplier;
     if (config.ENABLE_KELLY_SIZING) {
       const weekStats = await getPeriodPerformanceStats(7).catch(() => null);
       if (weekStats && weekStats.totalTrades >= 20) {
@@ -2147,7 +2161,7 @@ async function scanMarket() {
           weekStats.avgWin, 
           Math.abs(weekStats.avgLoss), 
           config.RISK_PERCENT
-        ) * 100;
+        ) * 100 * macroStatus.riskMultiplier;
       }
     }
 
@@ -2166,7 +2180,7 @@ async function scanMarket() {
       }
     }
 
-    logger.info(`📊 Phase: ${currentMarketPhase} | ADX: ${adaptiveADX.toFixed(1)} | Risk: ${adaptiveRisk.toFixed(2)}%`);
+    logger.info(`📊 Phase: ${currentMarketPhase} | Sentiment: ${macroStatus.sentimentClass} (${macroStatus.sentimentValue}) | ADX: ${adaptiveADX.toFixed(1)} | Risk: ${adaptiveRisk.toFixed(2)}%`);
 
     const spotWatchlist = await getTopKucoinPairs(config.TOP_COIN_LIMIT).catch(() => ['BTC-USDT', 'ETH-USDT']);
     const dynamicWatchlist = contractSpecsCache.size > 0 
@@ -2299,7 +2313,6 @@ async function scanMarket() {
         }
 
         if (direction !== null) {
-          // Confluence-Score Filter anwenden (muss >= 60 sein)
           const confluenceScore = calculateConfluenceScore(
             symbol, 
             { htfTrend: trend4h, ltfSignalDirection: direction, relativeVolume }, 
@@ -2347,7 +2360,7 @@ async function scanMarket() {
           const vwapDistancePct = vwap && currentPrice ? ((currentPrice - vwap) / currentPrice) * 100 : 0;
           const atrPct = currentPrice ? (atr / currentPrice) * 100 : 0;
 
-        const rlState = [
+          const rlState = [
             adx ? adx / 50 : 0.5,
             rsi ? rsi / 100 : 0.5,
             hurst || 0.5,
@@ -2363,7 +2376,7 @@ async function scanMarket() {
             orderBookMetrics.spreadPct || 0.1,
             btcATR > 0 ? atr / btcATR : 1,
             isModelTrained ? 0.8 : 0.5,
-            confluenceScore / 100 // <-- Confluence-Score als 16. Feature
+            confluenceScore / 100
           ];
 
           const rlAction = isModelTrained ? rlAgent.act(rlState) : (direction === 'LONG' ? 1 : 2);
@@ -2400,7 +2413,6 @@ async function scanMarket() {
             contracts: contractSizing.contracts
           };
 
-          // Portfolio Exposure Check vor dem Öffnen
           if (!calculatePortfolioExposure(activeTrades, direction, sizing.notionalUSD, config.CAPITAL_USD * config.MAX_EXPOSURE_RATIO)) {
             scanStats.skippedPortfolioExposureLimit++;
             return;
