@@ -2964,10 +2964,11 @@ async function handleTelegramCommand(chatId, text) {
   }
 
   if (command === '/retrain') {
-    await sendTelegramReply(chatId, '🧠 <i>Starte manuelles TensorFlow.js KI-Training...</i>');
+    await sendTelegramReply(chatId, '🧠 <i>Starte manuelles TensorFlow.js KI-Training mit Hyperparameter-Tuning...</i>');
     const res = await trainSignalMLModel(true);
     if (res.trained) {
-      await sendTelegramReply(chatId, `🟢 <b>KI-Training erfolgreich!</b>\nSamples: ${res.samples} | Epochs: ${res.epochs}`);
+      const bp = res.bestHyperparameters ? `\n• LR: ${res.bestHyperparameters.learningRate} | Dropout: ${res.bestHyperparameters.dropoutRate}` : '';
+      await sendTelegramReply(chatId, `🟢 <b>KI-Training erfolgreich!</b>\nSamples: ${res.samples} | Epochs: ${res.epochs}${bp}`);
     } else {
       await sendTelegramReply(chatId, `⚠️ <b>KI-Training nicht durchgeführt:</b> ${escapeHtml(res.reason)}`);
     }
@@ -3063,8 +3064,14 @@ async function handleTelegramCommand(chatId, text) {
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
+    
     const mlStats = mlModel.getStats();
-    lines.push(`ML: ${isModelTrained ? '🟢 TensorFlow.js aktiv' : '🟡 nicht trainiert'} | Samples: ${mlStats.samples || 0} | Acc: ${mlStats.validationAccuracy ? (mlStats.validationAccuracy * 100).toFixed(1) + '%' : 'n/a'}`);
+    let mlInfo = `ML: ${isModelTrained ? '🟢 TensorFlow.js aktiv' : '🟡 nicht trainiert'} | Samples: ${mlStats.samples || 0}`;
+    if (mlStats.bestHyperparameters) {
+      mlInfo += ` | LR: ${mlStats.bestHyperparameters.learningRate}`;
+    }
+    lines.push(mlInfo);
+    
     lines.push(`Scans: ${isPaused ? '⏸️ PAUSIERT' : '▶️ aktiv'}`);
     lines.push(`Kapital: $${config.CAPITAL_USD.toFixed(0)} | Peak: $${peakCapital.toFixed(0)}`);
     lines.push(`Hebel: ${config.LEVERAGE}x | Risk/Trade: ${config.RISK_PERCENT}%`);
