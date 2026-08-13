@@ -1,8 +1,9 @@
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - ULTIMATE v21.6 DYNAMIC FILTER & TIME-LEARNING EDITION
+ * TRADING SIGNAL BOT - ULTIMATE v21.7 DYNAMIC VOLATILITY SURFACE EDITION
  * (Mit adaptivem TensorFlow.js ML, globaler Telegram-Queue, State-Persistenz,
- *  Hurst-Exponent, Marktphasen-Logging, Dynamic Filter Control & Cross-Hedging)
+ *  Hurst-Exponent, Marktphasen-Logging, Dynamic Filter Control, Cross-Hedging 
+ *  & Dynamic Volatility Surface)
  * ============================================================================
  */
 
@@ -14,6 +15,7 @@ const { MongoClient } = require('mongodb');
 const winston = require('winston');
 const { TensorFlowSignalModel } = require('./ml-engine');
 const { HedgeManager } = require('./hedgeManager'); // <-- HedgeManager Modul eingebunden
+const { VolatilitySurfaceManager } = require('./volatilitySurface'); // <-- VolatilitySurfaceManager Modul eingebunden
 const { runBacktest, buildConfig: buildBacktestConfig } = require('./backtest-engine');
 
 // ==========================================
@@ -525,7 +527,7 @@ validateCriticalEnv();
 updateTelegramConfig(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID);
 
 // ==========================================
-// 8. DATENBANK & ADAPTIVES ML-MODELL & HEDGE
+// 8. DATENBANK & ADAPTIVES ML-MODELL & MANAGERS
 // ==========================================
 const client = new MongoClient(config.MONGODB_URI, {
   maxPoolSize: config.MONGODB_POOL_SIZE,
@@ -555,8 +557,9 @@ const mlModel = new TensorFlowSignalModel({
   logger
 });
 
-// Initialisierung des HedgeManagers (ab -2.5% BTC-Drop wird gewarnt/gehedged)
+// Initialisierung des HedgeManagers und VolatilitySurfaceManagers
 const hedgeManager = new HedgeManager({ logger, thresholdDropPct: -2.5 });
+const volManager = new VolatilitySurfaceManager({ logger });
 
 let isModelTrained = false;
 let lastMLTrainingStats = null;
@@ -1664,7 +1667,7 @@ async function checkRiskLevels() {
 }
 
 function formatScanStatsReport(stats) {
-  const lines = [`🔎 <b>SCAN-DIAGNOSE v21.6 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
+  const lines = [`🔎 <b>SCAN-DIAGNOSE v21.7 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
   lines.push(`Coins geprüft: ${stats.total} | Signale gesendet: ${stats.signalsSent}`);
   if (stats.avgSignalScore !== undefined) lines.push(`Ø Signal-Score: ${stats.avgSignalScore}/100`);
   lines.push(`Marktphase: ${currentMarketPhase}\n`);
@@ -2127,7 +2130,7 @@ async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.6...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.7...`);
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
@@ -2374,8 +2377,11 @@ async function scanMarket() {
             return;
           }
 
+          // 🌊 Volatility Surface Evaluierung einbinden
+          const volEvaluation = await volManager.evaluateVolatilityMultiplier(symbol, atr, currentPrice);
+
           const entryPrice = applySlippage(currentPrice, direction, 'entry');
-          const stopDistance = atr * adaptiveATR;
+          const stopDistance = atr * adaptiveATR * volEvaluation.volFactor; // Dynamisch angepasst durch volFactor
           const stopLoss = direction === 'LONG' ? entryPrice - stopDistance : entryPrice + stopDistance;
           const tp1 = direction === 'LONG' ? entryPrice + (stopDistance * adaptiveTP1) : entryPrice - (stopDistance * adaptiveTP1);
           const tp2 = direction === 'LONG' ? entryPrice + (stopDistance * config.TP2_MULT) : entryPrice - (stopDistance * config.TP2_MULT);
@@ -2449,6 +2455,8 @@ async function scanMarket() {
             orderBookImbalanceAtEntry: orderBookMetrics.bidAskRatio,
             spreadPctAtEntry: orderBookMetrics.spreadPct,
             volatilityRatioAtEntry: btcATR > 0 ? atr / btcATR : 1,
+            volFactorAtEntry: volEvaluation.volFactor,
+            marketStressAtEntry: volEvaluation.marketStress,
             mlProbabilityAtEntry: mlPrediction.probability,
             mlConfidenceAtEntry: mlPrediction.confidence,
             mlModelVersionAtEntry: mlModel.getStats().modelVersion || null
@@ -2460,7 +2468,7 @@ async function scanMarket() {
             `Entry: $${entryPrice.toFixed(6)} | SL: $${stopLoss.toFixed(6)}\n` +
             `TP1: $${tp1.toFixed(6)} | TP2: $${tp2.toFixed(6)}\n` +
             `Größe: ${sizing.contracts} Kontrakte | Risk: $${sizing.riskAmountUSD.toFixed(2)}\n` +
-            `ADX: ${adx} | Hurst: ${hurst} | RSI: ${rsi.toFixed(1)} | Phase: ${currentMarketPhase}\n` +
+            `ADX: ${adx} | Hurst: ${hurst} | Vol-Stress: ${volEvaluation.marketStress}\n` +
             `🧠 TensorFlow.js: ${mlPrediction.trained ? (mlPrediction.probability * 100).toFixed(1) + '% Erfolgswahrscheinlichkeit' : 'noch nicht trainiert'}`;
 
           if (config.ENABLE_BATCH_SIGNALS) {
@@ -2530,7 +2538,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
-      `<b>🤖 TRADING BOT v21.6 - MODULARES CONTROL SYSTEM</b>\n` +
+      `<b>🤖 TRADING BOT v21.7 - MODULARES CONTROL SYSTEM</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
       `<b>⚙️ DYNAMISCHE FILTER-STEUERUNG:</b>\n` +
       `/filters - Zeigt alle Indikator-Status & Werte an\n` +
@@ -3080,7 +3088,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v21.6 ULTIMATE TFJS</b>`);
+    lines.push(`🤖 <b>BOT STATUS v21.7 ULTIMATE TFJS</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
@@ -3235,14 +3243,14 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v21.6 ULTIMATE TFJS | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v21.7 ULTIMATE TFJS | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 app.get('/health', (req, res) => {
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
   const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : '0';
   res.status(isDbConnected ? 200 : 503).json({
-    status: isDbConnected ? 'ok' : 'degraded', version: '21.6', dbConnected: isDbConnected,
+    status: isDbConnected ? 'ok' : 'degraded', version: '21.7', dbConnected: isDbConnected,
     isPaused, activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, currentEquity, peakCapital, drawdownPercent
   });
 });
@@ -3372,7 +3380,7 @@ process.on('unhandledRejection', async (reason) => {
 // 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v21.6 ULTIMATE TFJS (Full Features, TensorFlow.js ML, Time-Learning Filter & Cross-Hedging)...');
+  logger.info('🚀 Starte Trading Bot v21.7 ULTIMATE TFJS (Full Features, TensorFlow.js ML, Time-Learning Filter, Cross-Hedging & Volatility Surface)...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
