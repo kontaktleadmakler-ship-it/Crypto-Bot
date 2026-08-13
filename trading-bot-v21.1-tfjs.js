@@ -2659,6 +2659,45 @@ async function handleTelegramCommand(chatId, text) {
     return;
   }
 
+  if (command === '/optimize') {
+    const symbolArg = args[0] ? args[0].toUpperCase() : 'BTC-USDT';
+    const days = args[1] ? Number(args[1]) : 14;
+    
+    await sendTelegramReply(chatId, `🧬 <b>Starte Hyperparameter-Optimierung</b> für ${symbolArg} (${days} Tage)... Das kann einen Moment dauern.`);
+    
+    try {
+      const { optimizeHyperparameters, buildConfig: buildBtcConfig } = require('./backtest-engine');
+      const cfg = buildBtcConfig(process.env);
+      
+      const best = await optimizeHyperparameters(symbolArg, days, cfg);
+      
+      if (best) {
+        // Übernehme die besten Werte direkt in die Live-Konfiguration des Bots
+        config.ATR_STOP_MULT = best.atrMultiplier;
+        config.ADX_MIN = best.adxMin;
+        
+        let report = `🎯 <b>OPTIMIERUNG ERFOLGREICH BEENDET!</b>\n`;
+        report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+        report += `• Beste Lernrate: <code>${best.learningRate}</code>\n`;
+        report += `• Bester ATR Multiplier: <b>${best.atrMultiplier}</b>\n`;
+        report += `• Bestes ADX Minimum: <b>${best.adxMin}</b>\n\n`;
+        report += `📈 <b>Ergebnis im Test:</b>\n`;
+        report += `• Net Profit: $${best.metrics.netProfit.toFixed(2)}\n`;
+        report += `• Win-Rate: ${best.metrics.winRate.toFixed(2)}%\n`;
+        report += `• Sharpe Ratio: ${best.metrics.sharpe.toFixed(2)}\n\n`;
+        report += `✅ <i>Die Live-Parameter des Bots wurden automatisch aktualisiert!</i>`;
+        
+        await sendTelegramReply(chatId, report);
+      } else {
+        await sendTelegramReply(chatId, `⚠️ Es konnten keine optimalen Parameter ermittelt werden.`);
+      }
+    } catch (e) {
+      logger.error(`Optimierungsfehler: ${e.message}`);
+      await sendTelegramReply(chatId, `❌ Fehler bei der Optimierung: ${escapeHtml(e.message)}`);
+    }
+    return;
+  }
+
   if (command === '/drawndown' || command === '/dd') {
     const currentEquity = config.CAPITAL_USD + dailyNetPnL;
     const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(2) : 0;
