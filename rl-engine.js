@@ -199,8 +199,34 @@ class DeepQTheTradingAgent {
   }
 
   /**
+   * NEU: Kontinuierliches Online-Lernen im Hintergrund (nach jeder neuen Marktbewegung/Tick)
+   */
+  async learnFromTick(state, action, reward, nextState) {
+    this.remember(state, action, reward, nextState, false);
+    return await this.train();
+  }
+
+  /**
+   * NEU: Adaptives Epsilon – prüft die Performance der letzten Trades und erhöht
+   * die Neugier (Epsilon) automatisch, wenn der Bot in eine Verlustphase gerät.
+   */
+  adjustEpsilonBasedOnPerformance(recentTrades) {
+    if (!recentTrades || recentTrades.length < 5) return;
+    
+    // Prüfen, ob die letzten Trades überwiegend Verluste waren
+    const lastFew = recentTrades.slice(0, 5);
+    const lossesCount = lastFew.filter(t => (t.pnlUSD || 0) < 0).length;
+
+    if (lossesCount >= 4) {
+      // Performance bricht ein -> Epsilon anheben, damit der Agent wieder aktiver experimentiert
+      this.epsilon = Math.min(0.4, this.epsilon + 0.15);
+      this.logger.info(`🔄 [RL-Engine] Schlechte Performance erkannt. Adaptives Epsilon auf ${this.epsilon.toFixed(2)} erhöht, um neue Strategien zu testen.`);
+    }
+  }
+
+  /**
    * Wandelt Closed Trades aus der MongoDB in RL-Erfahrungen um und trainiert das Netz
-   * (Erweitert um Confluence-Score im State-Vektor und optimiertes Reward Shaping)
+   * (Erweitert um Confluence-Score, optimiertes Reward Shaping und adaptives Epsilon)
    */
   async trainFromClosedTrades(closedTradesCollection) {
     try {
@@ -208,6 +234,9 @@ class DeepQTheTradingAgent {
       
       const trades = await closedTradesCollection.find({}).sort({ closeTime: -1 }).limit(500).toArray();
       if (trades.length < 10) return { trained: false, reason: 'not-enough-trades' };
+
+      // Adaptives Epsilon basierend auf den jüngsten Trades anpassen
+      this.adjustEpsilonBasedOnPerformance(trades);
 
       let addedCount = 0;
       for (let i = 0; i < trades.length - 1; i++) {
@@ -237,16 +266,14 @@ class DeepQTheTradingAgent {
         
         // ---- VERBESSERTES REWARD SHAPING ----
         const pnlUSD = t.pnlUSD || 0;
-        // Skalierte Basis-Belohnung mit Kappen bei +5 / -5 zur Stabilisierung
         let baseReward = pnlUSD > 0 ? Math.min(pnlUSD / 50, 5) : Math.max(pnlUSD / 50, -5);
         
-        // Confluence-Faktor einbeziehen: Bestrafe schlechte Trades mit hohem Risiko härter, belohne saubere Setups
         const confluenceScore = t.confluenceScore || 60;
         let confluenceBonus = 0;
         if (pnlUSD > 0 && confluenceScore >= 70) {
-          confluenceBonus = 1.0; // Starker Bonus für hochkonfluente Gewinne
+          confluenceBonus = 1.0; 
         } else if (pnlUSD < 0 && confluenceScore >= 70) {
-          confluenceBonus = -1.0; // Höhere Bestrafung, wenn trotz hohem Confluence ein Loss entsteht (Modell soll lernen, warum)
+          confluenceBonus = -1.0; 
         }
         
         const reward = baseReward + confluenceBonus;
@@ -285,7 +312,7 @@ class DeepQTheTradingAgent {
       this.updateTargetModel();
       await this.save();
 
-      this.logger.info(`🤖 [RL-Engine] DQN erfolgreich mit ${addedCount} Trades (inkl. optimiertem Reward-Shaping) trainiert.`);
+      this.logger.info(`🤖 [RL-Engine] DQN erfolgreich mit ${addedCount} Trades (inkl. adaptivem Epsilon & Reward-Shaping) trainiert.`);
       return { trained: true, samples: addedCount, epsilon: this.epsilon };
     } catch (e) {
       this.logger.error(`[RL-Engine Training Fehler]: ${e.message}`);
