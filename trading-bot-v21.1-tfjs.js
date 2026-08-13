@@ -2388,6 +2388,9 @@ async function scanMarket() {
             return;
           }
 
+          // ==========================================
+          // 🧠 DQN AGENT VETO-GATE (AKTIVIERT)
+          // ==========================================
           if (config.DQN_ENABLED && dqnAgent.isInitialized) {
             const dqnState = buildDQNStateVector({
               adx, rsi, hurst, relativeVolume, signalScore, direction,
@@ -2398,8 +2401,10 @@ async function scanMarket() {
             });
             const dqnAction = dqnAgent.act(dqnState);
 
+            // Wenn Action = 0 (Veto/Ablehnen) und außerhalb der Exploration (Epsilon)
             if (dqnAction === 0 && Math.random() >= dqnAgent.epsilon) {
               scanStats.dqnBlocked++;
+              logger.info(`[DQN-VETO] Trade für ${symbol} (${direction}) vom DQN-Agenten blockiert.`);
               return;
             }
           }
@@ -2583,7 +2588,7 @@ async function handleTelegramCommand(chatId, text) {
       `/optimize [Symbol] [Tage] - Automatisches Hyperparameter-Tuning\n\n` +
       `<b>📊 Performance & Status:</b>\n` +
       `/stats - Performance heute (UTC)\n` +
-      `/drawndown (또는 /dd) - Aktuellen Drawdown anzeigen\n` +
+      `/drawndown (oder /dd) - Aktuellen Drawdown anzeigen\n` +
       `/week - 7-Tage Performance Report\n` +
       `/month - 30-Tage Performance Report\n` +
       `/status - Gesamt-Status des Bots\n` +
