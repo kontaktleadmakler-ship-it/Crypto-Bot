@@ -235,13 +235,22 @@ class DeepQTheTradingAgent {
 
         const action = t.direction === 'LONG' ? 1 : 2;
         
-        // Erweitertes Reward Shaping: PnL kombiniert mit Confluence-Güte und Schnelligkeit
+        // ---- VERBESSERTES REWARD SHAPING ----
         const pnlUSD = t.pnlUSD || 0;
+        // Skalierte Basis-Belohnung mit Kappen bei +5 / -5 zur Stabilisierung
         let baseReward = pnlUSD > 0 ? Math.min(pnlUSD / 50, 5) : Math.max(pnlUSD / 50, -5);
         
-        // Bonus für Trades mit hohem Confluence-Score, die gewonnen haben, bzw. Strafe bei Fehlsignalen
-        const confluenceBonus = (t.confluenceScore || 60) >= 70 ? 0.5 : 0;
-        const reward = pnlUSD > 0 ? (baseReward + confluenceBonus) : (baseReward - confluenceBonus);
+        // Confluence-Faktor einbeziehen: Bestrafe schlechte Trades mit hohem Risiko härter, belohne saubere Setups
+        const confluenceScore = t.confluenceScore || 60;
+        let confluenceBonus = 0;
+        if (pnlUSD > 0 && confluenceScore >= 70) {
+          confluenceBonus = 1.0; // Starker Bonus für hochkonfluente Gewinne
+        } else if (pnlUSD < 0 && confluenceScore >= 70) {
+          confluenceBonus = -1.0; // Höhere Bestrafung, wenn trotz hohem Confluence ein Loss entsteht (Modell soll lernen, warum)
+        }
+        
+        const reward = baseReward + confluenceBonus;
+        // -------------------------------------
         
         const nextT = trades[i + 1];
         const nextState = [
@@ -276,7 +285,7 @@ class DeepQTheTradingAgent {
       this.updateTargetModel();
       await this.save();
 
-      this.logger.info(`🤖 [RL-Engine] DQN erfolgreich mit ${addedCount} Trades trainiert.`);
+      this.logger.info(`🤖 [RL-Engine] DQN erfolgreich mit ${addedCount} Trades (inkl. optimiertem Reward-Shaping) trainiert.`);
       return { trained: true, samples: addedCount, epsilon: this.epsilon };
     } catch (e) {
       this.logger.error(`[RL-Engine Training Fehler]: ${e.message}`);
