@@ -1425,8 +1425,15 @@ function deriveHigherTimeframes(candles15m, targetTimeframe) {
   const derived = [];
   for (let i = period - 1; i < candles15m.length; i += period) {
     const slice = candles15m.slice(i - period + 1, i + 1);
+    // Bug fixed: this timestamp used to be the LAST constituent candle's
+    // time. That made every derived HTF candle look "closed" even while it
+    // was still forming, and was inconsistent with backtest-engine.js's
+    // aggregate(), which already stamps the OPEN time of the first
+    // constituent 15m bar. Using the open time here keeps live and backtest
+    // HTF timestamps consistent and lets callers correctly test candle
+    // closure via `htf.time + timeframeMs <= now`.
     derived.push({
-      time: slice[slice.length - 1].time,
+      time: slice[0].time,
       open: slice[0].open,
       high: Math.max(...slice.map(c => c.high)),
       low: Math.min(...slice.map(c => c.low)),
@@ -2064,6 +2071,8 @@ async function checkActiveTrades() {
         logger.error(`[TRACKER ERROR] ${symbol}: ${e.message}`);
       }
     }
+  } catch (e) {
+    logger.error(`[TRACKER CRITICAL ERROR] ${e.message}\n${e.stack}`);
   } finally {
     trackerLock = false;
   }
@@ -2207,18 +2216,24 @@ async function scanMarket() {
     return;
   }
 
-  // Makro & Sentiment Check vor dem Scan ausführen
-  const macroStatus = await macroEngine.evaluateMacroEnvironment();
-  if (!macroStatus.safe) {
-    logger.warn(`⚠️ Scan wegen Makro-Risiko ausgesetzt (Sentiment: ${macroStatus.sentimentClass}, Wert: ${macroStatus.sentimentValue}).`);
-    isScanning = false;
-    return;
-  }
-
   const scanStats = createEmptyScanStats();
   const signalBatch = [];
 
+  // Bug fixed: the macro/sentiment check used to run BEFORE this try block.
+  // If macroEngine.evaluateMacroEnvironment() threw (e.g. the Fear & Greed
+  // API call failed in an unexpected way), the exception propagated out of
+  // scanMarket() without ever resetting isScanning back to false. Since
+  // scanMarket() early-returns while isScanning is true, a single transient
+  // macro-fetch failure would silently stop the bot from scanning ever
+  // again until process restart. It's now inside the try/finally below so
+  // isScanning is always reset regardless of where a failure occurs.
   try {
+    const macroStatus = await macroEngine.evaluateMacroEnvironment();
+    if (!macroStatus.safe) {
+      logger.warn(`⚠️ Scan wegen Makro-Risiko ausgesetzt (Sentiment: ${macroStatus.sentimentClass}, Wert: ${macroStatus.sentimentValue}).`);
+      return;
+    }
+
     const btcTrend = await getBitcoinTrend().catch(() => 'NEUTRAL');
     const btcKlines = await fetchKucoinKlinesCached('BTC-USDT', '15m', 100).catch(() => null);
     const btcADX = btcKlines ? calculateADX(btcKlines, 14) : 20;
@@ -3523,18 +3538,33 @@ const server = app.listen(config.PORT, '0.0.0.0', () => {
 const cronJobs = [];
 const intervalTimers = [];
 
-intervalTimers.push(setInterval(async () => { await checkActiveTrades(); }, config.FAST_TRACK_INTERVAL_SECONDS * 1000));
-intervalTimers.push(setInterval(() => { klinesCache.cleanup(config.CACHE_CLEANUP_MINUTES * 60 * 1000); }, config.CACHE_CLEANUP_MINUTES * 60 * 1000));
+intervalTimers.push(setInterval(async () => {
+  try { await checkActiveTrades(); }
+  catch (e) { logger.error(`[TRACKER INTERVAL ERROR] ${e.message}\n${e.stack}`); }
+}, config.FAST_TRACK_INTERVAL_SECONDS * 1000));
+
+intervalTimers.push(setInterval(() => {
+  try { klinesCache.cleanup(config.CACHE_CLEANUP_MINUTES * 60 * 1000); }
+  catch (e) { logger.error(`[CACHE CLEANUP ERROR] ${e.message}`); }
+}, config.CACHE_CLEANUP_MINUTES * 60 * 1000));
 
 cronJobs.push(cron.schedule('59 23 * * *', async () => {
-  dailyNetPnL = 0;
-  currentStreak = 0;
-  await persistDailyPnLState();
+  try {
+    dailyNetPnL = 0;
+    currentStreak = 0;
+    await persistDailyPnLState();
+  } catch (e) {
+    logger.error(`[DAILY RESET CRON ERROR] ${e.message}\n${e.stack}`);
+  }
 }, { timezone: 'UTC' }));
 
 cronJobs.push(cron.schedule('0 */6 * * *', async () => {
-  await loadFuturesContractSpecs();
-  await trainSignalMLModel();
+  try {
+    await loadFuturesContractSpecs();
+    await trainSignalMLModel();
+  } catch (e) {
+    logger.error(`[6H CRON ERROR] ${e.message}\n${e.stack}`);
+  }
 }, { timezone: 'UTC' }));
 
 async function gracefulShutdown(signal) {
