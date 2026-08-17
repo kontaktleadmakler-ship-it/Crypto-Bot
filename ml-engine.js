@@ -243,6 +243,7 @@ class TensorFlowSignalModel {
       let bestValAccuracy = -1;
       let bestValLoss = Infinity;
       let bestHistory = null;
+      let bestBestConfig = null;
 
       this.logger.star?.(`🧠 [TensorFlow.js] Starte automatisches Hyperparameter-Tuning (${hyperparameterGrid.length} Kombinationen)...`) || 
       this.logger.info(`🧠 [TensorFlow.js] Starte automatisches Hyperparameter-Tuning (${hyperparameterGrid.length} Kombinationen)...`);
