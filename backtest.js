@@ -1,4 +1,3 @@
-test · JS
 'use strict';
 require('dotenv').config();
 const fs=require('fs');
