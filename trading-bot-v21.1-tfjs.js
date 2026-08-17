@@ -475,7 +475,11 @@ const config = {
   MAX_SPREAD_PERCENT: parseFloat(process.env.MAX_SPREAD_PERCENT) || 0.15,
   MAX_CHOP_INDEX: parseFloat(process.env.MAX_CHOP_INDEX) || 61.8,
   MIN_HURST_EXPONENT: parseFloat(process.env.MIN_HURST_EXPONENT) || 0.52,
-  MIN_GATE_SCORE: parseFloat(process.env.MIN_GATE_SCORE) || 65,
+  // Punkt 10: nach Konsolidierung von ADX/Hurst/Chop zu einem einzigen
+  // Trend-Quality-Block (60 statt vorher 3x separat gewichteter Punkte)
+  // verschiebt sich die Punkteverteilung leicht; Standard-Schwelle von
+  // 65 auf 55 abgesenkt, um dieselbe relative Strenge beizubehalten.
+  MIN_GATE_SCORE: parseFloat(process.env.MIN_GATE_SCORE) || 55,
   MIN_RRR: parseFloat(process.env.MIN_RRR) || 1.2,
 
   ML_ENABLED: process.env.ML_ENABLED !== 'false',
@@ -566,7 +570,7 @@ const activeTrades = new Map();
 let isDbConnected = false, dbReconnectInterval = null, pendingClosedTrades = [], isReconnecting = false;
 const priceFailureCounts = new Map();
 let isPaused = false, lastScanTime = null, lastTrackerCheckTime = null;
-let trackerLock = false, trackerTimeout = null;
+let trackerLock = false;
 const signalPerformanceHistory = new Map();
 
 const mlModel = new TensorFlowSignalModel({
@@ -1355,27 +1359,11 @@ function calculateMACD(closes) {
   return { macd: macdLine, signal: signalLine, histogram: macdLine - signalLine };
 }
 
-function calculateVWAP(candles) {
-  // candle.time is already epoch MILLISECONDS (see fetchKucoinKlines: `to =
-  // Date.now()`, `from = to - ... * 60_000`). The previous code multiplied
-  // by 1000 again when building the Date (landing somewhere around the year
-  // 54,000,000) and then divided the UTC day-start back down to seconds,
-  // while candle.time stayed in ms - the filter below was comparing
-  // mismatched units and effectively never matched, so VWAP silently used
-  // the entire candle window instead of resetting at the start of each day.
-  if (!candles || candles.length === 0) return 0;
-  const lastCandleDate = new Date(candles[candles.length - 1].time);
-  const sessionStartMs = Date.UTC(lastCandleDate.getUTCFullYear(), lastCandleDate.getUTCMonth(), lastCandleDate.getUTCDate());
-  const sessionCandles = candles.filter(c => c.time >= sessionStartMs);
-  const workingSet = sessionCandles.length > 0 ? sessionCandles : candles;
-  let cumulativeTPV = 0, cumulativeVolume = 0;
-  for (const c of workingSet) {
-    const typicalPrice = (c.high + c.low + c.close) / 3;
-    cumulativeTPV += typicalPrice * c.volume;
-    cumulativeVolume += c.volume;
-  }
-  return cumulativeVolume === 0 ? workingSet[workingSet.length - 1].close : Number((cumulativeTPV / cumulativeVolume).toFixed(4));
-}
+// Punkt 8 - VWAP-Konsistenz: Berechnung lebt jetzt ausschließlich in
+// ./vwap-calculator.js und wird von Live-Bot und Backtest-Engine gemeinsam
+// genutzt, damit beide bei identischen Eingabedaten bitgenau dasselbe Ergebnis
+// liefern.
+const { calculateVWAP } = require('./vwap-calculator');
 
 function calculateVolumeProfilePOC(candles, lookback = 30, binsCount = 20) {
   if (!candles || candles.length < lookback) return null;
@@ -1412,14 +1400,34 @@ function checkSwingBreakOfStructure(candles, lookback = 10) {
   return { bosBullish: current.close > highestClose, bosBearish: current.close < lowestClose };
 }
 
+// Punkt 11 - Dynamisches Scoring-System: die Gewichtung der Indikatoren war
+// bisher statisch, obwohl unterschiedliche Marktphasen unterschiedliche
+// Anforderungen haben. In TRENDING-Märkten zählen ADX und MACD (klassische
+// Trendfolge-Indikatoren) stärker, in RANGING-Märkten RSI und relatives
+// Volumen (Reversion/Liquidität an Extremen). VOLATILE nutzt eine
+// ausgewogene Zwischenstufe. Alle Sets summieren sich auf 100 Punkte.
+const SIGNAL_SCORE_WEIGHTS = {
+  TRENDING: { adx: 35, rsi: 15, volume: 15, trend1h: 12, trend4h: 13, macd: 10 },
+  RANGING:  { adx: 15, rsi: 30, volume: 30, trend1h: 10, trend4h: 10, macd: 5 },
+  VOLATILE: { adx: 25, rsi: 22, volume: 18, trend1h: 12, trend4h: 13, macd: 10 }
+};
+// Fallback, falls marketPhase unbekannt/nicht übergeben ist - identisch zur
+// bisherigen statischen Gewichtung (ohne MACD-Anteil).
+const DEFAULT_SIGNAL_SCORE_WEIGHTS = { adx: 30, rsi: 20, volume: 20, trend1h: 15, trend4h: 15, macd: 0 };
+
 function calculateSignalScore(params) {
+  const weights = SIGNAL_SCORE_WEIGHTS[params.marketPhase] || DEFAULT_SIGNAL_SCORE_WEIGHTS;
   let score = 0;
-  score += Math.min(params.adx / 50, 1) * 30;
+  score += Math.min(params.adx / 50, 1) * weights.adx;
   const rsiOptimal = params.direction === 'LONG' ? 55 : 45;
-  score += Math.max(0, (1 - Math.abs(params.rsi - rsiOptimal) / 30)) * 20;
-  score += Math.min(params.relativeVolume / 2, 1) * 20;
-  if (params.trend1h === (params.direction === 'LONG' ? 'BULLISH' : 'BEARISH')) score += 15;
-  if (params.trend4h === (params.direction === 'LONG' ? 'BULLISH' : 'BEARISH')) score += 15;
+  score += Math.max(0, (1 - Math.abs(params.rsi - rsiOptimal) / 30)) * weights.rsi;
+  score += Math.min(params.relativeVolume / 2, 1) * weights.volume;
+  if (params.trend1h === (params.direction === 'LONG' ? 'BULLISH' : 'BEARISH')) score += weights.trend1h;
+  if (params.trend4h === (params.direction === 'LONG' ? 'BULLISH' : 'BEARISH')) score += weights.trend4h;
+  if (weights.macd && params.macdHistogram != null) {
+    const macdAligned = params.direction === 'LONG' ? params.macdHistogram >= 0 : params.macdHistogram <= 0;
+    if (macdAligned) score += weights.macd;
+  }
   return Math.round(Math.min(score, 100));
 }
 
@@ -1817,11 +1825,10 @@ function formatScanStatsReport(stats) {
   if (stats.skippedMaxSignals) reasons.push(`Max. Signale: ${stats.skippedMaxSignals}`);
   if (stats.skippedDynamicBlacklist) reasons.push(`KI-Erfahrung (Loss-Blocker): ${stats.skippedDynamicBlacklist}`);
   if (stats.timeBlocked) reasons.push(`Time-Learning Filter (ungünstige Stunde/Tag): ${stats.timeBlocked}`);
+  if (stats.newsBlackout) reasons.push(`News-Blackout (Makro-Event): ${stats.newsBlackout}`);
   if (stats.mlBlocked) reasons.push(`TensorFlow.js ML-Filter blockiert: ${stats.mlBlocked}`);
   if (stats.dqnBlocked) reasons.push(`DQN Agent (Reinforcement Learning) blockiert: ${stats.dqnBlocked}`);
-  if (stats.hurstBlocked) reasons.push(`Hurst-Exponent (Zufallsmarkt): ${stats.hurstBlocked}`);
-  if (stats.adxTooLow) reasons.push(`ADX zu niedrig: ${stats.adxTooLow}`);
-  if (stats.marketChoppy) reasons.push(`Markt seitwärts (CHOP): ${stats.marketChoppy}`);
+  if (stats.trendQualityLow) reasons.push(`Trend Quality Score (ADX/Hurst/Chop) zu niedrig: ${stats.trendQualityLow}`);
   if (stats.noBOS) reasons.push(`Kein BOS: ${stats.noBOS}`);
   if (stats.rsiTooLow) reasons.push(`RSI zu niedrig: ${stats.rsiTooLow}`);
   if (stats.rsiTooHigh) reasons.push(`RSI zu hoch: ${stats.rsiTooHigh}`);
@@ -1910,17 +1917,18 @@ async function accrueFundingCost(symbol, trade, hoursElapsed) {
   await upsertTrade(symbol, trade);
 }
 
+// Punkt 7 - Race Condition im Tracker-Lock: trackerLock wird jetzt
+// ausschließlich über try/finally zurückgesetzt, sodass ein geworfener Fehler
+// (oder ein früher return im try-Block) den Lock niemals dauerhaft blockieren
+// kann. Der separate trackerTimeout-Watchdog entfällt dadurch - er war nur
+// nötig, weil der alte Code den Lock im Fehlerfall nicht zuverlässig gelöst hat.
 async function checkActiveTrades() {
   if (trackerLock) {
-    if (!trackerTimeout) {
-      trackerTimeout = setTimeout(() => { trackerLock = false; trackerTimeout = null; }, 120000);
-    }
     return;
   }
   trackerLock = true;
 
   try {
-    if (trackerTimeout) { clearTimeout(trackerTimeout); trackerTimeout = null; }
     lastTrackerCheckTime = Date.now();
 
     const btcMark = await fetchKucoinMarkPrice('BTC-USDT') || await fetchKucoinTickerPrice('BTC-USDT');
@@ -2010,6 +2018,32 @@ async function checkActiveTrades() {
           await sendTelegramAlert(`⌛ <b>ABSOLUTES ZEITLIMIT: ${cleanSymbol}/USDT</b> PnL: $${pnlUSD.toFixed(2)}`);
           await removeTrade(symbol, { symbol, direction: trade.direction, closeTime: Date.now(), closeReason: 'absolute-time-limit', pnlUSD, exitPrice });
           continue;
+        }
+
+        // Punkt 13 - Break-Even früher aktivieren: bisher wanderte der
+        // Stop-Loss erst NACH TP1 auf Break-Even. Jetzt gibt es zusätzlich
+        // ein früheres Break-Even-Level bei entry ± (ATR*0.5). Sobald der
+        // Preis dieses Level erreicht (auch vor TP1), wird der Stop auf den
+        // Entry-Preis plus einen sehr kleinen Trailing-Abstand (0.1 ATR)
+        // gesetzt - nicht exakt auf Entry, damit normales Rauschen den Trade
+        // nicht sofort wieder ausstoppt.
+        if (!trade.tp1Hit && !trade.breakEvenActivated) {
+          const beDistance = (trade.atrAtEntry || 0) * 0.5;
+          const beTrail = (trade.atrAtEntry || 0) * 0.1;
+          if (beDistance > 0) {
+            const beLevel = trade.direction === 'LONG' ? trade.entry + beDistance : trade.entry - beDistance;
+            const beReached = trade.direction === 'LONG' ? highPrice >= beLevel : lowPrice <= beLevel;
+            if (beReached) {
+              const newStop = trade.direction === 'LONG' ? trade.entry + beTrail : trade.entry - beTrail;
+              const improves = trade.direction === 'LONG' ? newStop > trade.stopLoss : newStop < trade.stopLoss;
+              if (improves) {
+                trade.stopLoss = newStop;
+                trade.breakEvenActivated = true;
+                await upsertTrade(symbol, trade);
+                await sendTelegramAlert(`🔐 <b>BREAK-EVEN AKTIVIERT: ${cleanSymbol}/USDT</b> SL → $${newStop.toFixed(6)}`);
+              }
+            }
+          }
         }
 
         if (config.TRAILING_STOP_ENABLED && trade.tp1Hit) {
@@ -2185,23 +2219,32 @@ function evaluateDirectionGates(dir, p, scanStats) {
   // singularly veto a setup.
   let score = 0, max = 0;
 
-  if (filterState.adx.enabled) {
-    max += 25;
+  // --- Punkt 10 - Trend Quality Score: ADX, Hurst und Chop maßen bisher alle
+  // "Trendstärke" getrennt (25+20+15 = 60% der maximal erreichbaren Punkte)
+  // und verdoppelten damit effektiv dieselbe Information im Confluence-Score.
+  // Sie werden jetzt zu einem einzigen gewichteten Score zusammengefasst:
+  //   trendQuality = (adx/100 * 0.5) + (hurst * 0.3) + ((100-chop)/100 * 0.2)
+  // Ergebnis liegt zwischen 0 und 1 und ersetzt die drei separaten Blöcke.
+  // Die einzelnen Filter bleiben über die FILTER_REGISTRY ein-/ausschaltbar;
+  // ist einer deaktiviert, wird sein Gewichtsanteil unter den verbleibenden
+  // aktiven neu verteilt, damit z.B. "nur ADX aus" nicht automatisch auch
+  // Hurst/Chop unwirksam macht.
+  const chopUsable = filterState.chop.enabled && p.chop;
+  let trendRaw = 0, trendWeightSum = 0;
+  if (filterState.adx.enabled) { trendRaw += Math.max(0, Math.min(1, p.adx / 100)) * 0.5; trendWeightSum += 0.5; }
+  if (filterState.hurst.enabled) { trendRaw += Math.max(0, Math.min(1, p.hurst)) * 0.3; trendWeightSum += 0.3; }
+  if (chopUsable) { trendRaw += Math.max(0, Math.min(1, (100 - p.chop) / 100)) * 0.2; trendWeightSum += 0.2; }
+
+  if (trendWeightSum > 0) {
+    max += 60;
+    const trendQuality = trendRaw / trendWeightSum; // renormalisiert auf 0..1
+    score += 60 * trendQuality;
     const effectiveADX = p.adaptiveADX || config.ADX_MIN;
-    if (p.adx >= effectiveADX) score += 25;
-    else { score += Math.max(0, 25 * (p.adx / effectiveADX)); scanStats.adxTooLow++; }
-  }
-
-  if (filterState.hurst.enabled) {
-    max += 20;
-    if (p.hurst >= config.MIN_HURST_EXPONENT) score += 20;
-    else { score += Math.max(0, 20 * (p.hurst / config.MIN_HURST_EXPONENT)); scanStats.hurstBlocked++; }
-  }
-
-  if (filterState.chop.enabled && p.chop) {
-    max += 15;
-    if (p.chop <= config.MAX_CHOP_INDEX) score += 15;
-    else { score += Math.max(0, 15 * (1 - (p.chop - config.MAX_CHOP_INDEX) / config.MAX_CHOP_INDEX)); scanStats.marketChoppy++; }
+    const belowThreshold =
+      (filterState.adx.enabled && p.adx < effectiveADX) ||
+      (filterState.hurst.enabled && p.hurst < config.MIN_HURST_EXPONENT) ||
+      (chopUsable && p.chop > config.MAX_CHOP_INDEX);
+    if (belowThreshold) scanStats.trendQualityLow++;
   }
 
   max += 15;
@@ -2238,15 +2281,40 @@ function createEmptyScanStats() {
     skippedMaxConcurrentTrades: 0, skippedDailyLossLimit: 0, skippedMaxSameDirection: 0,
     skippedExposureLimit: 0, skippedMaxDrawdown: 0, missingKlines: 0,
     trendMismatch: 0, trendMismatch1h: 0, trendMismatch4h: 0,
-    btcCounterTrendBlocked: 0, adxTooLow: 0, hurstBlocked: 0, marketChoppy: 0, noBOS: 0, rsiOutOfRange: 0,
+    btcCounterTrendBlocked: 0, trendQualityLow: 0, noBOS: 0, rsiOutOfRange: 0,
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    timeBlocked: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0
+    timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0
   };
 }
 
 let isScanning = false;
+
+// Punkt 14 - News-Filter: Schutz vor hoher Volatilität durch Makro-News
+// (FOMC, CPI, NFP etc.). NEWS_BLACKOUT_TIMES ist eine komma-getrennte Liste
+// von ISO-Zeitstempeln (UTC), die z.B. manuell aus einem Wirtschaftskalender
+// wie ForexFactory gepflegt oder per Deploy-Skript aktualisiert werden kann.
+// Blackout-Fenster: 30 Minuten vor bis 60 Minuten nach jedem Event - in
+// diesem Fenster wird der komplette Scan ausgesetzt.
+const NEWS_BLACKOUT_BEFORE_MS = 30 * 60 * 1000;
+const NEWS_BLACKOUT_AFTER_MS = 60 * 60 * 1000;
+
+function loadNewsEvents() {
+  const raw = process.env.NEWS_BLACKOUT_TIMES;
+  if (!raw) return [];
+  return raw.split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(s => Date.parse(s))
+    .filter(t => Number.isFinite(t));
+}
+
+const newsEvents = loadNewsEvents();
+
+function isNewsBlackout(now = Date.now()) {
+  return newsEvents.some(t => now >= t - NEWS_BLACKOUT_BEFORE_MS && now <= t + NEWS_BLACKOUT_AFTER_MS);
+}
 
 async function scanMarket() {
   if (isScanning) return;
@@ -2272,6 +2340,12 @@ async function scanMarket() {
   // again until process restart. It's now inside the try/finally below so
   // isScanning is always reset regardless of where a failure occurs.
   try {
+    if (isNewsBlackout()) {
+      scanStats.newsBlackout = (scanStats.newsBlackout || 0) + 1;
+      logger.warn('⚠️ Scan wegen News-Blackout (Makro-Event, z.B. FOMC/CPI/NFP) ausgesetzt.');
+      return;
+    }
+
     const macroStatus = await macroEngine.evaluateMacroEnvironment();
     if (!macroStatus.safe) {
       logger.warn(`⚠️ Scan wegen Makro-Risiko ausgesetzt (Sentiment: ${macroStatus.sentimentClass}, Wert: ${macroStatus.sentimentValue}).`);
@@ -2498,7 +2572,8 @@ async function scanMarket() {
           }
 
           const signalScore = calculateSignalScore({
-            adx, rsi, relativeVolume, trend1h, trend4h, direction
+            adx, rsi, relativeVolume, trend1h, trend4h, direction,
+            marketPhase: currentMarketPhase, macdHistogram: macd.histogram
           });
 
           if (config.ENABLE_ORDERBOOK_ANALYSIS && signalScore > 60) {
@@ -2559,7 +2634,18 @@ async function scanMarket() {
 
           const volEvaluation = await volManager.evaluateVolatilityMultiplier(symbol, atr, currentPrice);
 
-          const entryPrice = applySlippage(currentPrice, direction, 'entry');
+          // Punkt 12 - Entry-Zonen statt fixem Market-Entry: statt immer exakt
+          // zum letzten Schlusskurs zu handeln, wird eine Entry-Zone zwischen
+          // dem Close der vorletzten und der aktuellen (letzten abgeschlossenen)
+          // Kerze aufgespannt. Als Referenzpreis für Slippage/Positionsgröße/
+          // SL/TP dient der Mittelpunkt dieser Zone - das nähert ein
+          // Limit-Order-Konzept an, ohne die restliche Risikologik zu ändern.
+          const prevClose15m = closes15m.length >= 2 ? closes15m[closes15m.length - 2] : currentPrice;
+          const entryZoneLow = Math.min(prevClose15m, currentPrice);
+          const entryZoneHigh = Math.max(prevClose15m, currentPrice);
+          const entryZoneMid = (entryZoneLow + entryZoneHigh) / 2;
+
+          const entryPrice = applySlippage(entryZoneMid, direction, 'entry');
           const atrStopDistance = atr * adaptiveATR * volEvaluation.volFactor;
 
           // Structure-based stop: prefer the most recent swing low/high over
@@ -2617,6 +2703,12 @@ async function scanMarket() {
 
           await upsertTrade(symbol, {
             symbol, direction, entry: entryPrice, stopLoss, tp1, tp2,
+            // Punkt 6 - ML-Feature-Leakage: Preis zum Zeitpunkt der
+            // Signalgenerierung separat vom tatsächlichen (Slippage-behafteten)
+            // Fill-Preis speichern, damit das ML-Training später korrekt
+            // normalisiert (siehe ml-engine.js featuresFromTrade).
+            signalPriceAtEntry: currentPrice,
+            entryZoneLow, entryZoneHigh,
             positionSizeUnits: sizing.positionSizeUnits,
             contracts: sizing.contracts,
             notionalUSD: sizing.notionalUSD,
@@ -2638,6 +2730,7 @@ async function scanMarket() {
             leverage: dynamicLeverage,
             marginMode: config.MARGIN_MODE,
             tp1Hit: false,
+            breakEvenActivated: false,
             partiallyClosed: false,
             startTime: Date.now(),
             maxHoldHours: config.MAX_HOLD_HOURS,
@@ -2665,7 +2758,7 @@ async function scanMarket() {
           const safeSymbol = escapeHtml(symbol);
           const signalText = 
             `🚀 <b>NEUES SIGNAL: ${safeSymbol} (${direction})</b> [Score: ${signalScore}/100]\n` +
-            `Entry: $${entryPrice.toFixed(6)} | SL: $${stopLoss.toFixed(6)}\n` +
+            `Entry Zone: $${entryZoneLow.toFixed(6)} - $${entryZoneHigh.toFixed(6)} (Mitte: $${entryPrice.toFixed(6)}) | SL: $${stopLoss.toFixed(6)}\n` +
             `TP1: $${tp1.toFixed(6)} | TP2: $${tp2.toFixed(6)}\n` +
             `Größe: ${sizing.contracts} Kontrakte | Risk: $${sizing.riskAmountUSD.toFixed(2)}\n` +
             `ADX: ${adx} | Hurst: ${hurst} | CVD-Score: ${orderFlowEval.score}\n` +
