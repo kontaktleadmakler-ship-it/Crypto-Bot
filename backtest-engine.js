@@ -188,12 +188,8 @@ async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.en
     if(dailyPnL<=-cfg.MAX_DAILY_LOSS_USD)continue;
     const result=simulateSignal(sig,bars,nextIndex,cfg);result.signal.mlProbability=prob;trades.push(result);dailyPnL+=result.pnlUSD;equity+=result.pnlUSD;trainingRecords.push(makeModelRecord(result.signal,result.pnlUSD,result.closeTime));i=result.closeIndex;
   }
-  const m=metrics(trades,cfg.BACKTEST_STARTING_CAPITAL);return {symbol,days,dataBars:bars.length,dataLimitations:['Historical KuCoin OHLCV only','Funding rate is assumed 0 in backtest','Historical orderbook imbalance is unavailable and assumed neutral','Intrabar ordering uses conservative stop-first when SL and TP occur in the same candle'],signals,rawCandidates,trades:trades.length,mlAccepted,mlBlocked,mlRetrains,mlEnabled:useML,metrics:m,trades:trades.map(t=>({time:new Date(t.signal.entryTime||t.closeTime).toISOString(),direction:t.signal.direction,entry:t.entry,exit:t.exitPrice,pnlUSD:t.pnlUSD,reason:t.reason,mlProbability:t.signal.mlProbability||.5,signalScore:t.signal.signalScore}))};
+  const m=metrics(trades,cfg.BACKTEST_STARTING_CAPITAL);return {symbol,days,dataBars:bars.length,dataLimitations:['Historical KuCoin OHLCV only','Funding rate is assumed 0 in backtest','Historical orderbook imbalance is unavailable and assumed neutral','Intrabar ordering uses conservative stop-first when SL and TP occur in the same candle'],signals,rawCandidates,tradeCount:trades.length,mlAccepted,mlBlocked,mlRetrains,mlEnabled:useML,metrics:m,trades:trades.map(t=>({time:new Date(t.signal.entryTime||t.closeTime).toISOString(),direction:t.signal.direction,entry:t.entry,exit:t.exitPrice,pnlUSD:t.pnlUSD,reason:t.reason,mlProbability:t.signal.mlProbability||.5,signalScore:t.signal.signalScore}))};
 }
-
-module.exports={runBacktest,fetchKucoinCandles,buildConfig,metrics};
-
-// Füge dies in backtest-engine.js ein oder ergänze es:
 
 async function optimizeHyperparameters(symbol, days, baseConfig) {
   // Definition eines kleinen Suchraums (Grid Search)
@@ -239,4 +235,4 @@ async function optimizeHyperparameters(symbol, days, baseConfig) {
   return bestParams;
 }
 
-module.exports = { runBacktest, buildConfig, optimizeHyperparameters };
+module.exports = { runBacktest, fetchKucoinCandles, buildConfig, metrics, optimizeHyperparameters };
