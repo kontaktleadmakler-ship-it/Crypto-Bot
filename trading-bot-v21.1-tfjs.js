@@ -17,6 +17,7 @@ const { DeepQTheTradingAgent } = require('./rl-engine'); // <-- DQN Agent Modul 
 const { HedgeManager } = require('./hedgeManager');
 const { VolatilitySurfaceManager } = require('./volatilitySurface');
 const { OrderFlowAnalyzer } = require('./orderFlowAnalyzer');
+const { MacroFilterEngine } = require('./macroFilter'); // <-- Makro & Sentiment Filter (in v21.1 wiederhergestellt)
 const { runBacktest, buildConfig: buildBacktestConfig, optimizeHyperparameters } = require('./backtest-engine');
 
 // ==========================================
@@ -571,6 +572,7 @@ const dqnAgent = new DeepQTheTradingAgent({
 const hedgeManager = new HedgeManager({ logger, thresholdDropPct: -2.5 });
 const volManager = new VolatilitySurfaceManager({ logger });
 const orderFlowManager = new OrderFlowAnalyzer({ logger });
+const macroEngine = new MacroFilterEngine({ logger });
 
 let isModelTrained = false;
 let lastMLTrainingStats = null;
@@ -1007,6 +1009,7 @@ function checkGlobalDrawdown(currentEquity) {
   peakCapital = Math.max(peakCapital, currentEquity);
   const drawdown = peakCapital > 0 ? (peakCapital - currentEquity) / peakCapital * 100 : 0;
   if (drawdown > config.MAX_DRAWDOWN_PERCENT) {
+    sendDeduplicatedAlert('global_drawdown', `🔴 <b>MAX DRAWDOWN ERREICHT: ${drawdown.toFixed(1)}%!</b>\nBot wurde pausiert.`);
     isPaused = true;
     persistPauseState();
     persistPeakCapital();
@@ -2143,6 +2146,14 @@ async function scanMarket() {
     return;
   }
 
+  // Makro & Sentiment Check vor dem Scan ausführen
+  const macroStatus = await macroEngine.evaluateMacroEnvironment();
+  if (!macroStatus.safe) {
+    logger.warn(`⚠️ Scan wegen Makro-Risiko ausgesetzt (Sentiment: ${macroStatus.sentimentClass}, Wert: ${macroStatus.sentimentValue}).`);
+    isScanning = false;
+    return;
+  }
+
   const scanStats = createEmptyScanStats();
   const signalBatch = [];
 
@@ -2164,7 +2175,7 @@ async function scanMarket() {
     const adaptiveTP1 = config.TP1_MULT + adaptiveConfig.TP1_MULT_ADJ;
     const adaptiveVolume = config.MIN_RELATIVE_VOLUME * adaptiveConfig.VOLUME_MULT;
 
-    let adaptiveRisk = config.RISK_PERCENT;
+    let adaptiveRisk = config.RISK_PERCENT * macroStatus.riskMultiplier;
     if (config.ENABLE_KELLY_SIZING) {
       const weekStats = await getPeriodPerformanceStats(7).catch(() => null);
       if (weekStats && weekStats.totalTrades >= 20) {
@@ -2173,7 +2184,7 @@ async function scanMarket() {
           weekStats.avgWin, 
           Math.abs(weekStats.avgLoss), 
           config.RISK_PERCENT
-        ) * 100;
+        ) * 100 * macroStatus.riskMultiplier;
       }
     }
 
@@ -2192,7 +2203,7 @@ async function scanMarket() {
       }
     }
 
-    logger.info(`📊 Phase: ${currentMarketPhase} | ADX: ${adaptiveADX.toFixed(1)} | Risk: ${adaptiveRisk.toFixed(2)}%`);
+    logger.info(`📊 Phase: ${currentMarketPhase} | Sentiment: ${macroStatus.sentimentClass} (${macroStatus.sentimentValue}) | ADX: ${adaptiveADX.toFixed(1)} | Risk: ${adaptiveRisk.toFixed(2)}%`);
 
     const spotWatchlist = await getTopKucoinPairs(config.TOP_COIN_LIMIT).catch(() => ['BTC-USDT', 'ETH-USDT']);
     const dynamicWatchlist = contractSpecsCache.size > 0 
@@ -2756,7 +2767,7 @@ async function handleTelegramCommand(chatId, text) {
       let report = `📊 <b>BACKTEST ERGEBNIS (${result.symbol} | ${result.days} Tage)</b>\n`;
       report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
       report += `${emoji} <b>Net Profit: $${m.netProfit.toFixed(2)} (${m.returnPct.toFixed(2)}%)</b>\n`;
-      report += `• Ausgeführte Trades: ${result.trades} (Win-Rate: ${m.winRate.toFixed(2)}%)\n`;
+      report += `• Ausgeführte Trades: ${result.tradeCount} (Win-Rate: ${m.winRate.toFixed(2)}%)\n`;
       report += `• Profit Factor: ${Number.isFinite(m.profitFactor) ? m.profitFactor.toFixed(2) : '∞'}\n`;
       report += `• Max Drawdown: ${m.maxDrawdownPct.toFixed(2)}%\n`;
       report += `• Sharpe Ratio: ${m.sharpe.toFixed(2)}\n`;
