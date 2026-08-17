@@ -227,7 +227,15 @@ async function trainModelFromRecords(model,records,cfg){
     vx=tf.tensor2d(model.scaleMatrix(va.map(x=>x.f),scaler));
     vy=tf.tensor2d(va.map(x=>[x.y]));
     net=tf.sequential();
-    net.add(tf.layers.dense({inputShape:[17],units:32,activation:'relu',kernelInitializer:'heNormal'}));
+    // inputShape must match FEATURE_NAMES.length from ml-engine.js (19
+    // features, including spreadPct/volatilityRatio). This was hardcoded to
+    // 17 - a stale value from before those two features existed. Every
+    // xs/vx tensor built above is actually shape [n,19], so net.fit()
+    // threw a shape-mismatch error on every walk-forward retrain attempt;
+    // the catch block below swallowed it, so the backtest's ML layer
+    // silently stayed untrained (falling back to gate-only signals) for
+    // the entire run without surfacing an error to the user.
+    net.add(tf.layers.dense({inputShape:[model.buildFeatures().length],units:32,activation:'relu',kernelInitializer:'heNormal'}));
     net.add(tf.layers.dropout({rate:.15}));
     net.add(tf.layers.dense({units:16,activation:'relu'}));
     net.add(tf.layers.dense({units:8,activation:'relu'}));
