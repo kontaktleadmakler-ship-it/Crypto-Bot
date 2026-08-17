@@ -1,6 +1,6 @@
 {
   "name": "trading-signal-bot-v21.1-tfjs",
-  "version": "21.1.0",
+  "version": "22.0.0",
   "private": true,
   "description": "KuCoin futures trading signal bot with TensorFlow.js ML and walk-forward backtesting",
   "main": "trading-bot-v21.1-tfjs.js",
