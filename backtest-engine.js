@@ -212,7 +212,7 @@ async function fetchHistoricalFunding(symbol, startTime, endTime) {
 
 function applySlippage(price,direction,pct,side='entry'){const f=side==='entry'?(direction==='LONG'?1+pct/100:1-pct/100):(direction==='LONG'?1-pct/100:1+pct/100);return price*f;}
 function fee(notional,pct){return notional*pct/100;}
-function buildConfig(env={}){const n=(k,d)=>env[k]!==undefined?Number(env[k]):d;const b=(k,d)=>env[k]!==undefined?env[k]!=='false':d;return {CAPITAL_USD:n('CAPITAL_USD',10000),RISK_PERCENT:n('RISK_PERCENT',0.75),MAX_CONCURRENT_TRADES:n('MAX_CONCURRENT_TRADES',3),MAX_SAME_DIRECTION:n('MAX_SAME_DIRECTION',2),MAX_DAILY_LOSS_USD:n('MAX_DAILY_LOSS_USD',250),MAX_EXPOSURE_RATIO:n('MAX_EXPOSURE_RATIO',0.6),LEVERAGE:n('LEVERAGE',3),ATR_STOP_MULT:n('ATR_STOP_MULT',2.3),TP1_MULT:n('TP1_MULT',1.3),TP2_MULT:n('TP2_MULT',2.5),MAX_HOLD_HOURS:n('MAX_HOLD_HOURS',4),ABSOLUTE_MAX_HOLD_HOURS:n('ABSOLUTE_MAX_HOLD_HOURS',24),TRAILING_STOP_ENABLED:b('TRAILING_STOP_ENABLED',true),TRAILING_ATR_MULT:n('TRAILING_ATR_MULT',2.2),TP1_CLOSE_PERCENT:n('TP1_CLOSE_PERCENT',60),SLIPPAGE_PERCENT:n('SLIPPAGE_PERCENT',0.05),FEE_PERCENT:n('FEE_PERCENT',0.1),MAX_CHOP_INDEX:n('MAX_CHOP_INDEX',61.8),MIN_HURST_EXPONENT:n('MIN_HURST_EXPONENT',0.52),ADX_MIN:n('ADX_MIN',20),RSI_LONG_MIN:n('RSI_LONG_MIN',48),RSI_LONG_MAX:n('RSI_LONG_MAX',68),RSI_SHORT_MIN:n('RSI_SHORT_MIN',32),RSI_SHORT_MAX:n('RSI_SHORT_MAX',52),MIN_RELATIVE_VOLUME:n('MIN_RELATIVE_VOLUME',1.2),MIN_GATE_SCORE:n('MIN_GATE_SCORE',55),MIN_RRR:n('MIN_RRR',1.5),SWING_LOOKBACK:n('SWING_LOOKBACK',10),BOS_LOOKBACK:n('BOS_LOOKBACK',10),TREND_EMA_FAST_15M:n('TREND_EMA_FAST_15M',20),TREND_EMA_SLOW_15M:n('TREND_EMA_SLOW_15M',50),REQUIRE_4H_TREND:b('REQUIRE_4H_TREND',true),ALLOW_COUNTER_BTC_TREND:b('ALLOW_COUNTER_BTC_TREND',false),ENABLE_SHORT_SIGNALS:b('ENABLE_SHORT_SIGNALS',true),ML_MIN_PREDICTION_PROBABILITY:n('ML_MIN_PREDICTION_PROBABILITY',0.55),ML_ENABLED:b('ML_ENABLED',true),ML_MIN_TRAINING_SAMPLES:n('ML_MIN_TRAINING_SAMPLES',40),ML_EPOCHS:n('ML_EPOCHS',50),ML_BATCH_SIZE:n('ML_BATCH_SIZE',32),BACKTEST_STARTING_CAPITAL:n('BACKTEST_STARTING_CAPITAL',n('CAPITAL_USD',10000)),BACKTEST_MAX_TRAIN_TRADES:n('BACKTEST_MAX_TRAIN_TRADES',1000),BACKTEST_RETRAIN_EVERY_SIGNALS:n('BACKTEST_RETRAIN_EVERY_SIGNALS',25),BACKTEST_TRAIN_DAYS:n('BACKTEST_TRAIN_DAYS',30),BACKTEST_TEST_DAYS:n('BACKTEST_TEST_DAYS',7),BACKTEST_WARMUP_BARS:n('BACKTEST_WARMUP_BARS',300),BACKTEST_USE_ML:b('BACKTEST_USE_ML',true)};}
+function buildConfig(env={}){const n=(k,d)=>env[k]!==undefined?Number(env[k]):d;const b=(k,d)=>env[k]!==undefined?env[k]!=='false':d;return {CAPITAL_USD:n('CAPITAL_USD',10000),RISK_PERCENT:n('RISK_PERCENT',0.75),MAX_CONCURRENT_TRADES:n('MAX_CONCURRENT_TRADES',3),MAX_SAME_DIRECTION:n('MAX_SAME_DIRECTION',2),MAX_DAILY_LOSS_USD:n('MAX_DAILY_LOSS_USD',250),MAX_EXPOSURE_RATIO:n('MAX_EXPOSURE_RATIO',0.6),LEVERAGE:n('LEVERAGE',3),ATR_STOP_MULT:n('ATR_STOP_MULT',2.3),TP1_MULT:n('TP1_MULT',1.3),TP2_MULT:n('TP2_MULT',2.5),MAX_HOLD_HOURS:n('MAX_HOLD_HOURS',4),ABSOLUTE_MAX_HOLD_HOURS:n('ABSOLUTE_MAX_HOLD_HOURS',24),TRAILING_STOP_ENABLED:b('TRAILING_STOP_ENABLED',true),TRAILING_ATR_MULT:n('TRAILING_ATR_MULT',2.2),TP1_CLOSE_PERCENT:n('TP1_CLOSE_PERCENT',60),SLIPPAGE_PERCENT:n('SLIPPAGE_PERCENT',0.10),FEE_PERCENT:n('FEE_PERCENT',0.1),MAX_CHOP_INDEX:n('MAX_CHOP_INDEX',61.8),MIN_HURST_EXPONENT:n('MIN_HURST_EXPONENT',0.52),ADX_MIN:n('ADX_MIN',20),RSI_LONG_MIN:n('RSI_LONG_MIN',48),RSI_LONG_MAX:n('RSI_LONG_MAX',68),RSI_SHORT_MIN:n('RSI_SHORT_MIN',32),RSI_SHORT_MAX:n('RSI_SHORT_MAX',52),MIN_RELATIVE_VOLUME:n('MIN_RELATIVE_VOLUME',1.2),MIN_GATE_SCORE:n('MIN_GATE_SCORE',55),MIN_RRR:n('MIN_RRR',1.5),SWING_LOOKBACK:n('SWING_LOOKBACK',10),BOS_LOOKBACK:n('BOS_LOOKBACK',10),TREND_EMA_FAST_15M:n('TREND_EMA_FAST_15M',20),TREND_EMA_SLOW_15M:n('TREND_EMA_SLOW_15M',50),REQUIRE_4H_TREND:b('REQUIRE_4H_TREND',true),ALLOW_COUNTER_BTC_TREND:b('ALLOW_COUNTER_BTC_TREND',false),ENABLE_SHORT_SIGNALS:b('ENABLE_SHORT_SIGNALS',true),ML_MIN_PREDICTION_PROBABILITY:n('ML_MIN_PREDICTION_PROBABILITY',0.55),ML_ENABLED:b('ML_ENABLED',true),ML_MIN_TRAINING_SAMPLES:n('ML_MIN_TRAINING_SAMPLES',40),ML_EPOCHS:n('ML_EPOCHS',50),ML_BATCH_SIZE:n('ML_BATCH_SIZE',32),BACKTEST_STARTING_CAPITAL:n('BACKTEST_STARTING_CAPITAL',n('CAPITAL_USD',10000)),BACKTEST_MAX_TRAIN_TRADES:n('BACKTEST_MAX_TRAIN_TRADES',1000),BACKTEST_RETRAIN_EVERY_SIGNALS:n('BACKTEST_RETRAIN_EVERY_SIGNALS',25),BACKTEST_TRAIN_DAYS:n('BACKTEST_TRAIN_DAYS',30),BACKTEST_TEST_DAYS:n('BACKTEST_TEST_DAYS',7),BACKTEST_WARMUP_BARS:n('BACKTEST_WARMUP_BARS',300),BACKTEST_USE_ML:b('BACKTEST_USE_ML',true),HYPERPARAM_SEARCH_SAMPLES:n('HYPERPARAM_SEARCH_SAMPLES',60)};}
 
 function buildSnapshot(candles15, candles1h, candles4h, btcCandles, cfg){const closes15=candles15.map(c=>c.close),price=closes15.at(-1),t4=trend(candles4h,20,50),t1=trend(candles1h,20,50),t15=trend(candles15,cfg.TREND_EMA_FAST_15M,cfg.TREND_EMA_SLOW_15M),btc=trend(btcCandles,20,50),adx=calculateADX(candles15,14),hurst=calculateHurstExponent(closes15),rsi=calculateRSI(closes15,14),atr=calculateATR(candles15,14),poc=calculatePOC(candles15,30),vwap=calculateVWAP(candles15),macd=calculateMACD(closes15),b=bos(candles15,cfg.BOS_LOOKBACK),rv=relativeVolume(candles15,20),chop=choppiness(candles15,14),phase=detectMarketPhase(btc,calculateADX(btcCandles,14),btcCandles.at(-1)?.close?atr/candles15.at(-1).close:0),adaptive=adaptiveConfig(phase,cfg);return {price,trend4h:t4,trend1h:t1,trend15m:t15,btcTrend:btc,adx,hurst,rsi,atr,poc,vwap,macd,bosBullish:b.bosBullish,bosBearish:b.bosBearish,relativeVolume:rv,chop,marketPhase:phase,adaptive};}
 
@@ -437,46 +437,70 @@ async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.en
 }
 
 async function optimizeHyperparameters(symbol, days, baseConfig) {
-  // Definition eines kleinen Suchraums (Grid Search)
-  const learningRates = [0.0001, 0.001, 0.01];
-  const atrMultipliers = [2.0, 2.3, 2.6];
-  const adxMins = [15, 20, 25];
+  // Random Search: deutlich breiter als der alte 3x3-Grid und inkl. TP1/TP2.
+  // Ein fester Seed macht die Suche reproduzierbar, ohne den Suchraum zu
+  // deterministisch auf wenige Randwerte zu beschränken.
+  const samples = Math.max(50, Number(baseConfig.HYPERPARAM_SEARCH_SAMPLES || 60));
+  let seed = 0x9e3779b9;
+  const rand = () => {
+    seed |= 0;
+    seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const uniform = (min, max) => min + rand() * (max - min);
 
   let bestScore = -Infinity;
   let bestParams = null;
 
-  console.log(`🔍 Starte Hyperparameter-Optimierung für ${symbol}...`);
+  console.log(`🔍 Starte Random-Search für ${symbol}: ${samples} Kombinationen...`);
 
-  for (const lr of learningRates) {
-    for (const atrM of atrMultipliers) {
-      for (const adx of adxMins) {
-        // Test-Konfiguration anpassen
-        const testConfig = { 
-          ...baseConfig, 
-          ML_LEARNING_RATE: lr, 
-          ATR_STOP_MULT: atrM, 
-          ADX_MIN: adx 
+  for (let i = 0; i < samples; i++) {
+    const learningRate = 10 ** uniform(Math.log10(0.0001), Math.log10(0.01));
+    const atrMultiplier = uniform(1.8, 3.0);
+    const adxMin = uniform(15, 30);
+    const tp1Multiplier = uniform(1.0, 2.4);
+    const tp2Multiplier = uniform(Math.max(tp1Multiplier + 0.4, 1.8), 4.0);
+
+    const testConfig = {
+      ...baseConfig,
+      ML_LEARNING_RATE: learningRate,
+      ATR_STOP_MULT: atrMultiplier,
+      ADX_MIN: adxMin,
+      TP1_MULT: tp1Multiplier,
+      TP2_MULT: tp2Multiplier
+    };
+
+    try {
+      const result = await runBacktest({ symbol, days, cfg: testConfig, useML: true, walkForward: false });
+      const metrics = result.metrics;
+
+      // Sharpe + Profit, mit leichtem Drawdown-Penalty gegen überangepasste Runs.
+      const drawdownPenalty = Number.isFinite(metrics.maxDrawdownPct) ? metrics.maxDrawdownPct * 0.15 : 0;
+      const score = (metrics.sharpe * 2) +
+        (metrics.netProfit > 0 ? metrics.netProfit / 100 : -10) -
+        drawdownPenalty;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestParams = {
+          learningRate,
+          atrMultiplier,
+          adxMin,
+          tp1Multiplier,
+          tp2Multiplier,
+          score,
+          metrics
         };
-
-        try {
-          const result = await runBacktest({ symbol, days, cfg: testConfig, useML: true, walkForward: false });
-          const metrics = result.metrics;
-
-          // Bewerte anhand von Sharpe-Ratio und Net Profit (Score-Funktion)
-          const score = (metrics.sharpe * 2) + (metrics.netProfit > 0 ? metrics.netProfit / 100 : -10);
-
-          if (score > bestScore) {
-            bestScore = score;
-            bestParams = { learningRate: lr, atrMultiplier: atrM, adxMin: adx, metrics };
-          }
-        } catch (e) {
-          // Ignoriere fehlerhafte Kombinationen
-        }
+        console.log(`🔬 #${i + 1}/${samples}: neuer Bestwert ${score.toFixed(3)}`);
       }
+    } catch (e) {
+      // Fehlerhafte Kombinationen nicht die gesamte Suche abbrechen lassen.
     }
   }
 
-  console.log(`✅ Optimierung abgeschlossen. Beste Parameter gefunden:`, bestParams);
+  console.log(`✅ Random-Search abgeschlossen. Beste Parameter:`, bestParams);
   return bestParams;
 }
 
