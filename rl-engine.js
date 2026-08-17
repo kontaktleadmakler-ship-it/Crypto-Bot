@@ -232,7 +232,7 @@ class DeepQTheTradingAgent {
     try {
       if (!closedTradesCollection) return { trained: false, reason: 'no-db-collection' };
       
-      const trades = await closedTradesCollection.find({}).sort({ closeTime: -1 }).limit(500).toArray();
+      const trades = await closedTradesCollection.find({ isPartial: { $ne: true }, closeTime: { $exists: true } }).sort({ closeTime: -1 }).limit(500).toArray();
       if (trades.length < 10) return { trained: false, reason: 'not-enough-trades' };
 
       // Adaptives Epsilon basierend auf den jüngsten Trades anpassen
