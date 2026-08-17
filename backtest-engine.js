@@ -98,18 +98,11 @@ function calculateMACD(closes) {
   const sig=calculateEMASeries(macd,9), line=macd.at(-1), signal=sig.at(-1)||0;
   return {macd:line,signal,histogram:line-signal};
 }
-function calculateVWAP(candles) {
-  // candle.time from KuCoin futures kline is already epoch MILLISECONDS.
-  // Bug fixed: previous code divided the UTC day-start by 1000 (-> seconds)
-  // while candle.time stayed in ms, so the >= comparison was effectively
-  // always true and the "current session only" filter never actually reset.
-  if(!candles?.length) return 0;
-  const d=new Date(candles.at(-1).time);
-  const sessionStartMs=Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate());
-  const ws=candles.filter(c=>c.time>=sessionStartMs); let tpv=0,v=0;
-  for(const c of (ws.length?ws:candles)){const tp=(c.high+c.low+c.close)/3;tpv+=tp*c.volume;v+=c.volume;}
-  return v?tpv/v:candles.at(-1).close;
-}
+// Punkt 8 - VWAP-Konsistenz: Berechnung lebt jetzt ausschließlich in
+// ./vwap-calculator.js und wird von Live-Bot und Backtest-Engine gemeinsam
+// genutzt, damit beide bei identischen Eingabedaten bitgenau dasselbe Ergebnis
+// liefern.
+const { calculateVWAP } = require('./vwap-calculator');
 function calculatePOC(candles, lookback=30,binsCount=20){
   if(!candles||candles.length<lookback)return null; const s=candles.slice(-lookback), min=Math.min(...s.map(c=>c.low)), max=Math.max(...s.map(c=>c.high));
   const step=(max-min)/binsCount;if(!step)return min; const bins=new Array(binsCount).fill(0);
@@ -149,20 +142,20 @@ function hardGates(dir,p,cfg){
   return true;
 }
 
-// --- Soft gates: redundant/correlated confluence filters (ADX, Hurst, chop,
-// RSI zone, POC/VWAP location, MACD, relative volume) that were previously
-// chained as a rigid AND. Several of these measure overlapping information
-// (ADX, Hurst and Chop all proxy "is this trending"), so stacking them as
-// hard booleans rejected valid setups on noise. They now contribute a
-// weighted confluence score instead; a setup passes if it clears
-// cfg.MIN_GATE_SCORE (default 65/100).
+// --- Punkt 10 - Trend Quality Score: ADX, Hurst und Chop maßen bisher alle
+// "Trendstärke" getrennt (25+20+15 = 60% der maximal erreichbaren Punkte)
+// und verdoppelten damit effektiv dieselbe Information im Confluence-Score.
+// Sie werden jetzt zu einem einzigen gewichteten Score zusammengefasst:
+//   trendQuality = (adx/100 * 0.5) + (hurst * 0.3) + ((100-chop)/100 * 0.2)
+// Ergebnis liegt zwischen 0 und 1 und ersetzt die drei separaten Blöcke,
+// identisch zur Live-Bot-Logik in trading-bot-v21_1-tfjs.js.
 function gateScore(dir,p,cfg){
   const long=dir==='LONG';
   let score=0, max=0;
 
-  max+=25; if(p.adx>=p.adaptive.adx) score+=25; else score+=Math.max(0,25*(p.adx/p.adaptive.adx));
-  max+=20; if(p.hurst>=cfg.MIN_HURST_EXPONENT) score+=20; else score+=Math.max(0,20*(p.hurst/cfg.MIN_HURST_EXPONENT));
-  max+=15; if(p.chop<=cfg.MAX_CHOP_INDEX) score+=15; else score+=Math.max(0,15*(1-(p.chop-cfg.MAX_CHOP_INDEX)/cfg.MAX_CHOP_INDEX));
+  max+=60;
+  const trendQuality=Math.max(0,Math.min(1,(p.adx/100)*0.5+p.hurst*0.3+((100-p.chop)/100)*0.2));
+  score+=60*trendQuality;
 
   max+=15;
   const inRsiZone = long ? (p.rsi>=cfg.RSI_LONG_MIN&&p.rsi<=cfg.RSI_LONG_MAX) : (p.rsi>=cfg.RSI_SHORT_MIN&&p.rsi<=cfg.RSI_SHORT_MAX);
@@ -180,7 +173,7 @@ function gateScore(dir,p,cfg){
 
 function evaluateGates(dir,p,cfg){
   if(!hardGates(dir,p,cfg)) return false;
-  return gateScore(dir,p,cfg) >= (cfg.MIN_GATE_SCORE ?? 65);
+  return gateScore(dir,p,cfg) >= (cfg.MIN_GATE_SCORE ?? 55);
 }
 
 async function fetchKucoinCandles(symbol, timeframe='15m', days=30, opts={}){
@@ -196,9 +189,30 @@ async function fetchKucoinCandles(symbol, timeframe='15m', days=30, opts={}){
   const map=new Map();for(const c of all)map.set(c.time,c);return [...map.values()].sort((a,b)=>a.time-b.time);
 }
 
+// Punkt 9 - Historische Funding-Daten im Backtest: bisher wurde die Funding
+// Rate im Backtest hart auf 0 gesetzt, was die PnL-Berechnung bei längeren
+// Haltedauern verfälscht (Funding wird auf KuCoin Futures alle 8h fällig).
+// fetchHistoricalFunding lädt die tatsächlichen historischen Raten für den
+// Backtest-Zeitraum; fundingCostForPeriod ordnet sie den jeweiligen
+// Kerzen-Perioden zu und wird pro Bar in simulateSignal verrechnet.
+async function fetchHistoricalFunding(symbol, startTime, endTime) {
+  const futuresSymbol = symbol.split('-')[0] === 'BTC' ? 'XBTUSDTM' : `${symbol.split('-')[0]}USDTM`;
+  const url = `https://api-futures.kucoin.com/api/v1/contract/funding-rates?symbol=${futuresSymbol}&from=${startTime}&to=${endTime}`;
+  let res;
+  for (let a = 0; a < 4; a++) {
+    try { res = await axios.get(url, { timeout: 15000 }); break; }
+    catch (e) { if (a === 3) { return []; } await sleep(1000 * (a + 1)); }
+  }
+  const rows = res?.data?.data || [];
+  return rows
+    .map(r => ({ time: Number(r.timepoint ?? r.fundingTime ?? r.time), fundingRate: Number(r.fundingRate) }))
+    .filter(r => Number.isFinite(r.time) && Number.isFinite(r.fundingRate))
+    .sort((a, b) => a.time - b.time);
+}
+
 function applySlippage(price,direction,pct,side='entry'){const f=side==='entry'?(direction==='LONG'?1+pct/100:1-pct/100):(direction==='LONG'?1-pct/100:1+pct/100);return price*f;}
 function fee(notional,pct){return notional*pct/100;}
-function buildConfig(env={}){const n=(k,d)=>env[k]!==undefined?Number(env[k]):d;const b=(k,d)=>env[k]!==undefined?env[k]!=='false':d;return {CAPITAL_USD:n('CAPITAL_USD',10000),RISK_PERCENT:n('RISK_PERCENT',0.75),MAX_CONCURRENT_TRADES:n('MAX_CONCURRENT_TRADES',3),MAX_SAME_DIRECTION:n('MAX_SAME_DIRECTION',2),MAX_DAILY_LOSS_USD:n('MAX_DAILY_LOSS_USD',250),MAX_EXPOSURE_RATIO:n('MAX_EXPOSURE_RATIO',0.6),LEVERAGE:n('LEVERAGE',3),ATR_STOP_MULT:n('ATR_STOP_MULT',2.3),TP1_MULT:n('TP1_MULT',1.3),TP2_MULT:n('TP2_MULT',2.5),MAX_HOLD_HOURS:n('MAX_HOLD_HOURS',4),ABSOLUTE_MAX_HOLD_HOURS:n('ABSOLUTE_MAX_HOLD_HOURS',24),TRAILING_STOP_ENABLED:b('TRAILING_STOP_ENABLED',true),TRAILING_ATR_MULT:n('TRAILING_ATR_MULT',2.2),TP1_CLOSE_PERCENT:n('TP1_CLOSE_PERCENT',60),SLIPPAGE_PERCENT:n('SLIPPAGE_PERCENT',0.05),FEE_PERCENT:n('FEE_PERCENT',0.1),MAX_CHOP_INDEX:n('MAX_CHOP_INDEX',61.8),MIN_HURST_EXPONENT:n('MIN_HURST_EXPONENT',0.52),ADX_MIN:n('ADX_MIN',20),RSI_LONG_MIN:n('RSI_LONG_MIN',48),RSI_LONG_MAX:n('RSI_LONG_MAX',68),RSI_SHORT_MIN:n('RSI_SHORT_MIN',32),RSI_SHORT_MAX:n('RSI_SHORT_MAX',52),MIN_RELATIVE_VOLUME:n('MIN_RELATIVE_VOLUME',1.2),MIN_GATE_SCORE:n('MIN_GATE_SCORE',65),MIN_RRR:n('MIN_RRR',1.2),SWING_LOOKBACK:n('SWING_LOOKBACK',10),BOS_LOOKBACK:n('BOS_LOOKBACK',10),TREND_EMA_FAST_15M:n('TREND_EMA_FAST_15M',20),TREND_EMA_SLOW_15M:n('TREND_EMA_SLOW_15M',50),REQUIRE_4H_TREND:b('REQUIRE_4H_TREND',true),ALLOW_COUNTER_BTC_TREND:b('ALLOW_COUNTER_BTC_TREND',false),ENABLE_SHORT_SIGNALS:b('ENABLE_SHORT_SIGNALS',true),ML_MIN_PREDICTION_PROBABILITY:n('ML_MIN_PREDICTION_PROBABILITY',0.55),ML_ENABLED:b('ML_ENABLED',true),ML_MIN_TRAINING_SAMPLES:n('ML_MIN_TRAINING_SAMPLES',40),ML_EPOCHS:n('ML_EPOCHS',50),ML_BATCH_SIZE:n('ML_BATCH_SIZE',32),BACKTEST_STARTING_CAPITAL:n('BACKTEST_STARTING_CAPITAL',n('CAPITAL_USD',10000)),BACKTEST_MAX_TRAIN_TRADES:n('BACKTEST_MAX_TRAIN_TRADES',1000),BACKTEST_RETRAIN_EVERY_SIGNALS:n('BACKTEST_RETRAIN_EVERY_SIGNALS',25),BACKTEST_WARMUP_BARS:n('BACKTEST_WARMUP_BARS',300),BACKTEST_USE_ML:b('BACKTEST_USE_ML',true)};}
+function buildConfig(env={}){const n=(k,d)=>env[k]!==undefined?Number(env[k]):d;const b=(k,d)=>env[k]!==undefined?env[k]!=='false':d;return {CAPITAL_USD:n('CAPITAL_USD',10000),RISK_PERCENT:n('RISK_PERCENT',0.75),MAX_CONCURRENT_TRADES:n('MAX_CONCURRENT_TRADES',3),MAX_SAME_DIRECTION:n('MAX_SAME_DIRECTION',2),MAX_DAILY_LOSS_USD:n('MAX_DAILY_LOSS_USD',250),MAX_EXPOSURE_RATIO:n('MAX_EXPOSURE_RATIO',0.6),LEVERAGE:n('LEVERAGE',3),ATR_STOP_MULT:n('ATR_STOP_MULT',2.3),TP1_MULT:n('TP1_MULT',1.3),TP2_MULT:n('TP2_MULT',2.5),MAX_HOLD_HOURS:n('MAX_HOLD_HOURS',4),ABSOLUTE_MAX_HOLD_HOURS:n('ABSOLUTE_MAX_HOLD_HOURS',24),TRAILING_STOP_ENABLED:b('TRAILING_STOP_ENABLED',true),TRAILING_ATR_MULT:n('TRAILING_ATR_MULT',2.2),TP1_CLOSE_PERCENT:n('TP1_CLOSE_PERCENT',60),SLIPPAGE_PERCENT:n('SLIPPAGE_PERCENT',0.05),FEE_PERCENT:n('FEE_PERCENT',0.1),MAX_CHOP_INDEX:n('MAX_CHOP_INDEX',61.8),MIN_HURST_EXPONENT:n('MIN_HURST_EXPONENT',0.52),ADX_MIN:n('ADX_MIN',20),RSI_LONG_MIN:n('RSI_LONG_MIN',48),RSI_LONG_MAX:n('RSI_LONG_MAX',68),RSI_SHORT_MIN:n('RSI_SHORT_MIN',32),RSI_SHORT_MAX:n('RSI_SHORT_MAX',52),MIN_RELATIVE_VOLUME:n('MIN_RELATIVE_VOLUME',1.2),MIN_GATE_SCORE:n('MIN_GATE_SCORE',55),MIN_RRR:n('MIN_RRR',1.2),SWING_LOOKBACK:n('SWING_LOOKBACK',10),BOS_LOOKBACK:n('BOS_LOOKBACK',10),TREND_EMA_FAST_15M:n('TREND_EMA_FAST_15M',20),TREND_EMA_SLOW_15M:n('TREND_EMA_SLOW_15M',50),REQUIRE_4H_TREND:b('REQUIRE_4H_TREND',true),ALLOW_COUNTER_BTC_TREND:b('ALLOW_COUNTER_BTC_TREND',false),ENABLE_SHORT_SIGNALS:b('ENABLE_SHORT_SIGNALS',true),ML_MIN_PREDICTION_PROBABILITY:n('ML_MIN_PREDICTION_PROBABILITY',0.55),ML_ENABLED:b('ML_ENABLED',true),ML_MIN_TRAINING_SAMPLES:n('ML_MIN_TRAINING_SAMPLES',40),ML_EPOCHS:n('ML_EPOCHS',50),ML_BATCH_SIZE:n('ML_BATCH_SIZE',32),BACKTEST_STARTING_CAPITAL:n('BACKTEST_STARTING_CAPITAL',n('CAPITAL_USD',10000)),BACKTEST_MAX_TRAIN_TRADES:n('BACKTEST_MAX_TRAIN_TRADES',1000),BACKTEST_RETRAIN_EVERY_SIGNALS:n('BACKTEST_RETRAIN_EVERY_SIGNALS',25),BACKTEST_WARMUP_BARS:n('BACKTEST_WARMUP_BARS',300),BACKTEST_USE_ML:b('BACKTEST_USE_ML',true)};}
 
 function buildSnapshot(candles15, candles1h, candles4h, btcCandles, cfg){const closes15=candles15.map(c=>c.close),price=closes15.at(-1),t4=trend(candles4h,20,50),t1=trend(candles1h,20,50),t15=trend(candles15,cfg.TREND_EMA_FAST_15M,cfg.TREND_EMA_SLOW_15M),btc=trend(btcCandles,20,50),adx=calculateADX(candles15,14),hurst=calculateHurstExponent(closes15),rsi=calculateRSI(closes15,14),atr=calculateATR(candles15,14),poc=calculatePOC(candles15,30),vwap=calculateVWAP(candles15),macd=calculateMACD(closes15),b=bos(candles15,cfg.BOS_LOOKBACK),rv=relativeVolume(candles15,20),chop=choppiness(candles15,14),phase=detectMarketPhase(btc,calculateADX(btcCandles,14),btcCandles.at(-1)?.close?atr/candles15.at(-1).close:0),adaptive=adaptiveConfig(phase,cfg);return {price,trend4h:t4,trend1h:t1,trend15m:t15,btcTrend:btc,adx,hurst,rsi,atr,poc,vwap,macd,bosBullish:b.bosBullish,bosBearish:b.bosBearish,relativeVolume:rv,chop,marketPhase:phase,adaptive};}
 
@@ -207,7 +221,33 @@ function snapshotForDir(s,d){return {...s,direction:d};}
 
 function tradeFeatures(model,c){const price=c.price;return model.buildFeatures({adx:c.adx,rsi:c.rsi,relativeVolume:c.relativeVolume,signalScore:c.signalScore,atrPct:price?c.atr/price*100:0,hurst:c.hurst,macdHistogramPct:price?c.macd.histogram/price*100:0,pocDistancePct:c.poc&&price?(price-c.poc)/price*100:0,vwapDistancePct:c.vwap&&price?(price-c.vwap)/price*100:0,fundingRate:0,orderBookImbalance:1,trend4h:c.trend4h,trend1h:c.trend1h,trend15m:c.trend15m,btcTrend:c.btcTrend,direction:c.direction,marketPhase:c.marketPhase});}
 
-function makeModelRecord(signal, pnlUSD, closeTime){return {entry:signal.entry, pnlUSD, direction:signal.direction, adxAtEntry:signal.adx,rsiAtEntry:signal.rsi,relativeVolumeAtEntry:signal.relativeVolume,signalScore:signal.signalScore,atrAtEntry:signal.atr,hurstAtEntry:signal.hurst,macdHistogramAtEntry:signal.macd.histogram,pocDistancePctAtEntry:signal.poc&&signal.entry?(signal.entry-signal.poc)/signal.entry*100:0,vwapDistancePctAtEntry:signal.vwap&&signal.entry?(signal.entry-signal.vwap)/signal.entry*100:0,fundingRateAtEntry:0,orderBookImbalanceAtEntry:1,trend4hAtEntry:signal.trend4h,trend1hAtEntry:signal.trend1h,trend15mAtEntry:signal.trend15m,btcTrendAtEntry:signal.btcTrend,marketPhase:signal.marketPhase,closeTime};}
+// Punkt 6 - ML-Feature-Leakage: signal.entry ist der Fill-Preis der NÄCHSTEN
+// Kerze (nach Signalentscheidung, siehe runBacktest: sig.entry=bars[i+1].open)
+// und stand zum Zeitpunkt der Signalgenerierung noch nicht fest. Für die
+// Normalisierung von POC-/VWAP-Distanz sowie ATR%/MACD% muss stattdessen
+// signal.price (Schlusskurs der letzten abgeschlossenen 15m-Kerze zum
+// Entscheidungszeitpunkt) verwendet werden - identisch zur Live-Bot-Logik,
+// die currentPrice (nicht entryPrice) für dieselben Prozentwerte nutzt.
+function makeModelRecord(signal, pnlUSD, closeTime){
+  const p = signal.price;
+  return {
+    entry: signal.entry,
+    signalPriceAtEntry: p,
+    pnlUSD, direction: signal.direction,
+    adxAtEntry: signal.adx, rsiAtEntry: signal.rsi, relativeVolumeAtEntry: signal.relativeVolume,
+    signalScore: signal.signalScore,
+    atrAtEntry: signal.atr,
+    atrPctAtEntry: p ? (signal.atr / p) * 100 : 0,
+    hurstAtEntry: signal.hurst,
+    macdHistogramAtEntry: signal.macd.histogram,
+    macdHistogramPctAtEntry: p ? (signal.macd.histogram / p) * 100 : 0,
+    pocDistancePctAtEntry: signal.poc && p ? (p - signal.poc) / p * 100 : 0,
+    vwapDistancePctAtEntry: signal.vwap && p ? (p - signal.vwap) / p * 100 : 0,
+    fundingRateAtEntry: 0, orderBookImbalanceAtEntry: 1,
+    trend4hAtEntry: signal.trend4h, trend1hAtEntry: signal.trend1h, trend15mAtEntry: signal.trend15m,
+    btcTrendAtEntry: signal.btcTrend, marketPhase: signal.marketPhase, closeTime
+  };
+}
 
 async function trainModelFromRecords(model,records,cfg){
   if(!records||records.length<cfg.ML_MIN_TRAINING_SAMPLES)return false;
@@ -263,7 +303,7 @@ function predictWith(model,features){
   catch(e){ return { probability:0.5, class:'UNKNOWN', confidence:0, trained:false }; }
 }
 
-function simulateSignal(signal, bars, startIndex, cfg){
+function simulateSignal(signal, bars, startIndex, cfg, fundingHistory=[]){
   const entry=applySlippage(bars[startIndex].open,signal.direction,cfg.SLIPPAGE_PERCENT,'entry');
   const atrDist=signal.atr*signal.adaptive.atr;
 
@@ -291,7 +331,19 @@ function simulateSignal(signal, bars, startIndex, cfg){
   const tp1=signal.direction==='LONG'?entry+tp1Dist:entry-tp1Dist;
   const tp2=signal.direction==='LONG'?entry+tp2Dist:entry-tp2Dist;
   const riskPerUnit=Math.abs(entry-stop);const riskUSD=cfg.BACKTEST_STARTING_CAPITAL*(cfg.RISK_PERCENT/100);const units=riskPerUnit>0?riskUSD/riskPerUnit:0;let remaining=units,realized=0,tp1Hit=false,highest=entry,lowest=entry;const entryFee=fee(units*entry,cfg.FEE_PERCENT);let exitPrice=bars[startIndex].open,reason='end';let lastIndex=startIndex;
+  // Punkt 9: Zeiger auf die erste Funding-Periode NACH Trade-Eröffnung; jede
+  // Periode, die während der Haltedauer fällig wird, wird unten pro Bar
+  // verrechnet, sobald deren Zeitstempel erreicht ist.
+  let fundingIdx=0;
+  while(fundingIdx<fundingHistory.length && fundingHistory[fundingIdx].time<=bars[startIndex].time) fundingIdx++;
+  let fundingCostTotal=0;
   for(let i=startIndex;i<bars.length;i++){const b=bars[i];lastIndex=i;const hours=(b.time-bars[startIndex].time)/3600000;
+    while(fundingIdx<fundingHistory.length && fundingHistory[fundingIdx].time<=b.time){
+      const f=fundingHistory[fundingIdx];
+      const notional=remaining*entry;
+      const cost=signal.direction==='LONG'?f.fundingRate*notional:-f.fundingRate*notional;
+      realized-=cost;fundingCostTotal+=cost;fundingIdx++;
+    }
     if(!tp1Hit&&hours>=cfg.MAX_HOLD_HOURS){exitPrice=applySlippage(b.close,signal.direction,cfg.SLIPPAGE_PERCENT,'exit');realized+=(signal.direction==='LONG'?exitPrice-entry:entry-exitPrice)*remaining-fee(remaining*entry,cfg.FEE_PERCENT);reason='time-stop';break;}
     if(tp1Hit&&hours>=cfg.ABSOLUTE_MAX_HOLD_HOURS){exitPrice=applySlippage(b.close,signal.direction,cfg.SLIPPAGE_PERCENT,'exit');realized+=(signal.direction==='LONG'?exitPrice-entry:entry-exitPrice)*remaining-fee(remaining*entry,cfg.FEE_PERCENT);reason='absolute-time-limit';break;}
     if(tp1Hit){if(signal.direction==='LONG')highest=Math.max(highest,b.high);else lowest=Math.min(lowest,b.low);if(cfg.TRAILING_STOP_ENABLED){const atr=calculateATR(bars.slice(Math.max(0,i-20),i+1),14)||signal.atr;const cand=signal.direction==='LONG'?highest-atr*cfg.TRAILING_ATR_MULT:lowest+atr*cfg.TRAILING_ATR_MULT;if(signal.direction==='LONG')stop=Math.max(stop,cand);else stop=Math.min(stop,cand);}}
@@ -307,7 +359,7 @@ function simulateSignal(signal, bars, startIndex, cfg){
     }
   }
   if(lastIndex===bars.length-1&&reason==='end'){const b=bars.at(-1);exitPrice=applySlippage(b.close,signal.direction,cfg.SLIPPAGE_PERCENT,'exit');realized+=(signal.direction==='LONG'?exitPrice-entry:entry-exitPrice)*remaining-fee(remaining*entry,cfg.FEE_PERCENT)-entryFee*(remaining/units);}
-  return {pnlUSD:realized,entry,exitPrice,reason,closeTime:bars[lastIndex].time,closeIndex:lastIndex,barsHeld:lastIndex-startIndex+1,tp1Hit,signal};}
+  return {pnlUSD:realized,entry,exitPrice,reason,closeTime:bars[lastIndex].time,closeIndex:lastIndex,barsHeld:lastIndex-startIndex+1,tp1Hit,fundingCostUSD:fundingCostTotal,signal};}
 
 function metrics(trades,startingCapital){const pnls=trades.map(t=>t.pnlUSD),wins=pnls.filter(x=>x>0),losses=pnls.filter(x=>x<0),net=pnls.reduce((a,b)=>a+b,0);let equity=startingCapital,peak=equity,maxDD=0;for(const p of pnls){equity+=p;peak=Math.max(peak,equity);maxDD=Math.max(maxDD,(peak-equity)/peak*100);}const grossWin=wins.reduce((a,b)=>a+b,0),grossLoss=Math.abs(losses.reduce((a,b)=>a+b,0));const returns=pnls.map(p=>p/startingCapital);const avg=returns.length?returns.reduce((a,b)=>a+b,0)/returns.length:0;const sd=returns.length?Math.sqrt(returns.reduce((a,r)=>a+Math.pow(r-avg,2),0)/returns.length):0;return {trades:trades.length,wins:wins.length,losses:losses.length,winRate:trades.length?wins.length/trades.length*100:0,netProfit:net,endingCapital:startingCapital+net,returnPct:net/startingCapital*100,maxDrawdownPct:maxDD,profitFactor:grossLoss?grossWin/grossLoss:Infinity,avgWin:wins.length?grossWin/wins.length:0,avgLoss:losses.length?losses.reduce((a,b)=>a+b,0)/losses.length:0,expectancy:trades.length?net/trades.length:0,sharpe:sd?avg/sd*Math.sqrt(96*365):0,bestTrade:pnls.length?Math.max(...pnls):0,worstTrade:pnls.length?Math.min(...pnls):0};}
 
@@ -326,6 +378,16 @@ async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.en
   }
   if(!bars||bars.length<cfg.BACKTEST_WARMUP_BARS+100)throw new Error(`Zu wenige 15m-Kerzen: ${bars?.length||0}`);
   const btcBars=btc&&btc.length?btc:bars;
+  // Punkt 9: historische Funding-Raten für den gesamten Backtest-Zeitraum
+  // einmalig laden. Schlägt der Abruf fehl, fällt der Backtest auf 0
+  // (bisheriges Verhalten) zurück statt komplett abzubrechen.
+  let fundingHistory=[];
+  try{
+    fundingHistory=await fetchHistoricalFunding(symbol,bars[0].time,bars.at(-1).time+ONE_HOUR_MS);
+    logger.log(`💰 ${fundingHistory.length} historische Funding-Perioden geladen.`);
+  }catch(e){
+    logger.error?.(`[Backtest] Funding-Daten-Abruf fehlgeschlagen, verwende 0: ${e.message}`);
+  }
   const trades=[], trainingRecords=[];let equity=cfg.BACKTEST_STARTING_CAPITAL, dailyPnL=0,lastDay='',active=null,model=new TensorFlowSignalModel({minSamples:cfg.ML_MIN_TRAINING_SAMPLES,epochs:cfg.ML_EPOCHS,batchSize:cfg.ML_BATCH_SIZE,minPredictionProbability:cfg.ML_MIN_PREDICTION_PROBABILITY,logger});let mlAccepted=0,mlBlocked=0,signals=0,rawCandidates=0,mlRetrains=0;
   const tf1h=aggregate(bars,4),tf4h=aggregate(bars,16),btc1h=aggregate(btcBars,4),btc4h=aggregate(btcBars,16);
   const warm=cfg.BACKTEST_WARMUP_BARS;
@@ -361,9 +423,9 @@ async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.en
     if(!accepted)continue;
     // Enforce simple one-position-at-a-time and daily loss protection for a conservative single-symbol backtest.
     if(dailyPnL<=-cfg.MAX_DAILY_LOSS_USD)continue;
-    const result=simulateSignal(sig,bars,nextIndex,cfg);result.signal.mlProbability=prob;trades.push(result);dailyPnL+=result.pnlUSD;equity+=result.pnlUSD;trainingRecords.push(makeModelRecord(result.signal,result.pnlUSD,result.closeTime));i=result.closeIndex;
+    const result=simulateSignal(sig,bars,nextIndex,cfg,fundingHistory);result.signal.mlProbability=prob;trades.push(result);dailyPnL+=result.pnlUSD;equity+=result.pnlUSD;trainingRecords.push(makeModelRecord(result.signal,result.pnlUSD,result.closeTime));i=result.closeIndex;
   }
-  const m=metrics(trades,cfg.BACKTEST_STARTING_CAPITAL);return {symbol,days,dataBars:bars.length,dataLimitations:['Historical KuCoin OHLCV only','Funding rate is assumed 0 in backtest','Historical orderbook imbalance is unavailable and assumed neutral','Intrabar ordering uses conservative stop-first when SL and TP occur in the same candle'],signals,rawCandidates,tradeCount:trades.length,mlAccepted,mlBlocked,mlRetrains,mlEnabled:useML,metrics:m,trades:trades.map(t=>({time:new Date(t.signal.entryTime||t.closeTime).toISOString(),direction:t.signal.direction,entry:t.entry,exit:t.exitPrice,pnlUSD:t.pnlUSD,reason:t.reason,mlProbability:t.signal.mlProbability||.5,signalScore:t.signal.signalScore}))};
+  const m=metrics(trades,cfg.BACKTEST_STARTING_CAPITAL);return {symbol,days,dataBars:bars.length,dataLimitations:['Historical KuCoin OHLCV only',fundingHistory.length?`Historical funding rates applied (${fundingHistory.length} periods)`:'Funding rate history unavailable, assumed 0','Historical orderbook imbalance is unavailable and assumed neutral','Intrabar ordering uses conservative stop-first when SL and TP occur in the same candle'],signals,rawCandidates,tradeCount:trades.length,mlAccepted,mlBlocked,mlRetrains,mlEnabled:useML,metrics:m,trades:trades.map(t=>({time:new Date(t.signal.entryTime||t.closeTime).toISOString(),direction:t.signal.direction,entry:t.entry,exit:t.exitPrice,pnlUSD:t.pnlUSD,reason:t.reason,mlProbability:t.signal.mlProbability||.5,signalScore:t.signal.signalScore}))};
 }
 
 async function optimizeHyperparameters(symbol, days, baseConfig) {
@@ -410,4 +472,4 @@ async function optimizeHyperparameters(symbol, days, baseConfig) {
   return bestParams;
 }
 
-module.exports = { runBacktest, fetchKucoinCandles, buildConfig, metrics, optimizeHyperparameters };
+module.exports = { runBacktest, fetchKucoinCandles, fetchHistoricalFunding, buildConfig, metrics, optimizeHyperparameters };
