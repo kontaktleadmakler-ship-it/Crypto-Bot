@@ -2,7 +2,7 @@
 
 const axios = require('axios');
 const tf = require('@tensorflow/tfjs-node');
-const { TensorFlowSignalModel } = require('./ml-engine');
+const { TensorFlowSignalModel, FEATURE_NAMES } = require('./ml-engine');
 
 const FUTURES_GRANULARITY_MINUTES = { '1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440 };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -212,7 +212,7 @@ async function fetchHistoricalFunding(symbol, startTime, endTime) {
 
 function applySlippage(price,direction,pct,side='entry'){const f=side==='entry'?(direction==='LONG'?1+pct/100:1-pct/100):(direction==='LONG'?1-pct/100:1+pct/100);return price*f;}
 function fee(notional,pct){return notional*pct/100;}
-function buildConfig(env={}){const n=(k,d)=>env[k]!==undefined?Number(env[k]):d;const b=(k,d)=>env[k]!==undefined?env[k]!=='false':d;return {CAPITAL_USD:n('CAPITAL_USD',10000),RISK_PERCENT:n('RISK_PERCENT',0.75),MAX_CONCURRENT_TRADES:n('MAX_CONCURRENT_TRADES',3),MAX_SAME_DIRECTION:n('MAX_SAME_DIRECTION',2),MAX_DAILY_LOSS_USD:n('MAX_DAILY_LOSS_USD',250),MAX_EXPOSURE_RATIO:n('MAX_EXPOSURE_RATIO',0.6),LEVERAGE:n('LEVERAGE',3),ATR_STOP_MULT:n('ATR_STOP_MULT',2.3),TP1_MULT:n('TP1_MULT',1.3),TP2_MULT:n('TP2_MULT',2.5),MAX_HOLD_HOURS:n('MAX_HOLD_HOURS',4),ABSOLUTE_MAX_HOLD_HOURS:n('ABSOLUTE_MAX_HOLD_HOURS',24),TRAILING_STOP_ENABLED:b('TRAILING_STOP_ENABLED',true),TRAILING_ATR_MULT:n('TRAILING_ATR_MULT',2.2),TP1_CLOSE_PERCENT:n('TP1_CLOSE_PERCENT',60),SLIPPAGE_PERCENT:n('SLIPPAGE_PERCENT',0.05),FEE_PERCENT:n('FEE_PERCENT',0.1),MAX_CHOP_INDEX:n('MAX_CHOP_INDEX',61.8),MIN_HURST_EXPONENT:n('MIN_HURST_EXPONENT',0.52),ADX_MIN:n('ADX_MIN',20),RSI_LONG_MIN:n('RSI_LONG_MIN',48),RSI_LONG_MAX:n('RSI_LONG_MAX',68),RSI_SHORT_MIN:n('RSI_SHORT_MIN',32),RSI_SHORT_MAX:n('RSI_SHORT_MAX',52),MIN_RELATIVE_VOLUME:n('MIN_RELATIVE_VOLUME',1.2),MIN_GATE_SCORE:n('MIN_GATE_SCORE',55),MIN_RRR:n('MIN_RRR',1.2),SWING_LOOKBACK:n('SWING_LOOKBACK',10),BOS_LOOKBACK:n('BOS_LOOKBACK',10),TREND_EMA_FAST_15M:n('TREND_EMA_FAST_15M',20),TREND_EMA_SLOW_15M:n('TREND_EMA_SLOW_15M',50),REQUIRE_4H_TREND:b('REQUIRE_4H_TREND',true),ALLOW_COUNTER_BTC_TREND:b('ALLOW_COUNTER_BTC_TREND',false),ENABLE_SHORT_SIGNALS:b('ENABLE_SHORT_SIGNALS',true),ML_MIN_PREDICTION_PROBABILITY:n('ML_MIN_PREDICTION_PROBABILITY',0.55),ML_ENABLED:b('ML_ENABLED',true),ML_MIN_TRAINING_SAMPLES:n('ML_MIN_TRAINING_SAMPLES',40),ML_EPOCHS:n('ML_EPOCHS',50),ML_BATCH_SIZE:n('ML_BATCH_SIZE',32),BACKTEST_STARTING_CAPITAL:n('BACKTEST_STARTING_CAPITAL',n('CAPITAL_USD',10000)),BACKTEST_MAX_TRAIN_TRADES:n('BACKTEST_MAX_TRAIN_TRADES',1000),BACKTEST_RETRAIN_EVERY_SIGNALS:n('BACKTEST_RETRAIN_EVERY_SIGNALS',25),BACKTEST_WARMUP_BARS:n('BACKTEST_WARMUP_BARS',300),BACKTEST_USE_ML:b('BACKTEST_USE_ML',true)};}
+function buildConfig(env={}){const n=(k,d)=>env[k]!==undefined?Number(env[k]):d;const b=(k,d)=>env[k]!==undefined?env[k]!=='false':d;return {CAPITAL_USD:n('CAPITAL_USD',10000),RISK_PERCENT:n('RISK_PERCENT',0.75),MAX_CONCURRENT_TRADES:n('MAX_CONCURRENT_TRADES',3),MAX_SAME_DIRECTION:n('MAX_SAME_DIRECTION',2),MAX_DAILY_LOSS_USD:n('MAX_DAILY_LOSS_USD',250),MAX_EXPOSURE_RATIO:n('MAX_EXPOSURE_RATIO',0.6),LEVERAGE:n('LEVERAGE',3),ATR_STOP_MULT:n('ATR_STOP_MULT',2.3),TP1_MULT:n('TP1_MULT',1.3),TP2_MULT:n('TP2_MULT',2.5),MAX_HOLD_HOURS:n('MAX_HOLD_HOURS',4),ABSOLUTE_MAX_HOLD_HOURS:n('ABSOLUTE_MAX_HOLD_HOURS',24),TRAILING_STOP_ENABLED:b('TRAILING_STOP_ENABLED',true),TRAILING_ATR_MULT:n('TRAILING_ATR_MULT',2.2),TP1_CLOSE_PERCENT:n('TP1_CLOSE_PERCENT',60),SLIPPAGE_PERCENT:n('SLIPPAGE_PERCENT',0.05),FEE_PERCENT:n('FEE_PERCENT',0.1),MAX_CHOP_INDEX:n('MAX_CHOP_INDEX',61.8),MIN_HURST_EXPONENT:n('MIN_HURST_EXPONENT',0.52),ADX_MIN:n('ADX_MIN',20),RSI_LONG_MIN:n('RSI_LONG_MIN',48),RSI_LONG_MAX:n('RSI_LONG_MAX',68),RSI_SHORT_MIN:n('RSI_SHORT_MIN',32),RSI_SHORT_MAX:n('RSI_SHORT_MAX',52),MIN_RELATIVE_VOLUME:n('MIN_RELATIVE_VOLUME',1.2),MIN_GATE_SCORE:n('MIN_GATE_SCORE',55),MIN_RRR:n('MIN_RRR',1.5),SWING_LOOKBACK:n('SWING_LOOKBACK',10),BOS_LOOKBACK:n('BOS_LOOKBACK',10),TREND_EMA_FAST_15M:n('TREND_EMA_FAST_15M',20),TREND_EMA_SLOW_15M:n('TREND_EMA_SLOW_15M',50),REQUIRE_4H_TREND:b('REQUIRE_4H_TREND',true),ALLOW_COUNTER_BTC_TREND:b('ALLOW_COUNTER_BTC_TREND',false),ENABLE_SHORT_SIGNALS:b('ENABLE_SHORT_SIGNALS',true),ML_MIN_PREDICTION_PROBABILITY:n('ML_MIN_PREDICTION_PROBABILITY',0.55),ML_ENABLED:b('ML_ENABLED',true),ML_MIN_TRAINING_SAMPLES:n('ML_MIN_TRAINING_SAMPLES',40),ML_EPOCHS:n('ML_EPOCHS',50),ML_BATCH_SIZE:n('ML_BATCH_SIZE',32),BACKTEST_STARTING_CAPITAL:n('BACKTEST_STARTING_CAPITAL',n('CAPITAL_USD',10000)),BACKTEST_MAX_TRAIN_TRADES:n('BACKTEST_MAX_TRAIN_TRADES',1000),BACKTEST_RETRAIN_EVERY_SIGNALS:n('BACKTEST_RETRAIN_EVERY_SIGNALS',25),BACKTEST_TRAIN_DAYS:n('BACKTEST_TRAIN_DAYS',30),BACKTEST_TEST_DAYS:n('BACKTEST_TEST_DAYS',7),BACKTEST_WARMUP_BARS:n('BACKTEST_WARMUP_BARS',300),BACKTEST_USE_ML:b('BACKTEST_USE_ML',true)};}
 
 function buildSnapshot(candles15, candles1h, candles4h, btcCandles, cfg){const closes15=candles15.map(c=>c.close),price=closes15.at(-1),t4=trend(candles4h,20,50),t1=trend(candles1h,20,50),t15=trend(candles15,cfg.TREND_EMA_FAST_15M,cfg.TREND_EMA_SLOW_15M),btc=trend(btcCandles,20,50),adx=calculateADX(candles15,14),hurst=calculateHurstExponent(closes15),rsi=calculateRSI(closes15,14),atr=calculateATR(candles15,14),poc=calculatePOC(candles15,30),vwap=calculateVWAP(candles15),macd=calculateMACD(closes15),b=bos(candles15,cfg.BOS_LOOKBACK),rv=relativeVolume(candles15,20),chop=choppiness(candles15,14),phase=detectMarketPhase(btc,calculateADX(btcCandles,14),btcCandles.at(-1)?.close?atr/candles15.at(-1).close:0),adaptive=adaptiveConfig(phase,cfg);return {price,trend4h:t4,trend1h:t1,trend15m:t15,btcTrend:btc,adx,hurst,rsi,atr,poc,vwap,macd,bosBullish:b.bosBullish,bosBearish:b.bosBearish,relativeVolume:rv,chop,marketPhase:phase,adaptive};}
 
@@ -275,7 +275,7 @@ async function trainModelFromRecords(model,records,cfg){
     // the catch block below swallowed it, so the backtest's ML layer
     // silently stayed untrained (falling back to gate-only signals) for
     // the entire run without surfacing an error to the user.
-    net.add(tf.layers.dense({inputShape:[model.buildFeatures().length],units:32,activation:'relu',kernelInitializer:'heNormal'}));
+    net.add(tf.layers.dense({inputShape:[FEATURE_NAMES.length],units:32,activation:'relu',kernelInitializer:'heNormal'}));
     net.add(tf.layers.dropout({rate:.15}));
     net.add(tf.layers.dense({units:16,activation:'relu'}));
     net.add(tf.layers.dense({units:8,activation:'relu'}));
@@ -284,14 +284,14 @@ async function trainModelFromRecords(model,records,cfg){
     await net.fit(xs,ys,{epochs:cfg.ML_EPOCHS,batchSize:Math.min(cfg.ML_BATCH_SIZE,tr.length),validationData:[vx,vy],shuffle:false,verbose:0,callbacks:tf.callbacks.earlyStopping({monitor:'val_loss',patience:7,restoreBestWeight:true})});
     // Dispose the previous model's tensors before overwriting - the old
     // model.model reference would otherwise leak on every retrain cycle.
-    if(model.model && model.model!==net) model.model.dispose();
+    if(model.model && model.model!==net) { try { model.model.optimizer?.dispose?.(); } catch (_) {} try { model.model.dispose(); } catch (_) {} }
     model.model=net;
     model.scaler=scaler;
     model.trained=true;
     return true;
   }catch(e){
     console.error(`[Backtest ML] Training fehlgeschlagen, überspringe Retrain: ${e.message}`);
-    if(net && net!==model.model) net.dispose();
+    if(net && net!==model.model) { try { net.optimizer?.dispose?.(); } catch (_) {} try { net.dispose(); } catch (_) {} }
     return false;
   }finally{
     [xs,ys,vx,vy].forEach(t=>{try{t?.dispose();}catch(_){}});
@@ -326,7 +326,7 @@ function simulateSignal(signal, bars, startIndex, cfg, fundingHistory=[]){
   // ATR_STOP_MULT (2.3) that produced RRR ~0.57 - a structurally losing
   // setup even at >50% win rate. TP1 distance is now floored at
   // stopDist*cfg.MIN_RRR.
-  const tp1Dist=Math.max(stopDist*signal.adaptive.tp1, stopDist*cfg.MIN_RRR);
+  const actualStopDistance=Math.abs(entry-stop); const tp1Dist=Math.max(stopDist*signal.adaptive.tp1, actualStopDistance*cfg.MIN_RRR); if(actualStopDistance<=0 || (tp1Dist/actualStopDistance)<cfg.MIN_RRR) return {pnlUSD:0,entry,exitPrice:entry,reason:'rrr-below-minimum',closeTime:bars[startIndex].time,closeIndex:startIndex,barsHeld:0,tp1Hit:false,fundingCostUSD:0,signal};
   const tp2Dist=Math.max(stopDist*cfg.TP2_MULT, tp1Dist*1.3);
   const tp1=signal.direction==='LONG'?entry+tp1Dist:entry-tp1Dist;
   const tp2=signal.direction==='LONG'?entry+tp2Dist:entry-tp2Dist;
@@ -389,6 +389,7 @@ async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.en
     logger.error?.(`[Backtest] Funding-Daten-Abruf fehlgeschlagen, verwende 0: ${e.message}`);
   }
   const trades=[], trainingRecords=[];let equity=cfg.BACKTEST_STARTING_CAPITAL, dailyPnL=0,lastDay='',active=null,model=new TensorFlowSignalModel({minSamples:cfg.ML_MIN_TRAINING_SAMPLES,epochs:cfg.ML_EPOCHS,batchSize:cfg.ML_BATCH_SIZE,minPredictionProbability:cfg.ML_MIN_PREDICTION_PROBABILITY,logger});let mlAccepted=0,mlBlocked=0,signals=0,rawCandidates=0,mlRetrains=0;
+  let lastWalkForwardTestBucket=null;
   const tf1h=aggregate(bars,4),tf4h=aggregate(bars,16),btc1h=aggregate(btcBars,4),btc4h=aggregate(btcBars,16);
   const warm=cfg.BACKTEST_WARMUP_BARS;
   for(let i=warm;i<bars.length-1;i++){
@@ -407,8 +408,15 @@ async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.en
     let accepted=true,prob=.5;
     if(useML&&walkForward){
       try{
-        if(trainingRecords.length>=cfg.ML_MIN_TRAINING_SAMPLES && (trainingRecords.length===cfg.ML_MIN_TRAINING_SAMPLES || signals%cfg.BACKTEST_RETRAIN_EVERY_SIGNALS===0)){
-          if(await trainModelFromRecords(model,trainingRecords,cfg))mlRetrains++;
+        const testBucket=Math.floor(bar.time/(cfg.BACKTEST_TEST_DAYS*86400000));
+        if(lastWalkForwardTestBucket===null || testBucket!==lastWalkForwardTestBucket){
+          lastWalkForwardTestBucket=testBucket;
+          const trainCutoff=bar.time;
+          const trainStart=trainCutoff-cfg.BACKTEST_TRAIN_DAYS*86400000;
+          const rollingTrainingRecords=trainingRecords.filter(r=>r.closeTime<trainCutoff && r.closeTime>=trainStart);
+          if(rollingTrainingRecords.length>=cfg.ML_MIN_TRAINING_SAMPLES){
+            if(await trainModelFromRecords(model,rollingTrainingRecords,cfg))mlRetrains++;
+          }
         }
         if(model.trained){
           const f=tradeFeatures(model,sig),pred=predictWith(model,f);
