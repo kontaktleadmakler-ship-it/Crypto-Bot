@@ -55,6 +55,12 @@ function marketPhaseValue(value) {
   return 0;
 }
 
+function disposeModelSafely(model) {
+  if (!model) return;
+  try { model.optimizer?.dispose?.(); } catch (_) {}
+  try { model.dispose(); } catch (_) {}
+}
+
 class TensorFlowSignalModel {
   constructor(options = {}) {
     this.modelDir = path.resolve(options.modelDir || './models/signal-model');
@@ -202,7 +208,10 @@ class TensorFlowSignalModel {
     this.training = true;
     try {
       const force = !!options.force;
-      const trades = await collection.find({ isPartial: { $ne: true }, pnlUSD: { $exists: true } })
+      const cutoffTime = options.cutoffTime != null ? Number(options.cutoffTime) : null;
+      const query = { isPartial: { $ne: true }, pnlUSD: { $exists: true } };
+      if (Number.isFinite(cutoffTime)) query.closeTime = { $lt: cutoffTime };
+      const trades = await collection.find(query)
         .sort({ closeTime: 1 })
         .limit(this.maxSamples)
         .toArray();
@@ -287,7 +296,7 @@ class TensorFlowSignalModel {
               callbacks: tf.callbacks.earlyStopping({ monitor: 'val_loss', patience: 6, restoreBestWeight: true })
             });
           } catch (fitErr) {
-            candidateModel.dispose();
+            disposeModelSafely(candidateModel);
             continue;
           }
 
@@ -304,12 +313,12 @@ class TensorFlowSignalModel {
           if (acc > bestValAccuracy || (acc === bestValAccuracy && loss < bestValLoss)) {
             bestValAccuracy = acc;
             bestValLoss = loss;
-            if (bestCandidate) bestCandidate.dispose();
+            if (bestCandidate) disposeModelSafely(bestCandidate);
             bestCandidate = candidateModel;
             bestHistory = history;
             bestBestConfig = config;
           } else {
-            candidateModel.dispose();
+            disposeModelSafely(candidateModel);
           }
         }
       } finally {
@@ -326,7 +335,7 @@ class TensorFlowSignalModel {
       const oldAccuracy = finite(this.stats.validationAccuracy, 0);
       if (!force && this.trained && validationAccuracy + 0.02 < oldAccuracy) {
         this.logger.warn(`🧠 [TensorFlow.js] Neues getuntes Modell verworfen: Val-Accuracy ${(validationAccuracy * 100).toFixed(1)}% vs. aktuell ${(oldAccuracy * 100).toFixed(1)}%.`);
-        bestCandidate.dispose();
+        disposeModelSafely(bestCandidate);
         return { trained: false, reason: 'candidate-model-worse', validationAccuracy, oldAccuracy };
       }
 
@@ -336,7 +345,7 @@ class TensorFlowSignalModel {
       // model is retrained repeatedly over the bot's lifetime, so the leak
       // was cumulative and eventually crashed the Node process.
       if (this.model && this.model !== bestCandidate) {
-        this.model.dispose();
+        disposeModelSafely(this.model);
         this.model = null;
       }
       this.model = bestCandidate;
@@ -366,6 +375,7 @@ class TensorFlowSignalModel {
       return { trained: false, reason: e.message };
     } finally {
       this.training = false;
+      try { await tf.nextFrame(); } catch (_) {}
     }
   }
 
