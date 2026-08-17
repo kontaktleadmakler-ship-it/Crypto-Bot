@@ -545,9 +545,25 @@ const client = new MongoClient(config.MONGODB_URI, {
   family: 4
 });
 
+// Bug fixed: previously isDbConnected only ever flipped to false inside
+// initDatabase()'s own catch block, i.e. on the very first connection
+// attempt. A connection that dropped later at runtime (network blip,
+// Atlas maintenance, etc.) was never detected - isDbConnected stayed
+// (wrongly) true and every DB write would keep silently failing/queuing.
+// These listeners catch that case and kick off the reconnect loop below.
+client.on('close', () => {
+  if (isShuttingDown) return;
+  if (isDbConnected) logger.warn('🔴 MongoDB-Verbindung unerwartet geschlossen.');
+  isDbConnected = false;
+  scheduleDbReconnect();
+});
+client.on('error', (err) => {
+  logger.error(`🔴 MongoDB-Client-Fehler: ${err.message}`);
+});
+
 let tradesCollection, closedTradesCollection, botStateCollection, lockCollection, marketPhaseLogsCollection, filterChangeLogCollection;
 const activeTrades = new Map();
-let isDbConnected = false, dbReconnectInterval = null, pendingClosedTrades = [];
+let isDbConnected = false, dbReconnectInterval = null, pendingClosedTrades = [], isReconnecting = false;
 const priceFailureCounts = new Map();
 let isPaused = false, lastScanTime = null, lastTrackerCheckTime = null;
 let trackerLock = false, trackerTimeout = null;
@@ -886,7 +902,33 @@ async function initDatabase() {
   } catch (e) {
     logger.error(`🔴 Datenbank-Verbindungsfehler: ${e.message}`);
     isDbConnected = false;
+    scheduleDbReconnect();
   }
+}
+
+// Starts (if not already running) a periodic retry loop that tries to
+// re-establish the MongoDB connection every 5s. Only one interval is ever
+// active at a time; initDatabase()'s success path clears it once a
+// reconnect succeeds, so this loop is self-terminating. Scans and the
+// tracker already refuse to run while isDbConnected is false (see
+// scanMarket()'s isDbConnected/isPaused guard), so no trading decisions
+// are made off a stale/disconnected DB state while this is in progress.
+function scheduleDbReconnect() {
+  if (dbReconnectInterval || isShuttingDown) return;
+  logger.warn('🔁 Starte MongoDB-Reconnect-Versuche (alle 5s)...');
+  dbReconnectInterval = setInterval(() => { ensureDbConnection(); }, 5000);
+}
+
+async function ensureDbConnection() {
+  if (isDbConnected || isReconnecting || isShuttingDown) return isDbConnected;
+  isReconnecting = true;
+  try {
+    await initDatabase();
+    if (isDbConnected) logger.info('✅ MongoDB-Reconnect erfolgreich.');
+  } finally {
+    isReconnecting = false;
+  }
+  return isDbConnected;
 }
 
 async function loadDailyPnLState() {
@@ -1415,6 +1457,8 @@ async function fetchKucoinKlines(symbol, timeframe = '15m', limit = 100) {
   } catch (e) {}
   return null;
 }
+
+const ONE_HOUR_MS = 3600000, FOUR_HOUR_MS = 14400000;
 
 function deriveHigherTimeframes(candles15m, targetTimeframe) {
   if (!candles15m || candles15m.length < 4) return null;
@@ -2338,13 +2382,23 @@ async function scanMarket() {
           return; 
         }
 
-        const raw1h = config.ENABLE_MULTI_TF_DERIVATION 
+        let raw1h = config.ENABLE_MULTI_TF_DERIVATION 
           ? deriveHigherTimeframes(raw15m, '1h') 
           : await fetchKucoinKlinesCached(symbol, '1h', 50);
 
         if (!raw1h) { 
           scanStats.missingKlines++; 
           return; 
+        }
+        // Explicit closed-candle guard: only use HTF candles whose full
+        // window has already elapsed. raw15m already excludes the
+        // still-forming 15m candle (see fetchKucoinKlines), so every
+        // derived group is inherently closed - this is defense-in-depth
+        // against a future change upstream reintroducing a partial candle.
+        raw1h = raw1h.filter(c => c.time + ONE_HOUR_MS <= Date.now());
+        if (raw1h.length === 0) {
+          scanStats.missingKlines++;
+          return;
         }
 
         let raw4h = null;
@@ -2357,6 +2411,7 @@ async function scanMarket() {
           } else {
             raw4h = await fetchKucoinKlinesCached(symbol, '4h', 50);
           }
+          if (raw4h) raw4h = raw4h.filter(c => c.time + FOUR_HOUR_MS <= Date.now());
         }
 
         const futuresData = await fetchFuturesData(symbol).catch(() => null);
@@ -3574,6 +3629,7 @@ async function gracefulShutdown(signal) {
   intervalTimers.forEach(t => clearInterval(t));
   if (dbBulkTimer) clearInterval(dbBulkTimer);
   if (lockHeartbeatInterval) clearInterval(lockHeartbeatInterval);
+  if (dbReconnectInterval) { clearInterval(dbReconnectInterval); dbReconnectInterval = null; }
   await processDbBulkQueue();
   server.close();
   await releaseInstanceLock();
