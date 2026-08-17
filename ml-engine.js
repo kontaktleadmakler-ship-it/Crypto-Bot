@@ -321,6 +321,14 @@ class TensorFlowSignalModel {
         return { trained: false, reason: 'candidate-model-worse', validationAccuracy, oldAccuracy };
       }
 
+      // Memory leak fix: without this, every successful retrain orphaned the
+      // previous tf.LayersModel's tensors (weights, optimizer state) on the
+      // heap - tf.js does not garbage-collect them automatically, and this
+      // model is retrained repeatedly over the bot's lifetime, so the leak
+      // was cumulative and eventually crashed the Node process.
+      if (this.model && this.model !== bestCandidate) {
+        this.model.dispose();
+      }
       this.model = bestCandidate;
       this.scaler = scaler;
       this.trained = true;
@@ -394,11 +402,17 @@ class TensorFlowSignalModel {
     }
 
     const scaled = this.scaleMatrix([features], this.scaler)[0];
-    const input = tf.tensor2d([scaled], [1, FEATURE_NAMES.length]);
-    const output = this.model.predict(input);
-    const probability = clamp(output.dataSync()[0], 0, 1);
-    input.dispose();
-    output.dispose();
+    let input, output, probability;
+    try {
+      input = tf.tensor2d([scaled], [1, FEATURE_NAMES.length]);
+      output = this.model.predict(input);
+      probability = clamp(output.dataSync()[0], 0, 1);
+    } finally {
+      // try/finally so a prediction error can't leak the input/output
+      // tensors (dataSync can throw on a disposed/invalid model).
+      input?.dispose();
+      output?.dispose();
+    }
 
     const confidence = Math.abs(probability - 0.5) * 2;
     const className = probability >= this.strongSignalProbability
