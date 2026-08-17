@@ -205,10 +205,22 @@ const configTelegram = {
 };
 
 let telegramQueue = Promise.resolve();
-
+const telegramSendTimes = [];
+const TELEGRAM_MAX_MESSAGES_PER_MINUTE = 20;
+async function enforceTelegramRateLimit() {
+  let now = Date.now();
+  while (telegramSendTimes.length && now - telegramSendTimes[0] >= 60000) telegramSendTimes.shift();
+  if (telegramSendTimes.length >= TELEGRAM_MAX_MESSAGES_PER_MINUTE) {
+    await sleep(Math.max(0, 60000 - (now - telegramSendTimes[0]) + 25));
+    now = Date.now();
+    while (telegramSendTimes.length && now - telegramSendTimes[0] >= 60000) telegramSendTimes.shift();
+  }
+  telegramSendTimes.push(Date.now());
+}
 function queueTelegramMessage(taskFn) {
   telegramQueue = telegramQueue.then(async () => {
     try {
+      await enforceTelegramRateLimit();
       await taskFn();
     } catch (e) {}
   });
@@ -480,7 +492,7 @@ const config = {
   // verschiebt sich die Punkteverteilung leicht; Standard-Schwelle von
   // 65 auf 55 abgesenkt, um dieselbe relative Strenge beizubehalten.
   MIN_GATE_SCORE: parseFloat(process.env.MIN_GATE_SCORE) || 55,
-  MIN_RRR: parseFloat(process.env.MIN_RRR) || 1.2,
+  MIN_RRR: 1.5,
 
   ML_ENABLED: process.env.ML_ENABLED !== 'false',
   ML_MIN_TRAINING_SAMPLES: parseInt(process.env.ML_MIN_TRAINING_SAMPLES, 10) || 40,
@@ -492,7 +504,7 @@ const config = {
   ML_BATCH_SIZE: parseInt(process.env.ML_BATCH_SIZE, 10) || 32,
   
   // DQN spezifische Config
-  DQN_ENABLED: process.env.DQN_ENABLED !== 'false',
+  DQN_ENABLED: false,
 };
 
 function validateConfig() {
@@ -628,11 +640,11 @@ async function trainSignalMLModel(force = false) {
   if (!config.ML_ENABLED) return { trained: false, reason: 'disabled' };
   if (!closedTradesCollection || !isDbConnected) return { trained: false, reason: 'db-unavailable' };
   try {
-    const result = await mlModel.trainFromTrades(closedTradesCollection, { force });
+    const result = await mlModel.trainFromTrades(closedTradesCollection, { force, cutoffTime: Date.now() });
     isModelTrained = !!result.trained;
     lastMLTrainingStats = result;
 
-    if (config.DQN_ENABLED) {
+    if (false) {
       await dqnAgent.trainFromClosedTrades(closedTradesCollection);
     }
 
@@ -650,7 +662,7 @@ async function loadSignalMLModel() {
     isModelTrained = loaded;
     if (loaded) lastMLTrainingStats = mlModel.getStats();
     
-    if (config.DQN_ENABLED) {
+    if (false) {
       await dqnAgent.init();
     }
 
@@ -679,6 +691,7 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
       const startTime = Date.now();
       const response = await axios.get(url, { timeout: options.timeout || 5000, ...options });
       apiLatencyStats.record('kucoin', Date.now() - startTime);
+      if (response.data?.code && response.data.code !== '200000') logger.warn(`[KuCoin API] Fehlercode ${response.data.code} für ${url}`);
       kucoinErrorCount = 0;
       return response;
     } catch (error) {
@@ -1156,12 +1169,13 @@ function canOpenNewTrade(activeTradesCount, direction, notionalUSD = 0) {
   return { allowed: true, reason: null };
 }
 
-function calculatePositionSize(entryPrice, stopLossPrice, capitalUSD, riskPercent) {
+function calculatePositionSize(entryPrice, stopLossPrice, capitalUSD, riskPercent, leverage = config.LEVERAGE) {
   const riskAmountUSD = capitalUSD * (riskPercent / 100);
-  const riskPerUnit = Math.abs(entryPrice - stopLossPrice);
-  if (riskPerUnit <= 0) return { positionSizeUnits: 0, notionalUSD: 0, riskAmountUSD: 0 };
-  const positionSizeUnits = riskAmountUSD / riskPerUnit;
-  const notionalUSD = positionSizeUnits * entryPrice;
+  const stopDistance = Math.abs(entryPrice - stopLossPrice);
+  if (stopDistance <= 0 || entryPrice <= 0 || leverage <= 0) return { positionSizeUnits: 0, notionalUSD: 0, riskAmountUSD: 0 };
+  const stopPct = stopDistance / entryPrice;
+  const notionalUSD = (riskAmountUSD / stopPct) * leverage;
+  const positionSizeUnits = notionalUSD / entryPrice;
   return { positionSizeUnits, notionalUSD, riskAmountUSD };
 }
 
@@ -1303,11 +1317,11 @@ function calculateHurstExponent(prices) {
   // statistically correct approach (multiple window sizes, log-log
   // regression of R/S vs. window size -> the slope is the Hurst exponent).
   // Live and backtest now compute Hurst identically.
-  if (!prices || prices.length < 50) return 0.5;
+  if (!prices || prices.length < 80) return 0.5;
   const returns = [];
   for (let i = 1; i < prices.length; i++) returns.push(Math.log(prices[i] / prices[i - 1]));
 
-  const sizes = [8, 16, 32].filter(s => s < returns.length / 2);
+  const sizes = [8, 16, 32, 64].filter(s => s < returns.length / 2);
   if (sizes.length < 2) return 0.5;
 
   const points = [];
@@ -1654,7 +1668,7 @@ async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
   const now = Date.now();
   const cacheKey = `${symbol}_${timeframe}`;
   const cached = klinesCache.get(cacheKey);
-  if (cached && cached.timeframe === timeframe && (now - cached.timestamp) < 55000) {
+  if (cached && cached.timeframe === timeframe && (now - cached.timestamp) < 120000) {
     return cached.candles;
   }
   const candles = await fetchKucoinKlines(symbol, timeframe, limit);
@@ -2028,7 +2042,7 @@ async function checkActiveTrades() {
         // gesetzt - nicht exakt auf Entry, damit normales Rauschen den Trade
         // nicht sofort wieder ausstoppt.
         if (!trade.tp1Hit && !trade.breakEvenActivated) {
-          const beDistance = (trade.atrAtEntry || 0) * 0.5;
+          const beDistance = (trade.atrAtEntry || 0) * 1.2;
           const beTrail = (trade.atrAtEntry || 0) * 0.1;
           if (beDistance > 0) {
             const beLevel = trade.direction === 'LONG' ? trade.entry + beDistance : trade.entry - beDistance;
@@ -2285,7 +2299,7 @@ function createEmptyScanStats() {
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0
+    timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0, rrrBelowMinimum: 0
   };
 }
 
@@ -2311,6 +2325,16 @@ function loadNewsEvents() {
 }
 
 const newsEvents = loadNewsEvents();
+async function refreshNewsEvents() {
+  const feedUrl = process.env.FOREXFACTORY_API_URL || 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';
+  try {
+    const response = await axios.get(feedUrl, { timeout: 8000 });
+    if (!Array.isArray(response.data)) return;
+    const imported = response.data.filter(e => String(e.impact || '').toUpperCase() === 'HIGH').map(e => Date.parse(e.date || e.datetime || e.timestamp)).filter(Number.isFinite);
+    newsEvents.splice(0, newsEvents.length, ...imported);
+    logger.info(`📰 ${imported.length} HIGH-Impact-News-Events automatisch geladen.`);
+  } catch (e) { logger.warn(`[News] Auto-Import fehlgeschlagen: ${e.message}`); }
+}
 
 function isNewsBlackout(now = Date.now()) {
   return newsEvents.some(t => now >= t - NEWS_BLACKOUT_BEFORE_MS && now <= t + NEWS_BLACKOUT_AFTER_MS);
@@ -2322,10 +2346,23 @@ async function scanMarket() {
   lastScanTime = Date.now();
   logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.7 (mit DQN)...`);
 
-  if (!isDbConnected || isPaused) {
-    logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
+  if (isPaused) {
+    logger.warn('⚠️ Scan abgebrochen: Bot pausiert.');
     isScanning = false;
     return;
+  }
+  if (!isDbConnected) {
+    let dbReady = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try { dbReady = await ensureDbConnection(); } catch (e) { logger.warn(`[DB] Scan-Reconnect Versuch ${attempt}/3 fehlgeschlagen: ${e.message}`); }
+      if (dbReady) break;
+      if (attempt < 3) await sleep(1000 * attempt);
+    }
+    if (!dbReady) {
+      logger.warn('⚠️ Scan abgebrochen: MongoDB nach 3 Retries nicht verfügbar.');
+      isScanning = false;
+      return;
+    }
   }
 
   const scanStats = createEmptyScanStats();
@@ -2665,12 +2702,13 @@ async function scanMarket() {
           // Enforce a minimum risk:reward ratio on TP1. With the default
           // TP1_MULT (1.3) vs ATR_STOP_MULT (2.3) this previously produced
           // RRR ~0.57 - a structurally losing setup even at >50% win rate.
-          const tp1Distance = Math.max(stopDistance * adaptiveTP1, stopDistance * config.MIN_RRR);
+          const actualStopDistance = Math.abs(entryPrice - stopLoss); const tp1Distance = Math.max(stopDistance * adaptiveTP1, actualStopDistance * config.MIN_RRR); if (actualStopDistance <= 0 || (tp1Distance / actualStopDistance) < config.MIN_RRR) { scanStats.rrrBelowMinimum = (scanStats.rrrBelowMinimum || 0) + 1; return; }
           const tp2Distance = Math.max(stopDistance * config.TP2_MULT, tp1Distance * 1.3);
           const tp1 = direction === 'LONG' ? entryPrice + tp1Distance : entryPrice - tp1Distance;
           const tp2 = direction === 'LONG' ? entryPrice + tp2Distance : entryPrice - tp2Distance;
 
-          const rawSizing = calculatePositionSize(entryPrice, stopLoss, config.CAPITAL_USD, adaptiveRisk);
+          const dynamicLeverage = calculateDynamicLeverage(atr, currentPrice, config.LEVERAGE);
+           const rawSizing = calculatePositionSize(entryPrice, stopLoss, config.CAPITAL_USD, adaptiveRisk, dynamicLeverage);
           const contractSizing = roundToContractSize(rawSizing.positionSizeUnits, symbol);
 
           if (!contractSizing) {
@@ -2698,8 +2736,6 @@ async function scanMarket() {
           signalsSent++;
           scanStats.signalsSent++;
           scanStats.totalSignalScore += signalScore;
-
-          const dynamicLeverage = calculateDynamicLeverage(atr, currentPrice, config.LEVERAGE);
 
           await upsertTrade(symbol, {
             symbol, direction, entry: entryPrice, stopLoss, tp1, tp2,
