@@ -124,7 +124,16 @@ class TensorFlowSignalModel {
   }
 
   featuresFromTrade(trade) {
-    const currentPrice = finite(trade.entry, 0);
+    // Bug fix (Punkt 6 - ML-Feature-Leakage): trade.entry ist der tatsächliche
+    // Fill-Preis, der erst NACH Signalentscheidung und Slippage feststeht.
+    // Für die Normalisierung von ATR%/MACD%/POC%/VWAP% muss stattdessen der
+    // Preis zum Zeitpunkt der Signalgenerierung (signalPriceAtEntry) verwendet
+    // werden, sonst lernt das Modell auf leicht verschobenen, zum
+    // Entscheidungszeitpunkt nicht verfügbaren Werten. Fällt auf trade.entry
+    // zurück, falls ältere Trade-Datensätze das Feld noch nicht besitzen.
+    const currentPrice = trade.signalPriceAtEntry != null
+      ? finite(trade.signalPriceAtEntry, 0)
+      : finite(trade.entry, 0);
     const atrPct = trade.atrPctAtEntry != null
       ? finite(trade.atrPctAtEntry, 0)
       : (currentPrice > 0 && trade.atrAtEntry ? (finite(trade.atrAtEntry) / currentPrice) * 100 : 0);
