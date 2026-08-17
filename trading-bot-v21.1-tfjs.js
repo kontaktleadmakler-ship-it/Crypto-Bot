@@ -475,6 +475,8 @@ const config = {
   MAX_SPREAD_PERCENT: parseFloat(process.env.MAX_SPREAD_PERCENT) || 0.15,
   MAX_CHOP_INDEX: parseFloat(process.env.MAX_CHOP_INDEX) || 61.8,
   MIN_HURST_EXPONENT: parseFloat(process.env.MIN_HURST_EXPONENT) || 0.52,
+  MIN_GATE_SCORE: parseFloat(process.env.MIN_GATE_SCORE) || 65,
+  MIN_RRR: parseFloat(process.env.MIN_RRR) || 1.2,
 
   ML_ENABLED: process.env.ML_ENABLED !== 'false',
   ML_MIN_TRAINING_SAMPLES: parseInt(process.env.ML_MIN_TRAINING_SAMPLES, 10) || 40,
@@ -1193,6 +1195,17 @@ function calculateATR(candles, period = 14) {
   return tr.slice(-period).reduce((a, b) => a + b, 0) / period;
 }
 
+// Finds the most recent swing low/high over `lookback` closed candles
+// (excludes the current, still-forming candle) to anchor the stop-loss to
+// real market structure instead of a rigid ATR multiple.
+function findSwingStop(candles, direction, lookback = 10) {
+  if (!candles || candles.length < lookback + 1) return null;
+  const sample = candles.slice(-lookback - 1, -1);
+  return direction === 'LONG'
+    ? Math.min(...sample.map(c => c.low))
+    : Math.max(...sample.map(c => c.high));
+}
+
 function calculateChoppinessIndex(candles, period = 14) {
   if (!candles || candles.length < period + 1) return 50;
   const sample = candles.slice(-period);
@@ -1237,32 +1250,48 @@ function calculateADX(candles, period = 14) {
 }
 
 function calculateHurstExponent(prices) {
-  if (!prices || prices.length < 30) return 0.5;
-  const l = prices.length;
-  const logPrices = prices.map(p => Math.log(p));
+  // Bug fixed: this previously computed a SINGLE Rescaled-Range value over
+  // the entire price window (H = log(R/S) / log(n)) - a single-scale
+  // estimate is noisy/biased and, worse, was inconsistent with
+  // backtest-engine.js's calculateHurstExponent, which already used the
+  // statistically correct approach (multiple window sizes, log-log
+  // regression of R/S vs. window size -> the slope is the Hurst exponent).
+  // Live and backtest now compute Hurst identically.
+  if (!prices || prices.length < 50) return 0.5;
   const returns = [];
-  for (let i = 1; i < logPrices.length; i++) {
-    returns.push(logPrices[i] - logPrices[i - 1]);
+  for (let i = 1; i < prices.length; i++) returns.push(Math.log(prices[i] / prices[i - 1]));
+
+  const sizes = [8, 16, 32].filter(s => s < returns.length / 2);
+  if (sizes.length < 2) return 0.5;
+
+  const points = [];
+  for (const size of sizes) {
+    const rsValues = [];
+    for (let i = 0; i + size <= returns.length; i += size) {
+      const segment = returns.slice(i, i + size);
+      const mean = segment.reduce((a, b) => a + b, 0) / segment.length;
+      let cumSum = 0, max = -Infinity, min = Infinity, variance = 0;
+      for (const r of segment) {
+        cumSum += r - mean;
+        max = Math.max(max, cumSum);
+        min = Math.min(min, cumSum);
+        variance += Math.pow(r - mean, 2);
+      }
+      const sd = Math.sqrt(variance / segment.length);
+      if (sd > 0 && max > min) rsValues.push((max - min) / sd);
+    }
+    if (rsValues.length) {
+      const avgRS = rsValues.reduce((a, b) => a + b, 0) / rsValues.length;
+      points.push([Math.log(size), Math.log(avgRS)]);
+    }
   }
-  
-  const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
-  const deviations = returns.map(r => r - mean);
-  const z = [];
-  let cumSum = 0;
-  for (const d of deviations) {
-    cumSum += d;
-    z.push(cumSum);
-  }
-  const maxZ = Math.max(...z);
-  const minZ = Math.min(...z);
-  const R = maxZ - minZ;
-  
-  const variance = returns.reduce((sum, r) => sum + Math.pow(r - mean, 2), 0) / returns.length;
-  const S = Math.sqrt(variance);
-  if (S === 0 || R === 0) return 0.5;
-  
-  const rs = R / S;
-  const hurst = Math.log(rs) / Math.log(l);
+  if (points.length < 2) return 0.5;
+
+  const meanX = points.reduce((a, p) => a + p[0], 0) / points.length;
+  const meanY = points.reduce((a, p) => a + p[1], 0) / points.length;
+  const num = points.reduce((a, p) => a + (p[0] - meanX) * (p[1] - meanY), 0);
+  const den = points.reduce((a, p) => a + Math.pow(p[0] - meanX, 2), 0);
+  const hurst = den ? num / den : 0.5;
   return Number(Math.max(0, Math.min(1, hurst)).toFixed(3));
 }
 
@@ -1285,10 +1314,17 @@ function calculateMACD(closes) {
 }
 
 function calculateVWAP(candles) {
+  // candle.time is already epoch MILLISECONDS (see fetchKucoinKlines: `to =
+  // Date.now()`, `from = to - ... * 60_000`). The previous code multiplied
+  // by 1000 again when building the Date (landing somewhere around the year
+  // 54,000,000) and then divided the UTC day-start back down to seconds,
+  // while candle.time stayed in ms - the filter below was comparing
+  // mismatched units and effectively never matched, so VWAP silently used
+  // the entire candle window instead of resetting at the start of each day.
   if (!candles || candles.length === 0) return 0;
-  const lastCandleDate = new Date(candles[candles.length - 1].time * 1000);
-  const sessionStartUTC = Date.UTC(lastCandleDate.getUTCFullYear(), lastCandleDate.getUTCMonth(), lastCandleDate.getUTCDate()) / 1000;
-  const sessionCandles = candles.filter(c => c.time >= sessionStartUTC);
+  const lastCandleDate = new Date(candles[candles.length - 1].time);
+  const sessionStartMs = Date.UTC(lastCandleDate.getUTCFullYear(), lastCandleDate.getUTCMonth(), lastCandleDate.getUTCDate());
+  const sessionCandles = candles.filter(c => c.time >= sessionStartMs);
   const workingSet = sessionCandles.length > 0 ? sessionCandles : candles;
   let cumulativeTPV = 0, cumulativeVolume = 0;
   for (const c of workingSet) {
@@ -2058,9 +2094,12 @@ async function asyncPool(concurrency, items, iteratorFn) {
   return Promise.all(results);
 }
 
-function evaluateDirectionGates(dir, p) {
+function evaluateDirectionGates(dir, p, scanStats) {
   const isLong = dir === 'LONG';
 
+  // --- Hard gates: structural preconditions. Without trend alignment and a
+  // break of structure this isn't the strategy the bot claims to trade, so
+  // these still reject immediately.
   if (filterState.trend4h.enabled && config.REQUIRE_4H_TREND) {
     const trendOk4h = isLong ? p.trend4h === 'BULLISH' : p.trend4h === 'BEARISH';
     if (!trendOk4h) return 'trendMismatch4h';
@@ -2074,46 +2113,68 @@ function evaluateDirectionGates(dir, p) {
     if (against) return 'btcCounterTrendBlocked';
   }
 
-  if (filterState.adx.enabled) {
-    const effectiveADX = p.adaptiveADX || config.ADX_MIN;
-    if (p.adx < effectiveADX) return 'adxTooLow';
-  }
-
-  if (filterState.hurst.enabled) {
-    if (p.hurst < config.MIN_HURST_EXPONENT) return 'hurstBlocked';
-  }
-
-  if (filterState.chop.enabled) {
-    if (p.chop && p.chop > config.MAX_CHOP_INDEX) return 'marketChoppy';
-  }
-
   if (filterState.bos.enabled) {
     const bos = isLong ? p.bosBullish : p.bosBearish;
     if (!bos) return 'noBOS';
   }
 
-  if (isLong) {
-    if (filterState.rsi_long_min.enabled && p.rsi < config.RSI_LONG_MIN) return 'rsiTooLow';
-    if (p.rsi > config.RSI_LONG_MAX) return 'rsiTooHigh';
-  } else {
-    if (p.rsi < config.RSI_SHORT_MIN) return 'rsiTooLow';
-    if (filterState.rsi_short_max.enabled && p.rsi > config.RSI_SHORT_MAX) return 'rsiTooHigh';
-  }
-
-  const priceOk = p.poc && p.vwap && (isLong ? (p.currentPrice >= p.poc && p.currentPrice >= p.vwap) : (p.currentPrice <= p.poc && p.currentPrice <= p.vwap));
-  if (!priceOk) return 'pocVwapFail';
-
-  const macdOk = isLong ? p.macd.histogram >= 0 : p.macd.histogram <= 0;
-  if (!macdOk) return 'macdFail';
-
   const fundingOk = isLong ? p.fundingRate <= config.MAX_FUNDING_RATE : p.fundingRate >= config.MIN_FUNDING_RATE;
   if (!fundingOk) return 'fundingBlocked';
 
-  if (filterState.relvol.enabled) {
-    const effectiveVolume = p.adaptiveVolume || config.MIN_RELATIVE_VOLUME;
-    if (effectiveVolume > 0 && p.relativeVolume < effectiveVolume) return 'relVolTooLow';
+  // --- Soft gates: previously a rigid AND-chain of ADX / Hurst / Chop / RSI
+  // zone / POC-VWAP location / MACD / relative volume. Several of these
+  // measure overlapping information (ADX, Hurst and Chop are all proxies for
+  // "is this trending"), so stacking them as hard booleans rejected valid
+  // setups on noise in any single one. They now contribute a weighted
+  // confluence score; the setup passes if enabled filters clear
+  // config.MIN_GATE_SCORE (default 65/100). Per-filter counters are still
+  // recorded for the existing /filter Telegram diagnostics, but no longer
+  // singularly veto a setup.
+  let score = 0, max = 0;
+
+  if (filterState.adx.enabled) {
+    max += 25;
+    const effectiveADX = p.adaptiveADX || config.ADX_MIN;
+    if (p.adx >= effectiveADX) score += 25;
+    else { score += Math.max(0, 25 * (p.adx / effectiveADX)); scanStats.adxTooLow++; }
   }
 
+  if (filterState.hurst.enabled) {
+    max += 20;
+    if (p.hurst >= config.MIN_HURST_EXPONENT) score += 20;
+    else { score += Math.max(0, 20 * (p.hurst / config.MIN_HURST_EXPONENT)); scanStats.hurstBlocked++; }
+  }
+
+  if (filterState.chop.enabled && p.chop) {
+    max += 15;
+    if (p.chop <= config.MAX_CHOP_INDEX) score += 15;
+    else { score += Math.max(0, 15 * (1 - (p.chop - config.MAX_CHOP_INDEX) / config.MAX_CHOP_INDEX)); scanStats.marketChoppy++; }
+  }
+
+  max += 15;
+  const rsiInZone = isLong
+    ? (!filterState.rsi_long_min.enabled || p.rsi >= config.RSI_LONG_MIN) && p.rsi <= config.RSI_LONG_MAX
+    : p.rsi >= config.RSI_SHORT_MIN && (!filterState.rsi_short_max.enabled || p.rsi <= config.RSI_SHORT_MAX);
+  if (rsiInZone) score += 15;
+  else scanStats[isLong ? (p.rsi < config.RSI_LONG_MIN ? 'rsiTooLow' : 'rsiTooHigh') : (p.rsi < config.RSI_SHORT_MIN ? 'rsiTooLow' : 'rsiTooHigh')]++;
+
+  max += 10;
+  const priceOk = p.poc && p.vwap && (isLong ? (p.currentPrice >= p.poc && p.currentPrice >= p.vwap) : (p.currentPrice <= p.poc && p.currentPrice <= p.vwap));
+  if (priceOk) score += 10; else scanStats.pocVwapFail++;
+
+  max += 10;
+  const macdOk = isLong ? p.macd.histogram >= 0 : p.macd.histogram <= 0;
+  if (macdOk) score += 10; else scanStats.macdFail++;
+
+  if (filterState.relvol.enabled) {
+    max += 5;
+    const effectiveVolume = p.adaptiveVolume || config.MIN_RELATIVE_VOLUME;
+    if (effectiveVolume <= 0 || p.relativeVolume >= effectiveVolume) score += 5;
+    else { score += Math.max(0, 5 * (p.relativeVolume / effectiveVolume)); scanStats.relVolTooLow++; }
+  }
+
+  const gateScore = max > 0 ? Math.round(100 * score / max) : 100;
+  if (gateScore < config.MIN_GATE_SCORE) return 'lowConfluenceScore';
   return null;
 }
 
@@ -2128,7 +2189,7 @@ function createEmptyScanStats() {
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    timeBlocked: 0, mlBlocked: 0, dqnBlocked: 0
+    timeBlocked: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0
   };
 }
 
@@ -2319,14 +2380,15 @@ async function scanMarket() {
 
         var direction = null;
         const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
-        let primaryFail = evaluateDirectionGates(primaryDir, gateParams);
+        let primaryFail = evaluateDirectionGates(primaryDir, gateParams, scanStats);
 
         if (!primaryFail) {
           direction = primaryDir;
         } else if (config.ENABLE_SHORT_SIGNALS || primaryDir === 'LONG') {
           const secondaryFail = evaluateDirectionGates(
             primaryDir === 'LONG' ? 'SHORT' : 'LONG', 
-            gateParams
+            gateParams,
+            scanStats
           );
           if (!secondaryFail) {
             direction = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
@@ -2428,10 +2490,29 @@ async function scanMarket() {
           const volEvaluation = await volManager.evaluateVolatilityMultiplier(symbol, atr, currentPrice);
 
           const entryPrice = applySlippage(currentPrice, direction, 'entry');
-          const stopDistance = atr * adaptiveATR * volEvaluation.volFactor; 
+          const atrStopDistance = atr * adaptiveATR * volEvaluation.volFactor;
+
+          // Structure-based stop: prefer the most recent swing low/high over
+          // a rigid ATR multiple, bounded to 0.8x-3x the ATR distance so a
+          // stray wick can't place the stop absurdly close or absurdly far.
+          const swingLevel = findSwingStop(raw15m, direction, config.BOS_LOOKBACK);
+          let stopDistance = atrStopDistance;
+          if (swingLevel != null && Number.isFinite(swingLevel)) {
+            const swingDistance = Math.abs(entryPrice - swingLevel);
+            if (swingDistance > 0) {
+              stopDistance = Math.min(Math.max(swingDistance, atrStopDistance * 0.8), atrStopDistance * 3);
+            }
+          }
+
           const stopLoss = direction === 'LONG' ? entryPrice - stopDistance : entryPrice + stopDistance;
-          const tp1 = direction === 'LONG' ? entryPrice + (stopDistance * adaptiveTP1) : entryPrice - (stopDistance * adaptiveTP1);
-          const tp2 = direction === 'LONG' ? entryPrice + (stopDistance * config.TP2_MULT) : entryPrice - (stopDistance * config.TP2_MULT);
+
+          // Enforce a minimum risk:reward ratio on TP1. With the default
+          // TP1_MULT (1.3) vs ATR_STOP_MULT (2.3) this previously produced
+          // RRR ~0.57 - a structurally losing setup even at >50% win rate.
+          const tp1Distance = Math.max(stopDistance * adaptiveTP1, stopDistance * config.MIN_RRR);
+          const tp2Distance = Math.max(stopDistance * config.TP2_MULT, tp1Distance * 1.3);
+          const tp1 = direction === 'LONG' ? entryPrice + tp1Distance : entryPrice - tp1Distance;
+          const tp2 = direction === 'LONG' ? entryPrice + tp2Distance : entryPrice - tp2Distance;
 
           const rawSizing = calculatePositionSize(entryPrice, stopLoss, config.CAPITAL_USD, adaptiveRisk);
           const contractSizing = roundToContractSize(rawSizing.positionSizeUnits, symbol);
