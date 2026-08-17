@@ -328,6 +328,7 @@ class TensorFlowSignalModel {
       // was cumulative and eventually crashed the Node process.
       if (this.model && this.model !== bestCandidate) {
         this.model.dispose();
+        this.model = null;
       }
       this.model = bestCandidate;
       this.scaler = scaler;
@@ -402,17 +403,20 @@ class TensorFlowSignalModel {
     }
 
     const scaled = this.scaleMatrix([features], this.scaler)[0];
-    let input, output, probability;
-    try {
-      input = tf.tensor2d([scaled], [1, FEATURE_NAMES.length]);
-      output = this.model.predict(input);
-      probability = clamp(output.dataSync()[0], 0, 1);
-    } finally {
-      // try/finally so a prediction error can't leak the input/output
-      // tensors (dataSync can throw on a disposed/invalid model).
-      input?.dispose();
-      output?.dispose();
-    }
+
+    // tf.tidy() disposes every tensor allocated inside the callback (the
+    // input tensor, whatever model.predict() allocates internally, and the
+    // output tensor) as soon as it returns, except the plain JS value we
+    // return out of it - this is stricter than manually tracking
+    // input/output handles, since it also catches any intermediate
+    // tensors a future model architecture might allocate that we don't
+    // hold a direct reference to.
+    const rawProbability = tf.tidy(() => {
+      const input = tf.tensor2d([scaled], [1, FEATURE_NAMES.length]);
+      const output = this.model.predict(input);
+      return output.dataSync()[0];
+    });
+    const probability = clamp(rawProbability, 0, 1);
 
     const confidence = Math.abs(probability - 0.5) * 2;
     const className = probability >= this.strongSignalProbability
@@ -426,6 +430,20 @@ class TensorFlowSignalModel {
             : 'NEUTRAL';
 
     return { probability, class: className, confidence, trained: true };
+  }
+
+  /**
+   * Explicitly releases the current model's tensors. Not part of the
+   * normal retrain cycle (trainFromTrades() already disposes the previous
+   * model before assigning the new one) - call this on process shutdown or
+   * before discarding a TensorFlowSignalModel instance entirely.
+   */
+  cleanup() {
+    if (this.model) {
+      try { this.model.dispose(); } catch (_) {}
+      this.model = null;
+    }
+    this.trained = false;
   }
 }
 
