@@ -30,6 +30,8 @@ class DeepQTheTradingAgent {
     this.targetModel = null;
     this.isInitialized = false;
     this.logger = options.logger || console;
+    this.modelVersion = options.modelVersion || process.env.DQN_MODEL_VERSION || 'dqn-v22.2';
+    this.trainingSteps = 0;
   }
 
   /**
@@ -84,10 +86,11 @@ class DeepQTheTradingAgent {
       }
       
       this.isInitialized = true;
-      this.logger.info('🤖 [RL-Engine] DQN Agent erfolgreich initialisiert.');
+      this.logger.info(`🤖 [RL-Engine] DQN Agent initialisiert (${this.modelVersion}).`);
     } catch (e) {
       this.logger.error(`[RL-Engine Init Fehler]: ${e.message}`);
-      this.isInitialized = true; // Fallback auf unternährtes Modell
+      this.isInitialized = false;
+      throw e;
     }
   }
 
@@ -106,20 +109,21 @@ class DeepQTheTradingAgent {
    * @param {number[]} state 
    * @returns {number} 0: Hold, 1: Long, 2: Short
    */
-  act(state) {
-    // Exploration: Zufällige Aktion wählen, um neue Strategien zu testen
-    if (Math.random() < this.epsilon) {
-      return Math.floor(Math.random() * this.actionSize);
-    }
-
-    // Exploitation: Beste Aktion vom Modell vorhersagen lassen
-    return tf.tidy(() => {
-      const stateTensor = tf.tensor2d([state]);
-      const prediction = this.model.predict(stateTensor);
-      const actionTensor = prediction.argMax(1);
-      return actionTensor.dataSync()[0];
+  actWithMetadata(state) {
+    if (!Array.isArray(state) || state.length !== this.stateSize) throw new Error(`Invalid DQN state size: expected ${this.stateSize}`);
+    const explore = Math.random() < this.epsilon;
+    if (explore) return { action: Math.floor(Math.random() * this.actionSize), exploration: true, qValues: null, modelVersion: this.modelVersion };
+    const qValues = tf.tidy(() => {
+      const t = tf.tensor2d([state]);
+      const pred = this.model.predict(t);
+      return Array.from(pred.dataSync());
     });
+    let action = 0;
+    for (let i = 1; i < qValues.length; i++) if (qValues[i] > qValues[action]) action = i;
+    return { action, exploration: false, qValues, modelVersion: this.modelVersion };
   }
+
+  act(state) { return this.actWithMetadata(state).action; }
 
   /**
    * Speichert eine Erfahrung im Replay Memory
@@ -189,6 +193,8 @@ class DeepQTheTradingAgent {
     nextQs.dispose();
     xTensor.dispose();
     yTensor.dispose();
+
+    this.trainingSteps++;
 
     // Epsilon abbauen (weniger Exploration, mehr Fokus auf gelerntes Wissen)
     if (this.epsilon > this.epsilonMin) {
@@ -324,6 +330,7 @@ class DeepQTheTradingAgent {
     try {
       if (!this.model) return;
       await this.model.save(`file://${path.resolve(this.modelDir)}`);
+      fs.writeFileSync(path.join(this.modelDir, 'state.json'), JSON.stringify({ epsilon: this.epsilon, trainingSteps: this.trainingSteps, modelVersion: this.modelVersion }, null, 2));
     } catch (e) {}
   }
 
@@ -334,7 +341,9 @@ class DeepQTheTradingAgent {
         this.model = await tf.loadLayersModel(`file://${modelPath}`);
         this.model.compile({ optimizer: tf.train.adam(this.learningRate), loss: 'meanSquaredError' });
         this.updateTargetModel();
-        this.logger.info('🤖 [RL-Engine] Gespeichertes DQN-Modell geladen.');
+        const stateFile = path.join(this.modelDir, 'state.json');
+        if (fs.existsSync(stateFile)) { try { const st = JSON.parse(fs.readFileSync(stateFile, 'utf8')); if (Number.isFinite(st.epsilon)) this.epsilon = Math.max(this.epsilonMin, Math.min(1, st.epsilon)); this.trainingSteps = Number(st.trainingSteps || 0); } catch {} }
+        this.logger.info(`🤖 [RL-Engine] Gespeichertes DQN-Modell geladen (${this.modelVersion}).`);
         return true;
       }
     } catch (e) {}
@@ -345,7 +354,9 @@ class DeepQTheTradingAgent {
     return {
       epsilon: Number(this.epsilon.toFixed(3)),
       memorySize: this.memory.length,
-      isInitialized: this.isInitialized
+      isInitialized: this.isInitialized,
+      modelVersion: this.modelVersion,
+      trainingSteps: this.trainingSteps
     };
   }
 }
