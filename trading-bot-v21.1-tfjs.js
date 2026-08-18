@@ -15,7 +15,10 @@ const winston = require('winston');
 const { TensorFlowSignalModel } = require('./ml-engine');
 const { DeepQTheTradingAgent } = require('./rl-engine'); // <-- DQN Agent Modul eingebunden
 const { HedgeManager } = require('./hedgeManager');
-const { VolatilitySurfaceManager } = require('./volatilitySurface');
+const { VolatilityRegimeManager } = require('./volatilityRegimeManager');
+const { RiskEngine } = require('./risk-engine');
+const { DataValidator } = require('./data-validator');
+const { AuditLogger } = require('./audit-log');
 const { OrderFlowAnalyzer } = require('./orderFlowAnalyzer');
 const { MacroFilterEngine } = require('./macroFilter'); // Sentiment / Fear & Greed
 const { MacroEngine } = require('./macro-engine'); // FRED Makro-Release-Kalender
@@ -504,8 +507,21 @@ const config = {
   ML_EPOCHS: parseInt(process.env.ML_EPOCHS, 10) || 80,
   ML_BATCH_SIZE: parseInt(process.env.ML_BATCH_SIZE, 10) || 32,
   
-  // DQN spezifische Config
-  DQN_ENABLED: true,
+  // DQN: ausdrücklich auf Paper/Shadow begrenzt. Live bleibt verboten.
+  DQN_ENABLED: process.env.DQN_ENABLED !== 'false',
+  DQN_MODE: (process.env.DQN_MODE || 'paper_learning').toLowerCase(),
+  DQN_PAPER_LEARNING: process.env.DQN_PAPER_LEARNING !== 'false',
+  DQN_ONLINE_TICK_LEARNING: process.env.DQN_ONLINE_TICK_LEARNING === 'true',
+  DQN_MIN_REPLAY_SIZE: parseInt(process.env.DQN_MIN_REPLAY_SIZE, 10) || 128,
+  DQN_CHECKPOINT_INTERVAL: parseInt(process.env.DQN_CHECKPOINT_INTERVAL, 10) || 100,
+  PAPER_TRADING: process.env.PAPER_TRADING !== 'false',
+  LIVE_TRADING_ENABLED: process.env.LIVE_TRADING_ENABLED === 'true',
+  REQUIRE_ORDERBOOK_DATA: process.env.REQUIRE_ORDERBOOK_DATA !== 'false',
+  REQUIRE_FUNDING_DATA: process.env.REQUIRE_FUNDING_DATA !== 'false',
+  DATA_MAX_AGE_MS: parseInt(process.env.DATA_MAX_AGE_MS, 10) || 180000,
+  CONFIG_VERSION: process.env.CONFIG_VERSION || '22.2.0-paper-dqn',
+  STRATEGY_VERSION: process.env.STRATEGY_VERSION || '22.2.0',
+  FEATURE_VERSION: process.env.FEATURE_VERSION || '22.2.0',
 };
 
 function validateConfig() {
@@ -527,7 +543,7 @@ function validateConfig() {
     'MONGODB_POOL_SIZE', 'DB_BULK_INTERVAL_MS', 'MAX_SPREAD_PERCENT', 'MAX_CHOP_INDEX',
     'MIN_HURST_EXPONENT', 'ML_MIN_TRAINING_SAMPLES', 'ML_MAX_TRAINING_SAMPLES',
     'ML_MIN_PREDICTION_PROBABILITY', 'ML_STRONG_SIGNAL_PROBABILITY', 'ML_RETRAIN_HOURS',
-    'ML_EPOCHS', 'ML_BATCH_SIZE'
+    'ML_EPOCHS', 'ML_BATCH_SIZE', 'DQN_MIN_REPLAY_SIZE', 'DQN_CHECKPOINT_INTERVAL', 'DATA_MAX_AGE_MS'
   ];
   for (const key of numericFields) {
     if (typeof config[key] !== 'number' || Number.isNaN(config[key])) {
@@ -549,6 +565,11 @@ function validateCriticalEnv() {
 validateCriticalEnv();
 
 updateTelegramConfig(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID);
+if (config.LIVE_TRADING_ENABLED) {
+  throw new Error('LIVE_TRADING_ENABLED=true ist in dieser Paper-DQN-Version absichtlich gesperrt. Für Live-Execution muss eine separat auditiert/reconciliierte ExecutionEngine aktiviert werden.');
+}
+if (!['paper_learning', 'shadow', 'disabled'].includes(config.DQN_MODE)) throw new Error(`[CONFIG ERROR] DQN_MODE=${config.DQN_MODE} ungültig`);
+if (config.DQN_MODE === 'paper_learning' && !config.PAPER_TRADING) throw new Error('DQN paper_learning benötigt PAPER_TRADING=true');
 
 // ==========================================
 // 8. DATENBANK & ADAPTIVES ML-MODELL & MANAGERS
@@ -578,7 +599,7 @@ client.on('error', (err) => {
   logger.error(`🔴 MongoDB-Client-Fehler: ${err.message}`);
 });
 
-let tradesCollection, closedTradesCollection, botStateCollection, lockCollection, marketPhaseLogsCollection, filterChangeLogCollection;
+let tradesCollection, closedTradesCollection, botStateCollection, lockCollection, marketPhaseLogsCollection, filterChangeLogCollection, auditCollection;
 const activeTrades = new Map();
 let isDbConnected = false, dbReconnectInterval = null, pendingClosedTrades = [], isReconnecting = false;
 const priceFailureCounts = new Map();
@@ -601,11 +622,17 @@ const dqnAgent = new DeepQTheTradingAgent({
   modelDir: process.env.DQN_MODEL_DIR || './models/rl-dqn-model',
   stateSize: 16,
   actionSize: 3,
+  maxMemorySize: parseInt(process.env.DQN_MAX_MEMORY_SIZE, 10) || 10000,
+  batchSize: parseInt(process.env.DQN_BATCH_SIZE, 10) || 32,
   logger
 });
 
+const riskEngine = new RiskEngine(config, logger);
+const dataValidator = new DataValidator({ logger, maxAgeMs: config.DATA_MAX_AGE_MS });
+let auditLogger;
+
 const hedgeManager = new HedgeManager({ logger, thresholdDropPct: -2.5 });
-const volManager = new VolatilitySurfaceManager({ logger });
+const volManager = new VolatilityRegimeManager({ logger });
 const orderFlowManager = new OrderFlowAnalyzer({ logger });
 const macroEngine = new MacroFilterEngine({ logger });
 const macroCalendar = new MacroEngine({
@@ -643,35 +670,34 @@ function buildDQNStateVector(params) {
 }
 
 async function trainSignalMLModel(force = false) {
-  if (!config.ML_ENABLED) return { trained: false, reason: 'disabled' };
   if (!closedTradesCollection || !isDbConnected) return { trained: false, reason: 'db-unavailable' };
+  let result = { trained: false, reason: 'ml-disabled' };
   try {
-    const result = await mlModel.trainFromTrades(closedTradesCollection, { force, cutoffTime: Date.now() });
-    isModelTrained = !!result.trained;
-    lastMLTrainingStats = result;
-
-    if (config.DQN_ENABLED) {
-      await dqnAgent.trainFromClosedTrades(closedTradesCollection);
+    if (config.ML_ENABLED) {
+      result = await mlModel.trainFromTrades(closedTradesCollection, { force, cutoffTime: Date.now() });
+      isModelTrained = !!result.trained;
+      lastMLTrainingStats = result;
     }
-
+    if (config.DQN_ENABLED && config.DQN_MODE === 'paper_learning' && config.DQN_PAPER_LEARNING) {
+      if (!dqnAgent.isInitialized) await dqnAgent.init();
+      const dqnResult = await dqnAgent.trainFromClosedTrades(closedTradesCollection);
+      result.dqn = dqnResult;
+    }
     return result;
   } catch (e) {
-    logger.error(`[TensorFlow.js ML Fehler beim Training]: ${e.message}`);
+    logger.error(`[Model Training Fehler]: ${e.message}`);
     return { trained: false, reason: e.message };
   }
 }
 
 async function loadSignalMLModel() {
+  if (config.DQN_ENABLED) { try { await dqnAgent.init(); } catch (e) { logger.error(`[DQN INIT] ${e.message}`); } }
   if (!config.ML_ENABLED) return false;
   try {
     const loaded = await mlModel.load();
     isModelTrained = loaded;
     if (loaded) lastMLTrainingStats = mlModel.getStats();
     
-    if (config.DQN_ENABLED) {
-      await dqnAgent.init();
-    }
-
     return loaded;
   } catch (e) {
     logger.warn(`[TensorFlow.js ML] Kein gespeichertes Modell geladen: ${e.message}`);
@@ -877,6 +903,11 @@ async function initDatabase() {
     await client.connect();
     const db = client.db('tradingBotDB');
     tradesCollection = db.collection('activeTrades');
+    auditCollection = db.collection('auditEvents');
+    auditLogger = new AuditLogger({ collection: auditCollection, logger });
+    await tradesCollection.createIndex({ symbol: 1 }, { unique: true });
+    await closedTradesCollection.createIndex({ signalId: 1 }, { unique: true, sparse: true });
+    await auditCollection.createIndex({ timestamp: -1 });
     closedTradesCollection = db.collection('closedTrades');
     botStateCollection = db.collection('botState');
     lockCollection = db.collection('locks');
@@ -978,8 +1009,13 @@ async function persistPeakCapital() {
 }
 
 async function upsertTrade(symbol, tradeData) {
-  activeTrades.set(symbol, tradeData);
-  if (tradesCollection && isDbConnected) dbBulkQueue.push({ type: 'upsertTrade', symbol, data: tradeData });
+  if (!isDbConnected || !tradesCollection) throw new Error('DB unavailable: refusing non-durable trade state');
+  const now = Date.now();
+  const durable = { ...tradeData, symbol, updatedAt: now, stateVersion: Number(tradeData.stateVersion || 0) + 1 };
+  await tradesCollection.updateOne({ symbol }, { $set: durable }, { upsert: true });
+  activeTrades.set(symbol, durable);
+  if (auditLogger) await auditLogger.write('TRADE_STATE_UPSERT', { symbol, signalId: durable.signalId || null, stateVersion: durable.stateVersion });
+  return durable;
 }
 
 async function removeTrade(symbol, closedTradeRecord = null) {
@@ -990,7 +1026,8 @@ async function removeTrade(symbol, closedTradeRecord = null) {
     activeTrades.delete(symbol);
   }
   priceFailureCounts.delete(symbol);
-  if (tradesCollection && isDbConnected) dbBulkQueue.push({ type: 'removeTrade', symbol });
+  if (tradesCollection && isDbConnected) await tradesCollection.deleteOne({ symbol });
+  if (auditLogger) await auditLogger.write('TRADE_STATE_REMOVE', { symbol, signalId: finalRecord?.signalId || null });
 }
 
 async function persistClosedTradeRecord(record) {
@@ -1157,32 +1194,29 @@ function calculateSharpeRatio(dailyReturns, riskFreeRate = 0.02) {
 
 function canOpenNewTrade(activeTradesCount, direction, notionalUSD = 0) {
   if (!isDbConnected) return { allowed: false, reason: 'skippedDbDisconnected' };
-  if (activeTradesCount >= config.MAX_CONCURRENT_TRADES) return { allowed: false, reason: 'skippedMaxConcurrentTrades' };
-  if (dailyNetPnL <= -config.MAX_DAILY_LOSS_USD) return { allowed: false, reason: 'skippedDailyLossLimit' };
-
-  const currentEquity = config.CAPITAL_USD + dailyNetPnL;
-  if (checkGlobalDrawdown(currentEquity)) return { allowed: false, reason: 'skippedMaxDrawdown' };
-
-  if (direction) {
-    const sameCount = [...activeTrades.values()].filter(t => t.direction === direction).length;
-    if (sameCount >= config.MAX_SAME_DIRECTION) return { allowed: false, reason: 'skippedMaxSameDirection' };
-  }
-
-  const totalNotional = [...activeTrades.values()].reduce((sum, t) => sum + (t.notionalUSD || 0), 0) + notionalUSD;
-  const totalMarginUSD = totalNotional / config.LEVERAGE;
-  if (totalMarginUSD > config.CAPITAL_USD * config.MAX_EXPOSURE_RATIO) return { allowed: false, reason: 'skippedExposureLimit' };
-
-  return { allowed: true, reason: null };
+  const equity = config.CAPITAL_USD + dailyNetPnL;
+  const result = riskEngine.evaluate({
+    equityUSD: equity,
+    dailyPnL: dailyNetPnL,
+    peakEquityUSD: peakCapital,
+    activeTrades: [...activeTrades.values()],
+    direction,
+    notionalUSD,
+    maxConcurrent: config.MAX_CONCURRENT_TRADES,
+    maxSameDirection: config.MAX_SAME_DIRECTION,
+    maxExposureRatio: config.MAX_EXPOSURE_RATIO,
+    maxDailyLossUSD: config.MAX_DAILY_LOSS_USD,
+    maxDrawdownPercent: config.MAX_DRAWDOWN_PERCENT
+  });
+  return { allowed: result.allowed, reason: result.allowed ? null : `skippedRisk:${result.reason}` };
 }
 
 function calculatePositionSize(entryPrice, stopLossPrice, capitalUSD, riskPercent, leverage = config.LEVERAGE) {
-  const riskAmountUSD = capitalUSD * (riskPercent / 100);
-  const stopDistance = Math.abs(entryPrice - stopLossPrice);
-  if (stopDistance <= 0 || entryPrice <= 0 || leverage <= 0) return { positionSizeUnits: 0, notionalUSD: 0, riskAmountUSD: 0 };
-  const stopPct = stopDistance / entryPrice;
-  const notionalUSD = (riskAmountUSD / stopPct) * leverage;
-  const positionSizeUnits = notionalUSD / entryPrice;
-  return { positionSizeUnits, notionalUSD, riskAmountUSD };
+  // Risk is defined as the cash loss at the stop. Leverage changes margin
+  // required, not the dollar loss at the stop. Never multiply risk by leverage.
+  const sized = riskEngine.positionSize({ equityUSD: capitalUSD, riskPercent, entryPrice, stopLossPrice });
+  const marginUSD = sized.notionalUSD / Math.max(1, leverage);
+  return { positionSizeUnits: sized.units, notionalUSD: sized.notionalUSD, riskAmountUSD: sized.riskUSD, marginUSD, leverage, stopPct: sized.stopPct };
 }
 
 function applySlippage(price, direction, side = 'entry') {
@@ -1858,7 +1892,7 @@ function formatScanStatsReport(stats) {
   if (stats.relVolTooLow) reasons.push(`Volumen zu niedrig: ${stats.relVolTooLow}`);
   if (stats.correlationBlocked) reasons.push(`Korrelations-Limit: ${stats.correlationBlocked}`);
   if (stats.orderBookBlocked) reasons.push(`Orderbuch Imbalance: ${stats.orderBookBlocked}`);
-  if (stats.orderFlowBlocked) reasons.push(`Order Flow / CVD blockiert: ${stats.orderFlowBlocked}`);
+  if (stats.orderFlowBlocked) reasons.push(`Order Flow blockiert: ${stats.orderFlowBlocked}`);
   if (stats.spreadTooHigh) reasons.push(`Orderbuch Spread zu hoch: ${stats.spreadTooHigh}`);
   if (stats.cooldownActive) reasons.push(`Signal-Cooldown aktiv: ${stats.cooldownActive}`);
   if (stats.positionTooSmallForLot) reasons.push(`Position zu klein für Min-Lot: ${stats.positionTooSmallForLot}`);
@@ -2294,7 +2328,7 @@ function createEmptyScanStats() {
     btcCounterTrendBlocked: 0, trendQualityLow: 0, noBOS: 0, rsiOutOfRange: 0,
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
-    orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
+    orderBookBlocked: 0, orderFlowBlocked: 0, dataQualityBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
     timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0, rrrBelowMinimum: 0
   };
 }
@@ -2467,10 +2501,12 @@ async function scanMarket() {
 
       try {
         const raw15m = await fetchKucoinKlinesCached(symbol, '15m', 100);
-        if (!raw15m || raw15m.length < 20) { 
+        if (!raw15m || raw15m.length < 60) { 
           scanStats.missingKlines++; 
           return; 
         }
+        const dataCheck = dataValidator.candles(raw15m, { timeframeMs: 15 * 60 * 1000, minLength: 60 });
+        if (!dataCheck.valid) { scanStats.dataQualityBlocked = (scanStats.dataQualityBlocked || 0) + 1; logger.warn(`[DATA-QUALITY] ${symbol}: ${dataCheck.reason}`); return; }
 
         let raw1h = config.ENABLE_MULTI_TF_DERIVATION 
           ? deriveHigherTimeframes(raw15m, '1h') 
@@ -2505,7 +2541,7 @@ async function scanMarket() {
         }
 
         const futuresData = await fetchFuturesData(symbol).catch(() => null);
-        const orderBookMetrics = await fetchOrderBookMetrics(symbol).catch(() => ({ spreadPct: 0, bidAskRatio: 1 }));
+        const orderBookMetrics = await fetchOrderBookMetrics(symbol).catch(() => ({ spreadPct: NaN, bidAskRatio: NaN, dataValid: false }));
 
         const orderFlowEval = orderFlowManager.evaluateOrderFlow(raw15m, orderBookMetrics);
 
@@ -2623,9 +2659,12 @@ async function scanMarket() {
           }
 
           // ==========================================
-          // 🧠 DQN AGENT VETO-GATE (AKTIVIERT)
+          // 🧠 DQN PAPER-LEARNING GATE
+          // 0 = reject/hold, 1 = long, 2 = short.
+          // DQN may influence PAPER/SHADOW only; RiskEngine always wins.
           // ==========================================
-          if (config.DQN_ENABLED && dqnAgent.isInitialized) {
+          let dqnDecision = { enabled: false, action: 0, exploration: false, qValues: null, modelVersion: null };
+          if (config.DQN_ENABLED && config.DQN_MODE !== 'disabled' && dqnAgent.isInitialized) {
             const dqnState = buildDQNStateVector({
               adx, rsi, hurst, relativeVolume, signalScore, direction,
               marketPhase: currentMarketPhase, atrPct, pocDistancePct,
@@ -2633,13 +2672,17 @@ async function scanMarket() {
               spreadPct: orderBookMetrics.spreadPct, volatilityRatio: btcATR > 0 ? atr / btcATR : 1,
               mlProbability: mlPrediction.probability
             });
-            const dqnAction = dqnAgent.act(dqnState);
-
-            // Wenn Action = 0 (Veto/Ablehnen) und außerhalb der Exploration (Epsilon)
-            if (dqnAction === 0 && Math.random() >= dqnAgent.epsilon) {
+            const expectedAction = direction === 'LONG' ? 1 : 2;
+            const meta = dqnAgent.actWithMetadata ? dqnAgent.actWithMetadata(dqnState) : { action: dqnAgent.act(dqnState), exploration: false, qValues: null, modelVersion: dqnAgent.getStats().modelVersion || null };
+            const dqnAction = meta.action;
+            dqnDecision = { enabled: true, action: dqnAction, exploration: !!meta.exploration, qValues: meta.qValues, expectedAction, modelVersion: meta.modelVersion || null };
+            if (config.DQN_MODE === 'paper_learning' && dqnAction !== expectedAction) {
               scanStats.dqnBlocked++;
-              logger.info(`[DQN-VETO] Trade für ${symbol} (${direction}) vom DQN-Agenten blockiert.`);
+              logger.info(`[DQN-VETO] ${symbol} ${direction}: action=${dqnAction}, expected=${expectedAction}`);
               return;
+            }
+            if (config.DQN_MODE === 'shadow') {
+              // Decision is recorded below but does not veto the strategy.
             }
           }
 
@@ -2716,7 +2759,12 @@ async function scanMarket() {
           scanStats.signalsSent++;
           scanStats.totalSignalScore += signalScore;
 
+          const signalId = `${symbol}:${direction}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
+          if (auditLogger) await auditLogger.write('SIGNAL_ACCEPTED', { signalId, symbol, direction, signalScore, dqn: dqnDecision });
           await upsertTrade(symbol, {
+            signalId, strategyVersion: config.STRATEGY_VERSION, featureVersion: config.FEATURE_VERSION, configHash: require('crypto').createHash('sha256').update(JSON.stringify(config)).digest('hex').slice(0, 16),
+            paper: true, executionMode: 'paper',
+            dqnMode: config.DQN_MODE, dqnAction: dqnDecision.action, dqnExpectedAction: dqnDecision.expectedAction || null, dqnExploration: dqnDecision.exploration, dqnModelVersion: dqnDecision.modelVersion,
             symbol, direction, entry: entryPrice, stopLoss, tp1, tp2,
             // Punkt 6 - ML-Feature-Leakage: Preis zum Zeitpunkt der
             // Signalgenerierung separat vom tatsächlichen (Slippage-behafteten)
@@ -2776,7 +2824,7 @@ async function scanMarket() {
             `Entry Zone: $${entryZoneLow.toFixed(6)} - $${entryZoneHigh.toFixed(6)} (Mitte: $${entryPrice.toFixed(6)}) | SL: $${stopLoss.toFixed(6)}\n` +
             `TP1: $${tp1.toFixed(6)} | TP2: $${tp2.toFixed(6)}\n` +
             `Größe: ${sizing.contracts} Kontrakte | Risk: $${sizing.riskAmountUSD.toFixed(2)}\n` +
-            `ADX: ${adx} | Hurst: ${hurst} | CVD-Score: ${orderFlowEval.score}\n` +
+            `ADX: ${adx} | Hurst: ${hurst} | Volume-Pressure-Score: ${orderFlowEval.score}\n` +
             `🧠 TensorFlow.js: ${mlPrediction.trained ? (mlPrediction.probability * 100).toFixed(1) + '% Erfolgswahrscheinlichkeit' : 'noch nicht trainiert'}\n` +
             `🤖 DQN Epsilon: ${dqnAgent.getStats().epsilon}`;
 
@@ -3451,7 +3499,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v21.7 ULTIMATE DQN</b>`);
+    lines.push(`🤖 <b>BOT STATUS v22.2 PAPER DQN</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
@@ -3603,17 +3651,25 @@ async function pollTelegramUpdates() {
 // 18. EXPRESS ENDPOINTS & WEB-BACKTEST
 // ==========================================
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '256kb' }));
+const ADMIN_TOKEN = process.env.ADMIN_API_TOKEN || '';
+app.use((req, res, next) => {
+  if (!['/health', '/'].includes(req.path) && ADMIN_TOKEN) {
+    const auth = req.headers.authorization || '';
+    if (auth !== `Bearer ${ADMIN_TOKEN}`) return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
+});
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v21.7 ULTIMATE DQN | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v22.2 PAPER DQN | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 app.get('/health', (req, res) => {
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
   const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : '0';
   res.status(isDbConnected ? 200 : 503).json({
-    status: isDbConnected ? 'ok' : 'degraded', version: '21.7', dbConnected: isDbConnected,
+    status: isDbConnected ? 'ok' : 'degraded', version: config.CONFIG_VERSION, dbConnected: isDbConnected,
     isPaused, activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, currentEquity, peakCapital, drawdownPercent
   });
 });
@@ -3764,7 +3820,7 @@ process.on('unhandledRejection', async (reason) => {
 // 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v21.7 ULTIMATE DQN (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
+  logger.info('🚀 Starte Trading Bot v22.2 PAPER DQN (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
