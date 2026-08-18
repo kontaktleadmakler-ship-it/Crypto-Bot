@@ -569,6 +569,7 @@ const client = new MongoClient(config.MONGODB_URI, {
 // (wrongly) true and every DB write would keep silently failing/queuing.
 // These listeners catch that case and kick off the reconnect loop below.
 client.on('close', () => {
+  dbIndexesInitialized = false;
   if (isShuttingDown) return;
   if (isDbConnected) logger.warn('🔴 MongoDB-Verbindung unerwartet geschlossen.');
   isDbConnected = false;
@@ -581,6 +582,10 @@ client.on('error', (err) => {
 let tradesCollection, closedTradesCollection, botStateCollection, lockCollection, marketPhaseLogsCollection, filterChangeLogCollection;
 const activeTrades = new Map();
 let isDbConnected = false, dbReconnectInterval = null, pendingClosedTrades = [], isReconnecting = false;
+let dbInitPromise = null;
+let dbIndexesInitialized = false;
+let telegramPollingActive = false;
+let telegramConflictCount = 0;
 const priceFailureCounts = new Map();
 let isPaused = false, lastScanTime = null, lastTrackerCheckTime = null;
 let trackerLock = false;
@@ -872,50 +877,67 @@ async function logFilterChange(filterKey, action, oldValue, newValue, user = 'Te
 }
 
 async function initDatabase() {
+  const startTime = Date.now();
+
+  if (isShuttingDown) return false;
+
   try {
-    const startTime = Date.now();
+    // MongoClient.connect() is safe to call only through the single init promise
+    // above. Reuse the existing client instead of creating competing connection
+    // attempts during reconnects.
     await client.connect();
+
     const db = client.db('tradingBotDB');
-    tradesCollection = db.collection('activeTrades');
-    closedTradesCollection = db.collection('closedTrades');
-    botStateCollection = db.collection('botState');
-    lockCollection = db.collection('locks');
-    marketPhaseLogsCollection = db.collection('marketPhaseLogs');
-    filterChangeLogCollection = db.collection('filterChangeLogs');
-    // [v22.1.1 DB HARDENING] Collections must exist before the connection is marked healthy.
-    const requiredCollections = {
-      trades: tradesCollection,
-      closedTrades: closedTradesCollection,
-      botState: botStateCollection,
-      locks: lockCollection,
-      marketPhaseLogs: marketPhaseLogsCollection,
-      filterChangeLogs: filterChangeLogCollection
+    if (!db || typeof db.collection !== 'function') {
+      throw new Error('MongoDB-Datenbankhandle konnte nicht initialisiert werden.');
+    }
+
+    const collections = {
+      trades: db.collection('activeTrades'),
+      closedTrades: db.collection('closedTrades'),
+      botState: db.collection('botState'),
+      locks: db.collection('locks'),
+      marketPhaseLogs: db.collection('marketPhaseLogs'),
+      filterChangeLogs: db.collection('filterChangeLogs')
     };
 
-    for (const [name, collection] of Object.entries(requiredCollections)) {
+    for (const [name, collection] of Object.entries(collections)) {
       if (!collection || typeof collection.createIndex !== 'function') {
-        throw new Error(`[DB INIT] Collection "${name}" konnte nicht initialisiert werden.`);
+        throw new Error(
+          `[DB INIT] Collection "${name}" konnte nicht initialisiert werden.`
+        );
       }
     }
 
-    logger.info('📦 MongoDB Collections initialisiert: ' + Object.keys(requiredCollections).join(', '));
+    tradesCollection = collections.trades;
+    closedTradesCollection = collections.closedTrades;
+    botStateCollection = collections.botState;
+    lockCollection = collections.locks;
+    marketPhaseLogsCollection = collections.marketPhaseLogs;
+    filterChangeLogCollection = collections.filterChangeLogs;
 
-    try {
+    if (!dbIndexesInitialized) {
       await tradesCollection.createIndex({ symbol: 1 }, { unique: true });
       await closedTradesCollection.createIndex({ closeTime: -1 });
       await closedTradesCollection.createIndex({ symbol: 1, closeTime: -1 });
       await marketPhaseLogsCollection.createIndex({ timestamp: -1 });
       await filterChangeLogCollection.createIndex({ timestamp: -1 });
-    } catch (e) {
-      // Index creation failure is a DB initialization failure; do not silently continue.
-      throw new Error(`[DB INIT] Index-Erstellung fehlgeschlagen: ${e.message}`);
+      dbIndexesInitialized = true;
+      logger.info('✅ MongoDB-Indizes erfolgreich initialisiert');
     }
 
     isDbConnected = true;
     apiLatencyStats.record('mongodb', Date.now() - startTime);
+    logger.info(
+      '📦 MongoDB Collections: activeTrades, closedTrades, botState, locks, marketPhaseLogs, filterChangeLogs'
+    );
     logger.info('✅ Datenbank erfolgreich verbunden und initialisiert');
 
-    if (dbReconnectInterval) { clearInterval(dbReconnectInterval); dbReconnectInterval = null; }
+    if (dbReconnectInterval) {
+      clearInterval(dbReconnectInterval);
+      dbReconnectInterval = null;
+    }
+
     const instanceId = await acquireInstanceLock();
     startLockHeartbeat(instanceId);
 
@@ -943,13 +965,16 @@ async function initDatabase() {
 
     if (dbBulkTimer) clearInterval(dbBulkTimer);
     dbBulkTimer = setInterval(processDbBulkQueue, config.DB_BULK_INTERVAL_MS);
+
+    return true;
   } catch (e) {
-    logger.error(`🔴 Datenbank-Verbindungsfehler: ${e.message}`);
     isDbConnected = false;
+    dbIndexesInitialized = false;
+    logger.error(`🔴 Datenbank-Initialisierung fehlgeschlagen: ${e.stack || e.message}`);
     scheduleDbReconnect();
+    return false;
   }
 }
-
 // Starts (if not already running) a periodic retry loop that tries to
 // re-establish the MongoDB connection every 5s. Only one interval is ever
 // active at a time; initDatabase()'s success path clears it once a
@@ -960,19 +985,30 @@ async function initDatabase() {
 function scheduleDbReconnect() {
   if (dbReconnectInterval || isShuttingDown) return;
   logger.warn('🔁 Starte MongoDB-Reconnect-Versuche (alle 5s)...');
-  dbReconnectInterval = setInterval(() => { ensureDbConnection(); }, 5000);
+  dbReconnectInterval = setInterval(() => {
+    ensureDbConnection().catch(err => {
+      logger.error(`🔴 MongoDB-Reconnect fehlgeschlagen: ${err.message}`);
+    });
+  }, 5000);
 }
 
 async function ensureDbConnection() {
-  if (isDbConnected || isReconnecting || isShuttingDown) return isDbConnected;
-  isReconnecting = true;
-  try {
-    await initDatabase();
-    if (isDbConnected) logger.info('✅ MongoDB-Reconnect erfolgreich.');
-  } finally {
-    isReconnecting = false;
-  }
-  return isDbConnected;
+  if (isShuttingDown) return false;
+  if (isDbConnected) return true;
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    isReconnecting = true;
+    try {
+      await initDatabase();
+      return isDbConnected;
+    } finally {
+      isReconnecting = false;
+      dbInitPromise = null;
+    }
+  })();
+
+  return dbInitPromise;
 }
 
 async function loadDailyPnLState() {
@@ -3589,37 +3625,64 @@ async function handleTelegramCommand(chatId, text) {
 let telegramOffset = 0;
 
 async function pollTelegramUpdates() {
-  setInterval(() => {
-    if (!isShuttingDown) logger.info('💓 Telegram polling alive');
-  }, 1800000);
-  
   const token = configTelegram.botToken || config.TELEGRAM_BOT_TOKEN;
   if (!token) return;
 
-  while (!isShuttingDown) {
-    try {
-      const res = await axios.get(`https://api.telegram.org/bot${token}/getUpdates`, {
-        params: { offset: telegramOffset, timeout: 25 },
-        timeout: 30000
-      });
-      const updates = res.data?.result || [];
-      for (const update of updates) {
-        telegramOffset = update.update_id + 1;
-        const msg = update.message;
-        if (!msg || !msg.text) continue;
-        if (!isAuthorizedChat(msg.chat.id)) continue;
-        await handleTelegramCommand(msg.chat.id, msg.text);
+  // Prevent accidental double invocation inside the same process.
+  if (telegramPollingActive) {
+    logger.warn('⚠️ Telegram Polling läuft bereits – zweiter Poller wird nicht gestartet.');
+    return;
+  }
+  telegramPollingActive = true;
+
+  const heartbeat = setInterval(() => {
+    if (!isShuttingDown) logger.info('💓 Telegram polling alive');
+  }, 1800000);
+
+  try {
+    while (!isShuttingDown) {
+      try {
+        const res = await axios.get(`https://api.telegram.org/bot${token}/getUpdates`, {
+          params: { offset: telegramOffset, timeout: 25 },
+          timeout: 30000
+        });
+
+        telegramConflictCount = 0;
+        const updates = res.data?.result || [];
+
+        for (const update of updates) {
+          telegramOffset = update.update_id + 1;
+          const msg = update.message;
+          if (!msg || !msg.text) continue;
+          if (!isAuthorizedChat(msg.chat.id)) continue;
+          await handleTelegramCommand(msg.chat.id, msg.text);
+        }
+      } catch (e) {
+        if (e.response?.status === 409) {
+          telegramConflictCount++;
+          const backoff = Math.min(60000, 10000 * telegramConflictCount);
+
+          logger.error(
+            `Telegram poll error: HTTP 409 – ein anderer Telegram-Poller verwendet diesen Bot-Token. ` +
+            `Backoff ${backoff / 1000}s (Konflikt #${telegramConflictCount}).`
+          );
+
+          // Do NOT call deleteWebhook here. A webhook and a competing
+          // getUpdates consumer are different problems; deleting the webhook
+          // does not stop another process polling the same token.
+          await sleep(backoff);
+          continue;
+        }
+
+        logger.error(`Telegram poll error: ${e.message}`);
+        await sleep(5000);
       }
-    } catch (e) {
-      if (e.response?.status === 409) {
-        try { await axios.get(`https://api.telegram.org/bot${token}/deleteWebhook`); } catch (e2) {}
-      }
-      logger.error(`Telegram poll error: ${e.message}`);
-      await sleep(5000);
     }
+  } finally {
+    clearInterval(heartbeat);
+    telegramPollingActive = false;
   }
 }
-
 // ==========================================
 // 18. EXPRESS ENDPOINTS & WEB-BACKTEST
 // ==========================================
