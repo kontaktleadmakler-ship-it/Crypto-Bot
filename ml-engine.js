@@ -55,6 +55,30 @@ function marketPhaseValue(value) {
   return 0;
 }
 
+
+function fitIsotonic(probabilities, labels) {
+  const pairs = probabilities.map((p, i) => ({ p: clamp(Number(p), 0, 1), y: Number(labels[i]) ? 1 : 0 })).sort((a,b) => a.p - b.p);
+  const blocks = [];
+  for (const item of pairs) {
+    blocks.push({ sum: item.y, n: 1, minP: item.p, maxP: item.p });
+    while (blocks.length >= 2) {
+      const a = blocks[blocks.length - 2], b = blocks[blocks.length - 1];
+      if (a.sum / a.n <= b.sum / b.n) break;
+      const merged = { sum: a.sum + b.sum, n: a.n + b.n, minP: a.minP, maxP: b.maxP };
+      blocks.splice(blocks.length - 2, 2, merged);
+    }
+  }
+  return blocks.map(b => ({ minP: b.minP, maxP: b.maxP, value: b.sum / b.n }));
+}
+function applyIsotonic(probability, calibration) {
+  if (!Array.isArray(calibration) || !calibration.length) return probability;
+  let best = calibration[0];
+  for (const b of calibration) { if (probability >= b.minP) best = b; else break; }
+  return clamp(best.value, 0, 1);
+}
+function brierScore(probs, labels) { return probs.length ? probs.reduce((s,p,i) => s + Math.pow(p - labels[i], 2), 0) / probs.length : 0; }
+function logLoss(probs, labels) { const eps = 1e-7; return probs.length ? -probs.reduce((s,p,i) => s + labels[i]*Math.log(clamp(p,eps,1-eps)) + (1-labels[i])*Math.log(clamp(1-p,eps,1-eps)), 0) / probs.length : 0; }
+
 function disposeModelSafely(model) {
   if (!model) return;
   try { model.optimizer?.dispose?.(); } catch (_) {}
@@ -71,6 +95,7 @@ class TensorFlowSignalModel {
     this.epochs = Number(options.epochs || 80);
     this.batchSize = Number(options.batchSize || 32);
     this.logger = options.logger || console;
+    this.calibration = null;
 
     this.model = null;
     this.scaler = null;
@@ -89,7 +114,10 @@ class TensorFlowSignalModel {
       modelVersion: null,
       featureCount: FEATURE_NAMES.length,
       featureNames: FEATURE_NAMES,
-      bestHyperparameters: null
+      bestHyperparameters: null,
+      validationBrier: 0,
+      validationLogLoss: 0,
+      calibrationMethod: 'isotonic'
     };
   }
 
@@ -331,6 +359,15 @@ class TensorFlowSignalModel {
 
       const validationAccuracy = bestValAccuracy;
       const validationLoss = bestValLoss;
+      const validationProbabilities = tf.tidy(() => {
+        const t = tf.tensor2d(xVal, [xVal.length, FEATURE_NAMES.length]);
+        const out = bestCandidate.predict(t);
+        return Array.from(out.dataSync());
+      });
+      const calibration = fitIsotonic(validationProbabilities, yVal);
+      const calibratedProbabilities = validationProbabilities.map(p => applyIsotonic(p, calibration));
+      const validationBrier = brierScore(calibratedProbabilities, yVal);
+      const validationLogLoss = logLoss(calibratedProbabilities, yVal);
 
       const oldAccuracy = finite(this.stats.validationAccuracy, 0);
       if (!force && this.trained && validationAccuracy + 0.02 < oldAccuracy) {
@@ -350,6 +387,7 @@ class TensorFlowSignalModel {
       }
       this.model = bestCandidate;
       this.scaler = scaler;
+      this.calibration = calibration;
       this.trained = true;
       this.stats = {
         trained: true,
@@ -359,6 +397,9 @@ class TensorFlowSignalModel {
         positiveRate: positives / dataset.length,
         validationAccuracy,
         validationLoss,
+        validationBrier,
+        validationLogLoss,
+        calibrationMethod: 'isotonic',
         epochs: bestHistory?.epoch?.length || 0,
         trainedAt: new Date().toISOString(),
         modelVersion: `tfjs-${Date.now()}`,
@@ -386,6 +427,7 @@ class TensorFlowSignalModel {
     fs.writeFileSync(path.join(this.modelDir, 'metadata.json'), JSON.stringify({
       scaler: this.scaler,
       stats: this.stats,
+      calibration: this.calibration,
       thresholds: {
         minPredictionProbability: this.minPredictionProbability,
         strongSignalProbability: this.strongSignalProbability
@@ -409,6 +451,7 @@ class TensorFlowSignalModel {
     this.model = await tf.loadLayersModel(`file://${modelPath}`);
     this.scaler = metadata.scaler;
     this.stats = metadata.stats;
+    this.calibration = metadata.calibration || null;
     this.trained = true;
     return true;
   }
@@ -435,7 +478,8 @@ class TensorFlowSignalModel {
       const output = this.model.predict(input);
       return output.dataSync()[0];
     });
-    const probability = clamp(rawProbability, 0, 1);
+    const raw = clamp(rawProbability, 0, 1);
+    const probability = applyIsotonic(raw, this.calibration);
 
     const confidence = Math.abs(probability - 0.5) * 2;
     const className = probability >= this.strongSignalProbability
