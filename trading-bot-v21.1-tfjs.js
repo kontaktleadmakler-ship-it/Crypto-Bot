@@ -494,6 +494,7 @@ const config = {
   LOCK_ACQUIRE_RETRY_DELAY_MS: parseInt(process.env.LOCK_ACQUIRE_RETRY_DELAY_MS, 10) || 2000,
   LOCK_STALE_AFTER_MS: parseInt(process.env.LOCK_STALE_AFTER_MS, 10) || 5 * 60 * 1000,
   LOCK_HANDOFF_ENABLED: process.env.LOCK_HANDOFF_ENABLED !== 'false',
+  LOCK_HANDOFF_GRACE_MS: parseInt(process.env.LOCK_HANDOFF_GRACE_MS, 10) || 15000,
   LOCK_HEARTBEAT_INTERVAL_MS: parseInt(process.env.LOCK_HEARTBEAT_INTERVAL_MS, 10) || 2000,
 
   FUNDING_INTERVAL_HOURS: parseFloat(process.env.FUNDING_INTERVAL_HOURS) || 8,
@@ -562,7 +563,7 @@ function validateConfig() {
     'TRAILING_ATR_MULT', 'FAST_TRACK_INTERVAL_SECONDS', 'TICKER_BATCH_SIZE',
     'SLIPPAGE_PERCENT', 'FEE_PERCENT', 'TP1_CLOSE_PERCENT', 'MAX_EXPOSURE_RATIO',
     'SCAN_CONCURRENCY', 'MAX_CONSECUTIVE_PRICE_FAILURES', 'LEVERAGE',
-    'LOCK_ACQUIRE_RETRIES', 'LOCK_ACQUIRE_RETRY_DELAY_MS', 'LOCK_STALE_AFTER_MS', 'LOCK_HEARTBEAT_INTERVAL_MS',
+    'LOCK_ACQUIRE_RETRIES', 'LOCK_ACQUIRE_RETRY_DELAY_MS', 'LOCK_STALE_AFTER_MS', 'LOCK_HANDOFF_GRACE_MS', 'LOCK_HEARTBEAT_INTERVAL_MS',
     'FUNDING_INTERVAL_HOURS', 'SCAN_STATS_TELEGRAM_EVERY_N_SCANS',
     'TREND_EMA_FAST_15M', 'TREND_EMA_SLOW_15M',
     'MAX_KLINES_CACHE_SIZE', 'CACHE_CLEANUP_MINUTES',
@@ -837,13 +838,20 @@ async function tryAcquireLockOnce(instanceId) {
 
   // FIX: Only acquire an empty/stale lock. An active owner is never silently
   // overwritten; Render handoff is coordinated through takeoverRequestedBy.
+  // FIX: A Render deployment can start the replacement before the old process
+  // has released the lease. Allow the requester to take over atomically after
+  // a short grace period, while still never overwriting an unrelated active lock.
+  const now = new Date();
+  const staleBefore = new Date(Date.now() - config.LOCK_STALE_AFTER_MS);
+  const handoffBefore = new Date(Date.now() - config.LOCK_HANDOFF_GRACE_MS);
   const result = await lockCollection.updateOne(
     { _id: 'instanceLock', $or: [
       { instanceId: null },
       { instanceId: instanceId },
-      { lastSeen: { $lt: new Date(Date.now() - config.LOCK_STALE_AFTER_MS) } }
+      { lastSeen: { $lt: staleBefore } },
+      { takeoverRequestedBy: instanceId, takeoverRequestedAt: { $lte: handoffBefore } }
     ] },
-    { $set: { instanceId, lastSeen: new Date(), takeoverRequestedBy: null, takeoverRequestedAt: null } }
+    { $set: { instanceId, lastSeen: now, takeoverRequestedBy: null, takeoverRequestedAt: null } }
   );
   return result.matchedCount > 0;
 }
@@ -879,6 +887,9 @@ async function acquireInstanceLock() {
       }
 
       if (!handoffRequested) handoffRequested = await requestInstanceLockHandoff(instanceId);
+      if (handoffRequested && attempt === 1) {
+        logger.info(`⏳ Warte bis zu ${config.LOCK_HANDOFF_GRACE_MS / 1000}s auf sauberen Render-Lock-Handoff...`);
+      }
       if (attempt < config.LOCK_ACQUIRE_RETRIES) await sleep(config.LOCK_ACQUIRE_RETRY_DELAY_MS);
     }
 
