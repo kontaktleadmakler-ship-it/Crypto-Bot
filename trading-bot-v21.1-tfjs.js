@@ -445,7 +445,7 @@ const config = {
   DYNAMIC_TRAILING_ATR: process.env.DYNAMIC_TRAILING_ATR !== 'false',
   FAST_TRACK_INTERVAL_SECONDS: parseInt(process.env.FAST_TRACK_INTERVAL_SECONDS, 10) || 60,
   TICKER_BATCH_SIZE: parseInt(process.env.TICKER_BATCH_SIZE, 10) || 10,
-  SLIPPAGE_PERCENT: parseFloat(process.env.SLIPPAGE_PERCENT) || 0.05,
+  SLIPPAGE_PERCENT: parseFloat(process.env.SLIPPAGE_PERCENT) || 0.10,
   FEE_PERCENT: parseFloat(process.env.FEE_PERCENT) || 0.1,
   TP1_CLOSE_PERCENT: parseFloat(process.env.TP1_CLOSE_PERCENT) || 60,
   ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false',
@@ -504,7 +504,7 @@ const config = {
   ML_BATCH_SIZE: parseInt(process.env.ML_BATCH_SIZE, 10) || 32,
   
   // DQN spezifische Config
-  DQN_ENABLED: false,
+  DQN_ENABLED: true,
 };
 
 function validateConfig() {
@@ -644,7 +644,7 @@ async function trainSignalMLModel(force = false) {
     isModelTrained = !!result.trained;
     lastMLTrainingStats = result;
 
-    if (false) {
+    if (config.DQN_ENABLED) {
       await dqnAgent.trainFromClosedTrades(closedTradesCollection);
     }
 
@@ -662,7 +662,7 @@ async function loadSignalMLModel() {
     isModelTrained = loaded;
     if (loaded) lastMLTrainingStats = mlModel.getStats();
     
-    if (false) {
+    if (config.DQN_ENABLED) {
       await dqnAgent.init();
     }
 
@@ -1842,7 +1842,7 @@ function formatScanStatsReport(stats) {
   if (stats.newsBlackout) reasons.push(`News-Blackout (Makro-Event): ${stats.newsBlackout}`);
   if (stats.mlBlocked) reasons.push(`TensorFlow.js ML-Filter blockiert: ${stats.mlBlocked}`);
   if (stats.dqnBlocked) reasons.push(`DQN Agent (Reinforcement Learning) blockiert: ${stats.dqnBlocked}`);
-  if (stats.trendQualityLow) reasons.push(`Trend Quality Score (ADX/Hurst/Chop) zu niedrig: ${stats.trendQualityLow}`);
+  if (stats.trendQualityLow) reasons.push(`Trend Quality Score (ADX/Hurst) zu niedrig: ${stats.trendQualityLow}`);
   if (stats.noBOS) reasons.push(`Kein BOS: ${stats.noBOS}`);
   if (stats.rsiTooLow) reasons.push(`RSI zu niedrig: ${stats.rsiTooLow}`);
   if (stats.rsiTooHigh) reasons.push(`RSI zu hoch: ${stats.rsiTooHigh}`);
@@ -2233,39 +2233,29 @@ function evaluateDirectionGates(dir, p, scanStats) {
   // singularly veto a setup.
   let score = 0, max = 0;
 
-  // --- Punkt 10 - Trend Quality Score: ADX, Hurst und Chop maßen bisher alle
-  // "Trendstärke" getrennt (25+20+15 = 60% der maximal erreichbaren Punkte)
-  // und verdoppelten damit effektiv dieselbe Information im Confluence-Score.
-  // Sie werden jetzt zu einem einzigen gewichteten Score zusammengefasst:
-  //   trendQuality = (adx/100 * 0.5) + (hurst * 0.3) + ((100-chop)/100 * 0.2)
-  // Ergebnis liegt zwischen 0 und 1 und ersetzt die drei separaten Blöcke.
-  // Die einzelnen Filter bleiben über die FILTER_REGISTRY ein-/ausschaltbar;
-  // ist einer deaktiviert, wird sein Gewichtsanteil unter den verbleibenden
-  // aktiven neu verteilt, damit z.B. "nur ADX aus" nicht automatisch auch
-  // Hurst/Chop unwirksam macht.
-  const chopUsable = filterState.chop.enabled && p.chop;
+  // Trendqualität bewusst auf zwei komplementärere Signale reduziert:
+  // ADX + Hurst. Choppiness wird nicht mehr zusätzlich gewichtet.
+  // Dafür bekommen RSI und relatives Volumen mehr Gewicht.
   let trendRaw = 0, trendWeightSum = 0;
-  if (filterState.adx.enabled) { trendRaw += Math.max(0, Math.min(1, p.adx / 100)) * 0.5; trendWeightSum += 0.5; }
-  if (filterState.hurst.enabled) { trendRaw += Math.max(0, Math.min(1, p.hurst)) * 0.3; trendWeightSum += 0.3; }
-  if (chopUsable) { trendRaw += Math.max(0, Math.min(1, (100 - p.chop) / 100)) * 0.2; trendWeightSum += 0.2; }
+  if (filterState.adx.enabled) { trendRaw += Math.max(0, Math.min(1, p.adx / 100)) * 0.6; trendWeightSum += 0.6; }
+  if (filterState.hurst.enabled) { trendRaw += Math.max(0, Math.min(1, p.hurst)) * 0.4; trendWeightSum += 0.4; }
 
   if (trendWeightSum > 0) {
-    max += 60;
-    const trendQuality = trendRaw / trendWeightSum; // renormalisiert auf 0..1
-    score += 60 * trendQuality;
+    max += 50;
+    const trendQuality = trendRaw / trendWeightSum;
+    score += 50 * trendQuality;
     const effectiveADX = p.adaptiveADX || config.ADX_MIN;
     const belowThreshold =
       (filterState.adx.enabled && p.adx < effectiveADX) ||
-      (filterState.hurst.enabled && p.hurst < config.MIN_HURST_EXPONENT) ||
-      (chopUsable && p.chop > config.MAX_CHOP_INDEX);
+      (filterState.hurst.enabled && p.hurst < config.MIN_HURST_EXPONENT);
     if (belowThreshold) scanStats.trendQualityLow++;
   }
 
-  max += 15;
+  max += 20;
   const rsiInZone = isLong
     ? (!filterState.rsi_long_min.enabled || p.rsi >= config.RSI_LONG_MIN) && p.rsi <= config.RSI_LONG_MAX
     : p.rsi >= config.RSI_SHORT_MIN && (!filterState.rsi_short_max.enabled || p.rsi <= config.RSI_SHORT_MAX);
-  if (rsiInZone) score += 15;
+  if (rsiInZone) score += 20;
   else scanStats[isLong ? (p.rsi < config.RSI_LONG_MIN ? 'rsiTooLow' : 'rsiTooHigh') : (p.rsi < config.RSI_SHORT_MIN ? 'rsiTooLow' : 'rsiTooHigh')]++;
 
   max += 10;
@@ -2277,10 +2267,10 @@ function evaluateDirectionGates(dir, p, scanStats) {
   if (macdOk) score += 10; else scanStats.macdFail++;
 
   if (filterState.relvol.enabled) {
-    max += 5;
+    max += 10;
     const effectiveVolume = p.adaptiveVolume || config.MIN_RELATIVE_VOLUME;
-    if (effectiveVolume <= 0 || p.relativeVolume >= effectiveVolume) score += 5;
-    else { score += Math.max(0, 5 * (p.relativeVolume / effectiveVolume)); scanStats.relVolTooLow++; }
+    if (effectiveVolume <= 0 || p.relativeVolume >= effectiveVolume) score += 10;
+    else { score += Math.max(0, 10 * (p.relativeVolume / effectiveVolume)); scanStats.relVolTooLow++; }
   }
 
   const gateScore = max > 0 ? Math.round(100 * score / max) : 100;
@@ -2335,6 +2325,9 @@ async function refreshNewsEvents() {
     logger.info(`📰 ${imported.length} HIGH-Impact-News-Events automatisch geladen.`);
   } catch (e) { logger.warn(`[News] Auto-Import fehlgeschlagen: ${e.message}`); }
 }
+// Initialer Import; bei Feed-Fehlern bleiben die manuellen ENV-Events erhalten.
+refreshNewsEvents().catch(() => {});
+
 
 function isNewsBlackout(now = Date.now()) {
   return newsEvents.some(t => now >= t - NEWS_BLACKOUT_BEFORE_MS && now <= t + NEWS_BLACKOUT_AFTER_MS);
@@ -2554,7 +2547,7 @@ async function scanMarket() {
         const fundingRate = futuresData ? futuresData.fundingRate : 0;
 
         const gateParams = {
-          trend4h, trend1h, trend15m, btcTrend, adx, hurst, chop, bosBullish, bosBearish,
+          trend4h, trend1h, trend15m, btcTrend, adx, hurst, bosBullish, bosBearish,
           rsi, poc, vwap, currentPrice, macd, fundingRate, relativeVolume,
           adaptiveADX, adaptiveVolume
         };
@@ -3731,6 +3724,10 @@ intervalTimers.push(setInterval(() => {
   try { klinesCache.cleanup(config.CACHE_CLEANUP_MINUTES * 60 * 1000); }
   catch (e) { logger.error(`[CACHE CLEANUP ERROR] ${e.message}`); }
 }, config.CACHE_CLEANUP_MINUTES * 60 * 1000));
+
+intervalTimers.push(setInterval(() => {
+  refreshNewsEvents().catch(e => logger.warn(`[News] Refresh-Fehler: ${e.message}`));
+}, 60 * 60 * 1000));
 
 cronJobs.push(cron.schedule('59 23 * * *', async () => {
   try {
