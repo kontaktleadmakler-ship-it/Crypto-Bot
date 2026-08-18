@@ -17,7 +17,8 @@ const { DeepQTheTradingAgent } = require('./rl-engine'); // <-- DQN Agent Modul 
 const { HedgeManager } = require('./hedgeManager');
 const { VolatilitySurfaceManager } = require('./volatilitySurface');
 const { OrderFlowAnalyzer } = require('./orderFlowAnalyzer');
-const { MacroFilterEngine } = require('./macroFilter'); // <-- Makro & Sentiment Filter (in v21.1 wiederhergestellt)
+const { MacroFilterEngine } = require('./macroFilter'); // Sentiment / Fear & Greed
+const { MacroEngine } = require('./macro-engine'); // FRED Makro-Release-Kalender
 const { runBacktest, buildConfig: buildBacktestConfig, optimizeHyperparameters } = require('./backtest-engine');
 
 // ==========================================
@@ -607,6 +608,11 @@ const hedgeManager = new HedgeManager({ logger, thresholdDropPct: -2.5 });
 const volManager = new VolatilitySurfaceManager({ logger });
 const orderFlowManager = new OrderFlowAnalyzer({ logger });
 const macroEngine = new MacroFilterEngine({ logger });
+const macroCalendar = new MacroEngine({
+  logger,
+  apiKey: process.env.FRED_API_KEY,
+  refreshIntervalMs: (parseInt(process.env.FRED_REFRESH_HOURS, 10) || 6) * 60 * 60 * 1000
+});
 
 let isModelTrained = false;
 let lastMLTrainingStats = null;
@@ -2295,43 +2301,21 @@ function createEmptyScanStats() {
 
 let isScanning = false;
 
-// Punkt 14 - News-Filter: Schutz vor hoher Volatilität durch Makro-News
-// (FOMC, CPI, NFP etc.). NEWS_BLACKOUT_TIMES ist eine komma-getrennte Liste
-// von ISO-Zeitstempeln (UTC), die z.B. manuell aus einem Wirtschaftskalender
-// wie ForexFactory gepflegt oder per Deploy-Skript aktualisiert werden kann.
-// Blackout-Fenster: 30 Minuten vor bis 60 Minuten nach jedem Event - in
-// diesem Fenster wird der komplette Scan ausgesetzt.
-const NEWS_BLACKOUT_BEFORE_MS = 30 * 60 * 1000;
-const NEWS_BLACKOUT_AFTER_MS = 60 * 60 * 1000;
-
-function loadNewsEvents() {
-  const raw = process.env.NEWS_BLACKOUT_TIMES;
-  if (!raw) return [];
-  return raw.split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
-    .map(s => Date.parse(s))
-    .filter(t => Number.isFinite(t));
+// Punkt 14 - Makro-Release-Filter
+// Der bisherige öffentliche Faireconomy/ForexFactory-Feed wird nicht mehr
+// verwendet. Der Kalender kommt aus macro-engine.js (FRED) und behält bei
+// API-Fehlern den letzten erfolgreichen Stand. Manuelle NEWS_BLACKOUT_TIMES
+// bleiben als Fallback erhalten.
+async function refreshMacroCalendar(force = false) {
+  return macroCalendar.refresh(force);
 }
-
-const newsEvents = loadNewsEvents();
-async function refreshNewsEvents() {
-  const feedUrl = process.env.FOREXFACTORY_API_URL || 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';
-  try {
-    const response = await axios.get(feedUrl, { timeout: 8000 });
-    if (!Array.isArray(response.data)) return;
-    const imported = response.data.filter(e => String(e.impact || '').toUpperCase() === 'HIGH').map(e => Date.parse(e.date || e.datetime || e.timestamp)).filter(Number.isFinite);
-    newsEvents.splice(0, newsEvents.length, ...imported);
-    logger.info(`📰 ${imported.length} HIGH-Impact-News-Events automatisch geladen.`);
-  } catch (e) { logger.warn(`[News] Auto-Import fehlgeschlagen: ${e.message}`); }
-}
-// Initialer Import; bei Feed-Fehlern bleiben die manuellen ENV-Events erhalten.
-refreshNewsEvents().catch(() => {});
-
 
 function isNewsBlackout(now = Date.now()) {
-  return newsEvents.some(t => now >= t - NEWS_BLACKOUT_BEFORE_MS && now <= t + NEWS_BLACKOUT_AFTER_MS);
+  return macroCalendar.isBlackout(now);
 }
+
+// Initialer Makro-Import; ohne FRED_API_KEY bleiben manuelle ENV-Events aktiv.
+refreshMacroCalendar().catch(e => logger.warn(`[Macro] Initialer Refresh fehlgeschlagen: ${e.message}`));
 
 async function scanMarket() {
   if (isScanning) return;
@@ -2372,7 +2356,9 @@ async function scanMarket() {
   try {
     if (isNewsBlackout()) {
       scanStats.newsBlackout = (scanStats.newsBlackout || 0) + 1;
-      logger.warn('⚠️ Scan wegen News-Blackout (Makro-Event, z.B. FOMC/CPI/NFP) ausgesetzt.');
+      const macroStatus = macroCalendar.getStatus();
+      const names = macroStatus.active.map(e => e.name).join(', ');
+      logger.warn(`⚠️ Scan wegen Makro-Blackout ausgesetzt: ${names || 'HIGH-Impact Event'}.`);
       return;
     }
 
@@ -3726,8 +3712,8 @@ intervalTimers.push(setInterval(() => {
 }, config.CACHE_CLEANUP_MINUTES * 60 * 1000));
 
 intervalTimers.push(setInterval(() => {
-  refreshNewsEvents().catch(e => logger.warn(`[News] Refresh-Fehler: ${e.message}`));
-}, 60 * 60 * 1000));
+  refreshMacroCalendar().catch(e => logger.warn(`[Macro] Refresh-Fehler: ${e.message}`));
+}, (parseInt(process.env.FRED_REFRESH_HOURS, 10) || 6) * 60 * 60 * 1000));
 
 cronJobs.push(cron.schedule('59 23 * * *', async () => {
   try {
