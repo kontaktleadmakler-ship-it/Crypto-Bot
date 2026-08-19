@@ -1,7 +1,6 @@
 
 
 
-Trading bot v21 1 tfjs · JS
 /**
  * ============================================================================
  * TRADING SIGNAL BOT - ULTIMATE v21.7 DYNAMIC VOLATILITY SURFACE & DQN EDITION
