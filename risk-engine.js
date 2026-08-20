@@ -9,6 +9,7 @@ class RiskEngine {
   }
 
   setKillSwitch(reason) { this.killSwitch = true; this.killReason = reason || 'manual'; }
+  isKilled() { return this.killSwitch; }
   clearKillSwitch() { this.killSwitch = false; this.killReason = null; }
 
   positionSize({ equityUSD, riskPercent, entryPrice, stopLossPrice }) {
@@ -27,7 +28,7 @@ class RiskEngine {
     return { riskUSD, units, notionalUSD, stopDistance, stopPct: stopDistance / entry };
   }
 
-  evaluate({ equityUSD, dailyPnL, peakEquityUSD, activeTrades = [], direction, notionalUSD = 0, maxConcurrent, maxSameDirection, maxExposureRatio, maxDailyLossUSD, maxDrawdownPercent }) {
+  evaluate({ equityUSD, dailyPnL, peakEquityUSD, activeTrades = [], direction, notionalUSD = 0, maxConcurrent, maxSameDirection, maxExposureRatio, maxDailyLossUSD, maxDrawdownPercent, leverage = 1 }) {
     if (this.killSwitch) return { allowed: false, reason: 'kill-switch:' + this.killReason };
     if (!Number.isFinite(equityUSD) || equityUSD <= 0) return { allowed: false, reason: 'invalid-equity' };
     if (dailyPnL <= -Math.abs(maxDailyLossUSD)) return { allowed: false, reason: 'daily-loss-limit' };
@@ -39,8 +40,11 @@ class RiskEngine {
       if (same >= maxSameDirection) return { allowed: false, reason: 'max-same-direction' };
     }
     const currentNotional = activeTrades.reduce((s, t) => s + Math.abs(Number(t.notionalUSD) || 0), 0);
-    const maxNotional = equityUSD * maxExposureRatio;
-    if (currentNotional + Math.abs(notionalUSD) > maxNotional) return { allowed: false, reason: 'max-exposure' };
+    const effectiveLeverage = Number.isFinite(Number(leverage)) && Number(leverage) > 0 ? Number(leverage) : 1;
+    const currentMargin = currentNotional / effectiveLeverage;
+    const newMargin = Math.abs(notionalUSD) / effectiveLeverage;
+    const maxMargin = equityUSD * maxExposureRatio;
+    if (currentMargin + newMargin > maxMargin) return { allowed: false, reason: 'max-exposure' };
     return { allowed: true, reason: null, drawdownPercent: dd };
   }
 }
