@@ -141,44 +141,66 @@ class DeepQTheTradingAgent {
   async train() {
     if (this.memory.length < this.batchSize) return { trained: false, reason: 'not-enough-memory' };
 
+    // Zufällige Samples aus dem Memory ziehen
     const batch = [];
-    for (let i = 0; i < this.batchSize; i++) batch.push(this.memory[Math.floor(Math.random() * this.memory.length)]);
+    for (let i = 0; i < this.batchSize; i++) {
+      const index = Math.floor(Math.random() * this.memory.length);
+      batch.push(this.memory[index]);
+    }
 
     const states = batch.map(b => b.state);
     const nextStates = batch.map(b => b.nextState);
 
-    // FIX: all temporary prediction tensors are scoped to tf.tidy().
-    const { currentQsData, nextQsData } = tf.tidy(() => {
-      const statesTensor = tf.tensor2d(states);
-      const nextStatesTensor = tf.tensor2d(nextStates);
-      const currentQs = this.model.predict(statesTensor);
-      const nextQs = this.targetModel.predict(nextStatesTensor);
-      const currentQsData = currentQs.arraySync();
-      const nextQsData = nextQs.arraySync();
-      return { currentQsData, nextQsData };
-    });
+    const statesTensor = tf.tensor2d(states);
+    const nextStatesTensor = tf.tensor2d(nextStates);
 
-    const X = [], Y = [];
+    const currentQs = this.model.predict(statesTensor);
+    const nextQs = this.targetModel.predict(nextStatesTensor);
+
+    const currentQsData = currentQs.arraySync();
+    const nextQsData = nextQs.arraySync();
+
+    const X = [];
+    const Y = [];
+
     for (let i = 0; i < batch.length; i++) {
       const { action, reward, done } = batch[i];
       const targetQ = [...currentQsData[i]];
-      targetQ[action] = done ? reward : reward + this.gamma * Math.max(...nextQsData[i]);
-      X.push(states[i]); Y.push(targetQ);
+
+      if (done) {
+        targetQ[action] = reward;
+      } else {
+        const maxNextQ = Math.max(...nextQsData[i]);
+        targetQ[action] = reward + this.gamma * maxNextQ;
+      }
+
+      X.push(states[i]);
+      Y.push(targetQ);
     }
 
-    // fit() is async, so its tensors must stay alive until the promise settles.
-    // FIX: explicit finally disposal closes the async lifetime safely.
     const xTensor = tf.tensor2d(X);
     const yTensor = tf.tensor2d(Y);
-    try {
-      await this.model.fit(xTensor, yTensor, { epochs: 1, verbose: 0 });
-    } finally {
-      xTensor.dispose();
-      yTensor.dispose();
-    }
+
+    await this.model.fit(xTensor, yTensor, {
+      epochs: 1,
+      verbose: 0
+    });
+
+    // Aufräumen im Tensor-Speicher, um Memory Leaks zu verhindern
+    statesTensor.dispose();
+    nextStatesTensor.dispose();
+    currentQs.dispose();
+    nextQs.dispose();
+    xTensor.dispose();
+    yTensor.dispose();
 
     this.trainingSteps++;
-    if (this.epsilon > this.epsilonMin) this.epsilon *= this.epsilonDecay;
+
+    // Epsilon abbauen (weniger Exploration, mehr Fokus auf gelerntes Wissen)
+    if (this.epsilon > this.epsilonMin) {
+      this.epsilon *= this.epsilonDecay;
+    }
+
     return { trained: true, epsilon: this.epsilon, memorySize: this.memory.length };
   }
 
@@ -216,7 +238,7 @@ class DeepQTheTradingAgent {
     try {
       if (!closedTradesCollection) return { trained: false, reason: 'no-db-collection' };
       
-      const trades = await closedTradesCollection.find({ isPartial: { $ne: true }, closeTime: { $exists: true } }).sort({ closeTime: -1 }).limit(500).toArray();
+      const trades = await closedTradesCollection.find({ isPartial: { $ne: true }, closeTime: { $exists: true } }).sort({ closeTime: 1 }).limit(500).toArray();
       if (trades.length < 10) return { trained: false, reason: 'not-enough-trades' };
 
       // Adaptives Epsilon basierend auf den jüngsten Trades anpassen
