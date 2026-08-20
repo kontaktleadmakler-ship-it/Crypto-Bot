@@ -1,6 +1,3 @@
-
-
-
 /**
  * ============================================================================
  * TRADING SIGNAL BOT - ULTIMATE v21.7 DYNAMIC VOLATILITY SURFACE & DQN EDITION
@@ -8,7 +5,7 @@
  *  State-Persistenz, Hurst-Exponent, Marktphasen-Logging & Dynamic Filter Control)
  * ============================================================================
  */
- 
+
 require('dotenv').config();
 const express = require('express');
 const cron = require('node-cron');
@@ -20,18 +17,17 @@ const { DeepQTheTradingAgent } = require('./rl-engine'); // <-- DQN Agent Modul 
 const { HedgeManager } = require('./hedgeManager');
 const { VolatilitySurfaceManager } = require('./volatilitySurface');
 const { OrderFlowAnalyzer } = require('./orderFlowAnalyzer');
-const { MacroFilterEngine } = require('./macroFilter'); // Sentiment / Fear & Greed
-const { MacroEngine } = require('./macro-engine'); // FRED Makro-Release-Kalender
+const { MacroFilterEngine } = require('./macroFilter'); // <-- Makro & Sentiment Filter (in v21.1 wiederhergestellt)
 const { runBacktest, buildConfig: buildBacktestConfig, optimizeHyperparameters } = require('./backtest-engine');
-// IMPROVED: centralized services for indicators, filters, config, queues and market-data access.
-const { evaluateDirectionGates: evaluateDirectionGatesCentral } = require('./src/filter-system');
-const indicators = require('./src/indicators');
- 
+const { RiskEngine } = require('./risk-engine');
+const { DataValidator } = require('./data-validator');
+const { AuditLogger } = require('./audit-log');
+
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
 // ==========================================
 const { Writable } = require('stream');
- 
+
 const recentLogs = [];
 const memoryStream = new Writable({
   write(chunk, encoding, callback) {
@@ -40,11 +36,11 @@ const memoryStream = new Writable({
     callback();
   }
 });
- 
+
 const memoryLogTransport = new winston.transports.Stream({
   stream: memoryStream
 });
- 
+
 const logger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
@@ -56,31 +52,31 @@ const logger = winston.createLogger({
     memoryLogTransport
   ]
 });
- 
+
 let isShuttingDown = false;
 let currentMarketPhase = 'RANGING';
 let adaptiveConfig = null;
 let lastScanStats = null;
 let scanCounter = 0;
- 
+
 let currentStreak = 0;
 let maxWinStreak = 0;
 let maxLossStreak = 0;
- 
+
 let peakCapital = parseFloat(process.env.CAPITAL_USD) || 10000;
 let dailyNetPnL = 0;
 let consecutiveLosses = 0;
- 
+
 const MAX_DRAWDOWN_PERCENT = parseFloat(process.env.MAX_DRAWDOWN_PERCENT) || 25;
 const DAILY_PROFIT_TARGET = parseFloat(process.env.DAILY_PROFIT_TARGET) || 500;
- 
+
 let kucoinErrorCount = 0;
 let kucoinCircuitOpenUntil = 0;
 const KUCOIN_CIRCUIT_THRESHOLD = 3;
 const KUCOIN_CIRCUIT_COOLDOWN_MS = 300000;
- 
+
 const manualBlacklist = new Set();
- 
+
 // ==========================================
 // 2. FILTER REGISTRY & ZENTRALE KONFIGURATION
 // ==========================================
@@ -96,12 +92,12 @@ const FILTER_REGISTRY = {
   btctrend:      { configKey: 'ALLOW_COUNTER_BTC_TREND', name: 'Gegen-BTC-Trend', default: false, type: 'boolean' },
   timetrend:     { configKey: 'ENABLE_TIME_FILTER', name: 'Time-based Learning Filter', default: true, type: 'boolean' }
 };
- 
+
 const filterState = {};
 Object.keys(FILTER_REGISTRY).forEach(key => {
   filterState[key] = { enabled: true };
 });
- 
+
 // ==========================================
 // 3. API LATENZ & RATE LIMITER
 // ==========================================
@@ -121,7 +117,7 @@ const apiLatencyStats = {
     return this[service].reduce((sum, e) => sum + e.latency, 0) / this[service].length;
   }
 };
- 
+
 const apiRateLimiter = {
   requests: 0,
   windowStart: Date.now(),
@@ -144,16 +140,13 @@ const apiRateLimiter = {
     this.requests++;
   }
 };
- 
+
 // ==========================================
 // 4. BULK QUEUE & LRU CACHE
 // ==========================================
 let dbBulkQueue = [];
 let dbBulkTimer = null;
-// IMPROVED: bounded DB bulk queue and per-batch retry counter.
-const DB_BULK_QUEUE_MAX = Number(process.env.DB_BULK_QUEUE_MAX || 500);
-const DB_BULK_MAX_RETRIES = Number(process.env.DB_BULK_MAX_RETRIES || 3);
- 
+
 class LRUCache {
   constructor(maxSize) {
     this.maxSize = maxSize;
@@ -189,7 +182,7 @@ class LRUCache {
     }
   }
 }
- 
+
 // ==========================================
 // 5. HELFER & TELEGRAM ENGINE
 // ==========================================
@@ -201,78 +194,41 @@ function safeParseFloat(value, fieldName, context) {
   }
   return parsed;
 }
- 
+
 function escapeHtml(value) {
   return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
- 
+
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function todayUTCString() { return new Date().toISOString().slice(0, 10); }
- 
+
 const configTelegram = {
   botToken: process.env.TELEGRAM_BOT_TOKEN || '',
   chatId: process.env.TELEGRAM_CHAT_ID || ''
 };
- 
-// FIX: bounded Telegram queue. The previous Promise chain could grow without limit.
-let telegramQueue = [];
-let telegramQueueRunning = false;
-const TELEGRAM_QUEUE_MAX = Number(process.env.TELEGRAM_QUEUE_MAX || 100);
- 
-const telegramSendTimes = [];
-const TELEGRAM_MAX_MESSAGES_PER_MINUTE = 20;
-async function enforceTelegramRateLimit() {
-  let now = Date.now();
-  while (telegramSendTimes.length && now - telegramSendTimes[0] >= 60000) telegramSendTimes.shift();
-  if (telegramSendTimes.length >= TELEGRAM_MAX_MESSAGES_PER_MINUTE) {
-    await sleep(Math.max(0, 60000 - (now - telegramSendTimes[0]) + 25));
-    now = Date.now();
-    while (telegramSendTimes.length && now - telegramSendTimes[0] >= 60000) telegramSendTimes.shift();
-  }
-  telegramSendTimes.push(Date.now());
-}
+
+let telegramQueue = Promise.resolve();
+
 function queueTelegramMessage(taskFn) {
-  return new Promise(resolve => {
-    if (telegramQueue.length >= TELEGRAM_QUEUE_MAX) {
-      // FIX: discard oldest pending task on overflow.
-      telegramQueue.shift();
-      logger.warn(`[TelegramQueue] Overflow: oldest message discarded (max ${TELEGRAM_QUEUE_MAX}).`);
-    }
-    telegramQueue.push({ taskFn, resolve });
-    drainTelegramQueue();
+  telegramQueue = telegramQueue.then(async () => {
+    try {
+      await taskFn();
+    } catch (e) {}
   });
+  return telegramQueue;
 }
-async function drainTelegramQueue() {
-  if (telegramQueueRunning) return;
-  telegramQueueRunning = true;
-  try {
-    while (telegramQueue.length) {
-      const item = telegramQueue.shift();
-      try {
-        await enforceTelegramRateLimit();
-        await item.taskFn();
-      } catch (e) {
-        logger.error(`[TelegramQueue] task failed: ${e.message}`);
-      } finally {
-        item.resolve();
-      }
-    }
-  } finally {
-    telegramQueueRunning = false;
-  }
-}
- 
+
 async function sendTelegramAlert(text) {
   if (!configTelegram.botToken || !configTelegram.chatId) return;
   const startTime = Date.now();
   const chatIds = configTelegram.chatId.split(',').map(id => id.trim()).filter(Boolean);
- 
+
   for (const chatId of chatIds) {
     await queueTelegramMessage(async () => {
       let success = false;
       let attempts = 0;
       let delay = 3000;
- 
+
       while (!success && attempts < 3) {
         try {
           attempts++;
@@ -298,14 +254,14 @@ async function sendTelegramAlert(text) {
   }
   apiLatencyStats.record('telegram', Date.now() - startTime);
 }
- 
+
 async function sendTelegramReply(chatId, text) {
   if (!configTelegram.botToken || !chatId) return;
   await queueTelegramMessage(async () => {
     let success = false;
     let attempts = 0;
     let delay = 3000;
- 
+
     while (!success && attempts < 3) {
       try {
         attempts++;
@@ -329,7 +285,7 @@ async function sendTelegramReply(chatId, text) {
     }
   });
 }
- 
+
 async function getAlertTimestamp(key) {
   if (!botStateCollection || !isDbConnected) return 0;
   try {
@@ -339,7 +295,7 @@ async function getAlertTimestamp(key) {
     return 0;
   }
 }
- 
+
 async function persistAlertHistoryEntry(key, timestamp) {
   if (!botStateCollection || !isDbConnected) return;
   try {
@@ -350,14 +306,23 @@ async function persistAlertHistoryEntry(key, timestamp) {
     );
   } catch (e) {}
 }
- 
+
 async function sendDeduplicatedAlert(key, text, cooldownMs = 300000) {
-  const lastSent = await getAlertTimestamp(key);
-  if (Date.now() - lastSent < cooldownMs) return;
-  await persistAlertHistoryEntry(key, Date.now());
-  await sendTelegramAlert(text);
+  if (!botStateCollection || !isDbConnected) return;
+  const now = Date.now();
+  try {
+    const result = await botStateCollection.findOneAndUpdate(
+      { _id: `alert_${key}`, $or: [{ lastSent: { $exists: false } }, { lastSent: { $lte: now - cooldownMs } }] },
+      { $set: { lastSent: now } },
+      { upsert: true, returnDocument: 'after' }
+    );
+    if (!result) return;
+    await sendTelegramAlert(text);
+  } catch (e) {
+    logger.warn(`[ALERT-COOLDOWN] ${key}: ${e.message}`);
+  }
 }
- 
+
 async function sendBatchedSignalAlert(signals) {
   if (signals.length === 0) return;
   if (signals.length === 1) {
@@ -371,12 +336,12 @@ async function sendBatchedSignalAlert(signals) {
   batchText += `⚠️ <b>Mehrere Signale - Position Sizing beachten!</b>`;
   await sendTelegramAlert(batchText);
 }
- 
+
 function updateTelegramConfig(token, chatId) {
   configTelegram.botToken = token;
   configTelegram.chatId = chatId;
 }
- 
+
 // ==========================================
 // 6. KORRELATIONS-GRUPPEN
 // ==========================================
@@ -389,7 +354,7 @@ const CORRELATION_GROUPS = {
   'AI':      ['FET-USDT', 'AGIX-USDT', 'OCEAN-USDT', 'WLD-USDT', 'RNDR-USDT'],
   'GAMING':  ['GALA-USDT', 'SAND-USDT', 'MANA-USDT', 'AXS-USDT'],
 };
- 
+
 function checkCorrelationLimit(symbol, direction, activeTrades, enabled = true) {
   if (!enabled) return true;
   for (const [group, coins] of Object.entries(CORRELATION_GROUPS)) {
@@ -400,7 +365,7 @@ function checkCorrelationLimit(symbol, direction, activeTrades, enabled = true) 
   }
   return true;
 }
- 
+
 // ==========================================
 // 7. STRATEGIE PROFILES & CONFIG
 // ==========================================
@@ -432,16 +397,16 @@ const STRATEGY_PROFILES = {
     TREND_EMA_SLOW_15M: 50,
   }
 };
- 
+
 let STRATEGY_PROFILE_NAME = (process.env.STRATEGY_PROFILE || 'strict').toLowerCase();
 let activeProfile = STRATEGY_PROFILES[STRATEGY_PROFILE_NAME] || STRATEGY_PROFILES.strict;
- 
+
 function envFloatOrProfile(envVal, profileVal) { return envVal !== undefined ? parseFloat(envVal) : profileVal; }
 function envBoolOrProfile(envVal, profileVal, trueLiteral) {
   if (envVal === undefined) return profileVal;
   return trueLiteral ? envVal === 'true' : envVal !== 'false';
 }
- 
+
 const config = {
   PORT: parseInt(process.env.PORT, 10) || 10000,
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
@@ -456,7 +421,7 @@ const config = {
   MAX_DAILY_LOSS_USD: parseFloat(process.env.MAX_DAILY_LOSS_USD) || 250,
   MAX_FUNDING_RATE: parseFloat(process.env.MAX_FUNDING_RATE) || 0.0005,
   MIN_FUNDING_RATE: parseFloat(process.env.MIN_FUNDING_RATE) || -0.0005,
- 
+
   ALLOW_COUNTER_BTC_TREND: envBoolOrProfile(process.env.ALLOW_COUNTER_BTC_TREND, activeProfile.ALLOW_COUNTER_BTC_TREND, false),
   REQUIRE_4H_TREND: envBoolOrProfile(process.env.REQUIRE_4H_TREND, activeProfile.REQUIRE_4H_TREND, true),
   ADX_MIN: envFloatOrProfile(process.env.ADX_MIN, activeProfile.ADX_MIN),
@@ -468,7 +433,7 @@ const config = {
   BOS_LOOKBACK: process.env.BOS_LOOKBACK !== undefined ? parseInt(process.env.BOS_LOOKBACK, 10) : activeProfile.BOS_LOOKBACK,
   TREND_EMA_FAST_15M: process.env.TREND_EMA_FAST_15M !== undefined ? parseInt(process.env.TREND_EMA_FAST_15M, 10) : activeProfile.TREND_EMA_FAST_15M,
   TREND_EMA_SLOW_15M: process.env.TREND_EMA_SLOW_15M !== undefined ? parseInt(process.env.TREND_EMA_SLOW_15M, 10) : activeProfile.TREND_EMA_SLOW_15M,
- 
+
   ATR_STOP_MULT: parseFloat(process.env.ATR_STOP_MULT) || 2.3,
   TP1_MULT: parseFloat(process.env.TP1_MULT) || 1.3,
   TP2_MULT: parseFloat(process.env.TP2_MULT) || 2.5,
@@ -480,7 +445,7 @@ const config = {
   DYNAMIC_TRAILING_ATR: process.env.DYNAMIC_TRAILING_ATR !== 'false',
   FAST_TRACK_INTERVAL_SECONDS: parseInt(process.env.FAST_TRACK_INTERVAL_SECONDS, 10) || 60,
   TICKER_BATCH_SIZE: parseInt(process.env.TICKER_BATCH_SIZE, 10) || 10,
-  SLIPPAGE_PERCENT: parseFloat(process.env.SLIPPAGE_PERCENT) || 0.10,
+  SLIPPAGE_PERCENT: parseFloat(process.env.SLIPPAGE_PERCENT) || 0.05,
   FEE_PERCENT: parseFloat(process.env.FEE_PERCENT) || 0.1,
   TP1_CLOSE_PERCENT: parseFloat(process.env.TP1_CLOSE_PERCENT) || 60,
   ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false',
@@ -489,17 +454,11 @@ const config = {
   MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,
   LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3,
   MARGIN_MODE: (process.env.MARGIN_MODE || 'ISOLATED').toUpperCase(),
- 
-  // FIX: Render uses zero-downtime replacement: new and old instances overlap.
-  // The lock therefore supports an explicit two-phase handoff instead of letting
-  // the new instance steal an active lock.
-  LOCK_ACQUIRE_RETRIES: parseInt(process.env.LOCK_ACQUIRE_RETRIES, 10) || 30,
-  LOCK_ACQUIRE_RETRY_DELAY_MS: parseInt(process.env.LOCK_ACQUIRE_RETRY_DELAY_MS, 10) || 2000,
+
+  LOCK_ACQUIRE_RETRIES: parseInt(process.env.LOCK_ACQUIRE_RETRIES, 10) || 8,
+  LOCK_ACQUIRE_RETRY_DELAY_MS: parseInt(process.env.LOCK_ACQUIRE_RETRY_DELAY_MS, 10) || 5000,
   LOCK_STALE_AFTER_MS: parseInt(process.env.LOCK_STALE_AFTER_MS, 10) || 5 * 60 * 1000,
-  LOCK_HANDOFF_ENABLED: process.env.LOCK_HANDOFF_ENABLED !== 'false',
-  LOCK_HANDOFF_GRACE_MS: parseInt(process.env.LOCK_HANDOFF_GRACE_MS, 10) || 15000,
-  LOCK_HEARTBEAT_INTERVAL_MS: parseInt(process.env.LOCK_HEARTBEAT_INTERVAL_MS, 10) || 2000,
- 
+
   FUNDING_INTERVAL_HOURS: parseFloat(process.env.FUNDING_INTERVAL_HOURS) || 8,
   SCAN_STATS_TELEGRAM_EVERY_N_SCANS: parseInt(process.env.SCAN_STATS_TELEGRAM_EVERY_N_SCANS, 10) || 4,
   
@@ -533,8 +492,8 @@ const config = {
   // verschiebt sich die Punkteverteilung leicht; Standard-Schwelle von
   // 65 auf 55 abgesenkt, um dieselbe relative Strenge beizubehalten.
   MIN_GATE_SCORE: parseFloat(process.env.MIN_GATE_SCORE) || 55,
-  MIN_RRR: 1.5,
- 
+  MIN_RRR: parseFloat(process.env.MIN_RRR) || 1.2,
+
   ML_ENABLED: process.env.ML_ENABLED !== 'false',
   ML_MIN_TRAINING_SAMPLES: parseInt(process.env.ML_MIN_TRAINING_SAMPLES, 10) || 40,
   ML_MAX_TRAINING_SAMPLES: parseInt(process.env.ML_MAX_TRAINING_SAMPLES, 10) || 2000,
@@ -545,17 +504,12 @@ const config = {
   ML_BATCH_SIZE: parseInt(process.env.ML_BATCH_SIZE, 10) || 32,
   
   // DQN spezifische Config
-  DQN_ENABLED: true,
- 
-  // IMPROVED: centralized hardening limits consumed by the legacy entrypoint.
-  KLINES_SCAN_LIMIT: parseInt(process.env.KLINES_SCAN_LIMIT, 10) || 60,
-  TELEGRAM_QUEUE_MAX: parseInt(process.env.TELEGRAM_QUEUE_MAX, 10) || 100,
-  DB_BULK_QUEUE_MAX: parseInt(process.env.DB_BULK_QUEUE_MAX, 10) || 500,
-  DB_BULK_MAX_RETRIES: parseInt(process.env.DB_BULK_MAX_RETRIES, 10) || 3,
-  API_KEY: process.env.API_KEY || '',
-  API_BIND_HOST: process.env.API_BIND_HOST || ''
+  DQN_ENABLED: process.env.DQN_ENABLED !== 'false',
+  BACKTEST_OOS_DAYS: parseInt(process.env.BACKTEST_OOS_DAYS, 10) || 7,
+  MONTE_CARLO_SAMPLES: parseInt(process.env.MONTE_CARLO_SAMPLES, 10) || 1000,
+  DATA_MAX_AGE_15M_MS: parseInt(process.env.DATA_MAX_AGE_15M_MS, 10) || 1200000,
 };
- 
+
 function validateConfig() {
   const numericFields = [
     'PORT', 'CAPITAL_USD', 'RISK_PERCENT', 'TOP_COIN_LIMIT', 'MAX_SIGNALS_PER_SCAN',
@@ -566,7 +520,7 @@ function validateConfig() {
     'TRAILING_ATR_MULT', 'FAST_TRACK_INTERVAL_SECONDS', 'TICKER_BATCH_SIZE',
     'SLIPPAGE_PERCENT', 'FEE_PERCENT', 'TP1_CLOSE_PERCENT', 'MAX_EXPOSURE_RATIO',
     'SCAN_CONCURRENCY', 'MAX_CONSECUTIVE_PRICE_FAILURES', 'LEVERAGE',
-    'LOCK_ACQUIRE_RETRIES', 'LOCK_ACQUIRE_RETRY_DELAY_MS', 'LOCK_STALE_AFTER_MS', 'LOCK_HANDOFF_GRACE_MS', 'LOCK_HEARTBEAT_INTERVAL_MS',
+    'LOCK_ACQUIRE_RETRIES', 'LOCK_ACQUIRE_RETRY_DELAY_MS', 'LOCK_STALE_AFTER_MS',
     'FUNDING_INTERVAL_HOURS', 'SCAN_STATS_TELEGRAM_EVERY_N_SCANS',
     'TREND_EMA_FAST_15M', 'TREND_EMA_SLOW_15M',
     'MAX_KLINES_CACHE_SIZE', 'CACHE_CLEANUP_MINUTES',
@@ -575,7 +529,7 @@ function validateConfig() {
     'MONGODB_POOL_SIZE', 'DB_BULK_INTERVAL_MS', 'MAX_SPREAD_PERCENT', 'MAX_CHOP_INDEX',
     'MIN_HURST_EXPONENT', 'ML_MIN_TRAINING_SAMPLES', 'ML_MAX_TRAINING_SAMPLES',
     'ML_MIN_PREDICTION_PROBABILITY', 'ML_STRONG_SIGNAL_PROBABILITY', 'ML_RETRAIN_HOURS',
-    'ML_EPOCHS', 'ML_BATCH_SIZE'
+    'ML_EPOCHS', 'ML_BATCH_SIZE', 'BACKTEST_OOS_DAYS', 'MONTE_CARLO_SAMPLES', 'DATA_MAX_AGE_15M_MS'
   ];
   for (const key of numericFields) {
     if (typeof config[key] !== 'number' || Number.isNaN(config[key])) {
@@ -584,9 +538,10 @@ function validateConfig() {
   }
   if (!['ISOLATED', 'CROSS'].includes(config.MARGIN_MODE)) throw new Error(`[CONFIG ERROR] MARGIN_MODE ungültig`);
   logger.info('✅ Konfiguration validiert');
+  logger.info(`🛡️ Phase-A Hardening aktiv | DataValidation + CentralRisk + AuditTrail + OOS/MonteCarlo`);
 }
 validateConfig();
- 
+
 function validateCriticalEnv() {
   const missing = [];
   if (!config.MONGODB_URI) missing.push('MONGODB_URI');
@@ -595,9 +550,9 @@ function validateCriticalEnv() {
   if (missing.length > 0) throw new Error(`[STARTUP ERROR] Fehlende Variablen: ${missing.join(', ')}`);
 }
 validateCriticalEnv();
- 
+
 updateTelegramConfig(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID);
- 
+
 // ==========================================
 // 8. DATENBANK & ADAPTIVES ML-MODELL & MANAGERS
 // ==========================================
@@ -609,7 +564,7 @@ const client = new MongoClient(config.MONGODB_URI, {
   socketTimeoutMS: 30000,
   family: 4
 });
- 
+
 // Bug fixed: previously isDbConnected only ever flipped to false inside
 // initDatabase()'s own catch block, i.e. on the very first connection
 // attempt. A connection that dropped later at runtime (network blip,
@@ -617,7 +572,6 @@ const client = new MongoClient(config.MONGODB_URI, {
 // (wrongly) true and every DB write would keep silently failing/queuing.
 // These listeners catch that case and kick off the reconnect loop below.
 client.on('close', () => {
-  dbIndexesInitialized = false;
   if (isShuttingDown) return;
   if (isDbConnected) logger.warn('🔴 MongoDB-Verbindung unerwartet geschlossen.');
   isDbConnected = false;
@@ -626,19 +580,15 @@ client.on('close', () => {
 client.on('error', (err) => {
   logger.error(`🔴 MongoDB-Client-Fehler: ${err.message}`);
 });
- 
+
 let tradesCollection, closedTradesCollection, botStateCollection, lockCollection, marketPhaseLogsCollection, filterChangeLogCollection;
 const activeTrades = new Map();
 let isDbConnected = false, dbReconnectInterval = null, pendingClosedTrades = [], isReconnecting = false;
-let dbInitPromise = null;
-let dbIndexesInitialized = false;
-let telegramPollingActive = false;
-let telegramConflictCount = 0;
 const priceFailureCounts = new Map();
 let isPaused = false, lastScanTime = null, lastTrackerCheckTime = null;
 let trackerLock = false;
 const signalPerformanceHistory = new Map();
- 
+
 const mlModel = new TensorFlowSignalModel({
   modelDir: process.env.ML_MODEL_DIR || './models/signal-model',
   minSamples: config.ML_MIN_TRAINING_SAMPLES,
@@ -649,31 +599,29 @@ const mlModel = new TensorFlowSignalModel({
   batchSize: config.ML_BATCH_SIZE,
   logger
 });
- 
+
 const dqnAgent = new DeepQTheTradingAgent({
   modelDir: process.env.DQN_MODEL_DIR || './models/rl-dqn-model',
   stateSize: 16,
   actionSize: 3,
   logger
 });
- 
+
 const hedgeManager = new HedgeManager({ logger, thresholdDropPct: -2.5 });
 const volManager = new VolatilitySurfaceManager({ logger });
 const orderFlowManager = new OrderFlowAnalyzer({ logger });
 const macroEngine = new MacroFilterEngine({ logger });
-const macroCalendar = new MacroEngine({
-  logger,
-  apiKey: process.env.FRED_API_KEY,
-  refreshIntervalMs: (parseInt(process.env.FRED_REFRESH_HOURS, 10) || 6) * 60 * 60 * 1000
-});
- 
+const dataValidator = new DataValidator({ logger, maxAgeMs: config.DATA_MAX_AGE_15M_MS });
+const riskEngine = new RiskEngine(config, logger);
+const auditLogger = new AuditLogger({ logger });
+
 let isModelTrained = false;
 let lastMLTrainingStats = null;
- 
+
 function buildMLFeatures(data) {
   return mlModel.buildFeatures(data);
 }
- 
+
 function buildDQNStateVector(params) {
   return [
     params.adx ? params.adx / 50 : 0.5,
@@ -691,29 +639,29 @@ function buildDQNStateVector(params) {
     params.spreadPct || 0.1,
     params.volatilityRatio || 1,
     params.mlProbability || 0.5,
-    0.5
+    params.confluenceScore != null ? Number(params.confluenceScore) / 100 : 0.5
   ];
 }
- 
+
 async function trainSignalMLModel(force = false) {
   if (!config.ML_ENABLED) return { trained: false, reason: 'disabled' };
   if (!closedTradesCollection || !isDbConnected) return { trained: false, reason: 'db-unavailable' };
   try {
-    const result = await mlModel.trainFromTrades(closedTradesCollection, { force, cutoffTime: Date.now() });
+    const result = await mlModel.trainFromTrades(closedTradesCollection, { force });
     isModelTrained = !!result.trained;
     lastMLTrainingStats = result;
- 
+
     if (config.DQN_ENABLED) {
       await dqnAgent.trainFromClosedTrades(closedTradesCollection);
     }
- 
+
     return result;
   } catch (e) {
     logger.error(`[TensorFlow.js ML Fehler beim Training]: ${e.message}`);
     return { trained: false, reason: e.message };
   }
 }
- 
+
 async function loadSignalMLModel() {
   if (!config.ML_ENABLED) return false;
   try {
@@ -724,33 +672,32 @@ async function loadSignalMLModel() {
     if (config.DQN_ENABLED) {
       await dqnAgent.init();
     }
- 
+
     return loaded;
   } catch (e) {
     logger.warn(`[TensorFlow.js ML] Kein gespeichertes Modell geladen: ${e.message}`);
     return false;
   }
 }
- 
+
 function predictSignalSuccess(features) {
   if (!config.ML_ENABLED || !isModelTrained) {
     return { probability: 0.5, class: 'UNKNOWN', confidence: 0, trained: false };
   }
   return mlModel.predict(features);
 }
- 
+
 async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 1000) {
   if (Date.now() < kucoinCircuitOpenUntil) {
     throw new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
   }
- 
+
   await apiRateLimiter.checkLimit();
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const startTime = Date.now();
       const response = await axios.get(url, { timeout: options.timeout || 5000, ...options });
       apiLatencyStats.record('kucoin', Date.now() - startTime);
-      if (response.data?.code && response.data.code !== '200000') logger.warn(`[KuCoin API] Fehlercode ${response.data.code} für ${url}`);
       kucoinErrorCount = 0;
       return response;
     } catch (error) {
@@ -770,7 +717,7 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
     }
   }
 }
- 
+
 const futuresApiSemaphore = {
   active: 0, queue: [],
   async acquire() {
@@ -783,17 +730,17 @@ const futuresApiSemaphore = {
     if (this.queue.length > 0) this.queue.shift()();
   }
 };
- 
+
 async function futuresApiGetWithRetry(url, options = {}, retries = 3, backoffMs = 1000) {
   await futuresApiSemaphore.acquire();
   try { return await axiosGetWithRetry(url, options, retries, backoffMs); }
   finally { futuresApiSemaphore.release(); }
 }
- 
+
 async function processDbBulkQueue() {
   if (dbBulkQueue.length === 0 || !isDbConnected) return;
-  const batch = dbBulkQueue.splice(0, dbBulkQueue.length);
-  const attempt = Number(batch.attempt || 0);
+  const batch = [...dbBulkQueue];
+  dbBulkQueue = [];
   try {
     const startTime = Date.now();
     const tradeOps = [], closeOps = [];
@@ -802,20 +749,30 @@ async function processDbBulkQueue() {
       else if (op.type === 'removeTrade') tradeOps.push({ deleteOne: { filter: { symbol: op.symbol } } });
       else if (op.type === 'insertClosed') closeOps.push({ insertOne: { document: op.data } });
     }
-    if (tradeOps.length) await tradesCollection.bulkWrite(tradeOps);
-    if (closeOps.length) await closedTradesCollection.bulkWrite(closeOps);
+    if (tradeOps.length > 0) await tradesCollection.bulkWrite(tradeOps);
+    if (closeOps.length > 0) await closedTradesCollection.bulkWrite(closeOps);
     apiLatencyStats.record('mongodb', Date.now() - startTime);
   } catch (e) {
-    const nextAttempt = attempt + 1;
-    if (nextAttempt <= DB_BULK_MAX_RETRIES) {
-      const retryBatch = batch.map(x => ({ ...x, attempt: nextAttempt }));
-      dbBulkQueue.push(...retryBatch.slice(-DB_BULK_QUEUE_MAX));
-      logger.warn(`[DB BULK] Batch fehlgeschlagen (${nextAttempt}/${DB_BULK_MAX_RETRIES}), Fehler: ${e.message}`);
-    } else {
-      logger.error(`[DB BULK] Batch endgültig verworfen nach ${DB_BULK_MAX_RETRIES} Retries: ${e.message}`);
-    }
+    dbBulkQueue.push(...batch);
   }
 }
+
+async function persistDqnState() {
+  if (!botStateCollection || !isDbConnected) return;
+  await botStateCollection.updateOne({ _id: 'botControl' }, { $set: { dqnEnabled: !!config.DQN_ENABLED } }, { upsert: true });
+}
+
+async function setDqnEnabled(enabled) {
+  config.DQN_ENABLED = !!enabled;
+  await persistDqnState();
+  if (config.DQN_ENABLED) {
+    await dqnAgent.init();
+    await auditLogger.write('DQN_ENABLED', { enabled: true, modelVersion: dqnAgent.modelVersion });
+  } else {
+    await auditLogger.write('DQN_DISABLED', { enabled: false });
+  }
+}
+
 async function loadPauseState() {
   if (!botStateCollection) return;
   try {
@@ -823,128 +780,55 @@ async function loadPauseState() {
     if (doc) isPaused = !!doc.isPaused;
   } catch (e) {}
 }
- 
+
 async function persistPauseState() {
   if (!botStateCollection || !isDbConnected) return;
   try { await botStateCollection.updateOne({ _id: 'botControl' }, { $set: { isPaused } }, { upsert: true }); } catch (e) {}
 }
- 
+
 let currentInstanceId = null;
- 
+
 async function tryAcquireLockOnce(instanceId) {
-  try {
-    await lockCollection.insertOne({
-      _id: 'instanceLock', instanceId: null, lastSeen: new Date(0),
-      takeoverRequestedBy: null, takeoverRequestedAt: null
-    });
-  } catch (e) { if (e.code !== 11000) throw e; }
- 
-  // FIX: Only acquire an empty/stale lock. An active owner is never silently
-  // overwritten; Render handoff is coordinated through takeoverRequestedBy.
-  // FIX: A Render deployment can start the replacement before the old process
-  // has released the lease. Allow the requester to take over atomically after
-  // a short grace period, while still never overwriting an unrelated active lock.
-  const now = new Date();
-  const staleBefore = new Date(Date.now() - config.LOCK_STALE_AFTER_MS);
-  const handoffBefore = new Date(Date.now() - config.LOCK_HANDOFF_GRACE_MS);
+  try { await lockCollection.insertOne({ _id: 'instanceLock', instanceId: null, lastSeen: new Date(0) }); } catch (e) { if (e.code !== 11000) throw e; }
   const result = await lockCollection.updateOne(
-    { _id: 'instanceLock', $or: [
-      { instanceId: null },
-      { instanceId: instanceId },
-      { lastSeen: { $lt: staleBefore } },
-      { takeoverRequestedBy: instanceId, takeoverRequestedAt: { $lte: handoffBefore } }
-    ] },
-    { $set: { instanceId, lastSeen: now, takeoverRequestedBy: null, takeoverRequestedAt: null } }
+    { _id: 'instanceLock', $or: [{ instanceId }, { lastSeen: { $lt: new Date(Date.now() - config.LOCK_STALE_AFTER_MS) } }] },
+    { $set: { instanceId, lastSeen: new Date() } }
   );
   return result.matchedCount > 0;
 }
- 
-async function requestInstanceLockHandoff(instanceId) {
-  if (!config.LOCK_HANDOFF_ENABLED || process.env.RENDER !== 'true') return false;
-  try {
-    const result = await lockCollection.updateOne(
-      { _id: 'instanceLock', instanceId: { $nin: [null, instanceId] } },
-      { $set: { takeoverRequestedBy: instanceId, takeoverRequestedAt: new Date() } }
-    );
-    if (result.matchedCount > 0) {
-      logger.warn(`🟡 Instance-Lock belegt – Render-Handoff für ${instanceId} angefordert.`);
-      return true;
-    }
-  } catch (e) {
-    logger.warn(`[LOCK HANDOFF] Anfrage fehlgeschlagen: ${e.message}`);
-  }
-  return false;
-}
- 
+
 async function acquireInstanceLock() {
-  // IMPROVED: Render supplies a stable per-instance identifier.
-  const instanceId = process.env.INSTANCE_ID || process.env.RENDER_INSTANCE_ID || `primary-${process.pid}-${Date.now()}`;
+  const instanceId = process.env.INSTANCE_ID || `primary-${process.pid}-${Date.now()}`;
   try {
-    let handoffRequested = false;
     for (let attempt = 1; attempt <= config.LOCK_ACQUIRE_RETRIES; attempt++) {
       const acquired = await tryAcquireLockOnce(instanceId);
-      if (acquired) {
-        currentInstanceId = instanceId;
-        logger.info(`🔒 Instance-Lock erworben: ${instanceId}`);
-        return instanceId;
-      }
- 
-      if (!handoffRequested) handoffRequested = await requestInstanceLockHandoff(instanceId);
-      if (handoffRequested && attempt === 1) {
-        logger.info(`⏳ Warte bis zu ${config.LOCK_HANDOFF_GRACE_MS / 1000}s auf sauberen Render-Lock-Handoff...`);
-      }
+      if (acquired) { currentInstanceId = instanceId; return instanceId; }
       if (attempt < config.LOCK_ACQUIRE_RETRIES) await sleep(config.LOCK_ACQUIRE_RETRY_DELAY_MS);
     }
- 
-    logger.error('🔴 Konnte Instance-Lock nach Handoff-Wartezeit nicht erwerben – beende Prozess.');
-    await sendTelegramAlert('🚨 <b>Instance-Lock fehlgeschlagen!</b> Render-Handoff konnte nicht abgeschlossen werden.');
+    logger.error('🔴 Konnte Instance-Lock nicht erwerben – beende Prozess.');
+    await sendTelegramAlert('🚨 <b>Instance-Lock fehlgeschlagen!</b> Bot wird beendet.');
     process.exit(1);
   } catch (e) {
-    logger.error(`🔴 Kritischer Fehler beim Instance-Lock – ${e.message}`);
+    logger.error('🔴 Kritischer Fehler beim Instance-Lock – beende Prozess.');
     await sendTelegramAlert('🚨 <b>Instance-Lock Fehler!</b> Bot wird beendet.');
     process.exit(1);
   }
 }
- 
+
 async function releaseInstanceLock() {
   if (!lockCollection || !isDbConnected || !currentInstanceId) return;
-  try {
-    await lockCollection.updateOne(
-      { _id: 'instanceLock', instanceId: currentInstanceId },
-      { $set: { instanceId: null, lastSeen: new Date(0), takeoverRequestedBy: null, takeoverRequestedAt: null } }
-    );
-    logger.info(`🔓 Instance-Lock freigegeben: ${currentInstanceId}`);
-    currentInstanceId = null;
-  } catch (e) { logger.warn(`[LOCK RELEASE] ${e.message}`); }
+  try { await lockCollection.updateOne({ _id: 'instanceLock', instanceId: currentInstanceId }, { $set: { instanceId: null, lastSeen: new Date(0) } }); } catch (e) {}
 }
- 
+
 let lockHeartbeatInterval = null;
 function startLockHeartbeat(instanceId) {
   if (lockHeartbeatInterval) return;
   lockHeartbeatInterval = setInterval(async () => {
-    if (!isDbConnected || !lockCollection || isShuttingDown) return;
-    try {
-      const doc = await lockCollection.findOne({ _id: 'instanceLock' }, { projection: { instanceId: 1, takeoverRequestedBy: 1 } });
-      if (!doc || doc.instanceId !== instanceId) {
-        logger.error('🔴 Instance-Lock wurde von einer anderen Instanz übernommen – starte sicheren Shutdown.');
-        await gracefulShutdown('LOCK_HANDOFF');
-        return;
-      }
-      if (doc.takeoverRequestedBy && doc.takeoverRequestedBy !== instanceId) {
-        logger.warn(`🟡 Lock-Handoff an ${doc.takeoverRequestedBy} erkannt – dieser Prozess beendet sich.`);
-        await gracefulShutdown('LOCK_HANDOFF');
-        return;
-      }
-      await lockCollection.updateOne(
-        { _id: 'instanceLock', instanceId },
-        { $set: { lastSeen: new Date() } }
-      );
-    } catch (e) {
-      logger.warn(`[LOCK HEARTBEAT] ${e.message}`);
-    }
-  }, config.LOCK_HEARTBEAT_INTERVAL_MS);
+    if (!isDbConnected || !lockCollection) return;
+    try { await lockCollection.updateOne({ _id: 'instanceLock', instanceId }, { $set: { lastSeen: new Date() } }); } catch (e) {}
+  }, 60_000);
 }
- 
+
 async function loadPersistedFilterState() {
   if (!botStateCollection) return;
   try {
@@ -968,7 +852,7 @@ async function loadPersistedFilterState() {
     logger.error(`Fehler beim Laden des DynamicFilterState: ${e.message}`);
   }
 }
- 
+
 async function persistFilterState() {
   if (!botStateCollection || !isDbConnected) return;
   try {
@@ -986,7 +870,7 @@ async function persistFilterState() {
     logger.error(`Fehler beim Speichern des FilterState: ${e.message}`);
   }
 }
- 
+
 async function logFilterChange(filterKey, action, oldValue, newValue, user = 'TelegramUser') {
   if (filterChangeLogCollection && isDbConnected) {
     try {
@@ -1002,106 +886,69 @@ async function logFilterChange(filterKey, action, oldValue, newValue, user = 'Te
   }
   logger.info(`⚙️ [FILTER CHANGE] ${filterKey} (${action}): ${oldValue} -> ${newValue}`);
 }
- 
+
 async function initDatabase() {
-  const startTime = Date.now();
- 
-  if (isShuttingDown) return false;
- 
   try {
-    // MongoClient.connect() is safe to call only through the single init promise
-    // above. Reuse the existing client instead of creating competing connection
-    // attempts during reconnects.
+    const startTime = Date.now();
     await client.connect();
- 
     const db = client.db('tradingBotDB');
-    if (!db || typeof db.collection !== 'function') {
-      throw new Error('MongoDB-Datenbankhandle konnte nicht initialisiert werden.');
-    }
- 
-    const collections = {
-      trades: db.collection('activeTrades'),
-      closedTrades: db.collection('closedTrades'),
-      botState: db.collection('botState'),
-      locks: db.collection('locks'),
-      marketPhaseLogs: db.collection('marketPhaseLogs'),
-      filterChangeLogs: db.collection('filterChangeLogs')
-    };
- 
-    for (const [name, collection] of Object.entries(collections)) {
-      if (!collection || typeof collection.createIndex !== 'function') {
-        throw new Error(
-          `[DB INIT] Collection "${name}" konnte nicht initialisiert werden.`
-        );
-      }
-    }
- 
-    tradesCollection = collections.trades;
-    closedTradesCollection = collections.closedTrades;
-    botStateCollection = collections.botState;
-    lockCollection = collections.locks;
-    marketPhaseLogsCollection = collections.marketPhaseLogs;
-    filterChangeLogCollection = collections.filterChangeLogs;
- 
-    if (!dbIndexesInitialized) {
+    tradesCollection = db.collection('activeTrades');
+    closedTradesCollection = db.collection('closedTrades');
+    botStateCollection = db.collection('botState');
+    lockCollection = db.collection('locks');
+    marketPhaseLogsCollection = db.collection('marketPhaseLogs');
+    filterChangeLogCollection = db.collection('filterChangeLogs');
+    auditLogger.collection = db.collection('auditLogs');
+    isDbConnected = true;
+    apiLatencyStats.record('mongodb', Date.now() - startTime);
+    logger.info('✅ Datenbank erfolgreich verbunden');
+
+    try {
       await tradesCollection.createIndex({ symbol: 1 }, { unique: true });
       await closedTradesCollection.createIndex({ closeTime: -1 });
       await closedTradesCollection.createIndex({ symbol: 1, closeTime: -1 });
       await marketPhaseLogsCollection.createIndex({ timestamp: -1 });
       await filterChangeLogCollection.createIndex({ timestamp: -1 });
-      dbIndexesInitialized = true;
-      logger.info('✅ MongoDB-Indizes erfolgreich initialisiert');
-    }
- 
-    isDbConnected = true;
-    apiLatencyStats.record('mongodb', Date.now() - startTime);
-    logger.info(
-      '📦 MongoDB Collections: activeTrades, closedTrades, botState, locks, marketPhaseLogs, filterChangeLogs'
-    );
-    logger.info('✅ Datenbank erfolgreich verbunden und initialisiert');
- 
-    if (dbReconnectInterval) {
-      clearInterval(dbReconnectInterval);
-      dbReconnectInterval = null;
-    }
- 
+      await auditLogger.collection.createIndex({ timestamp: -1 });
+    } catch (e) {}
+
+    if (dbReconnectInterval) { clearInterval(dbReconnectInterval); dbReconnectInterval = null; }
     const instanceId = await acquireInstanceLock();
     startLockHeartbeat(instanceId);
- 
+
     const runtimeDoc = await botStateCollection.findOne({ _id: 'runtimeConfig' });
     if (runtimeDoc) {
       if (runtimeDoc.CAPITAL_USD) config.CAPITAL_USD = runtimeDoc.CAPITAL_USD;
       if (runtimeDoc.LEVERAGE) config.LEVERAGE = runtimeDoc.LEVERAGE;
       if (runtimeDoc.RISK_PERCENT) config.RISK_PERCENT = runtimeDoc.RISK_PERCENT;
     }
- 
+
     const blDoc = await botStateCollection.findOne({ _id: 'manualBlacklist' });
     if (blDoc && Array.isArray(blDoc.symbols)) {
       blDoc.symbols.forEach(s => manualBlacklist.add(s));
     }
- 
+
     await loadPersistedFilterState();
     await loadDailyPnLState();
     await loadPauseState();
- 
+    const dqnControl = await botStateCollection.findOne({ _id: 'botControl' });
+    if (dqnControl && typeof dqnControl.dqnEnabled === 'boolean') config.DQN_ENABLED = dqnControl.dqnEnabled;
+
     const pnlDoc = await botStateCollection.findOne({ _id: 'peakCapital' });
     if (pnlDoc) peakCapital = Math.max(config.CAPITAL_USD, pnlDoc.value);
- 
+
     const savedTrades = await tradesCollection.find({}).toArray();
     savedTrades.forEach(trade => activeTrades.set(trade.symbol, trade));
- 
+
     if (dbBulkTimer) clearInterval(dbBulkTimer);
     dbBulkTimer = setInterval(processDbBulkQueue, config.DB_BULK_INTERVAL_MS);
- 
-    return true;
   } catch (e) {
+    logger.error(`🔴 Datenbank-Verbindungsfehler: ${e.message}`);
     isDbConnected = false;
-    dbIndexesInitialized = false;
-    logger.error(`🔴 Datenbank-Initialisierung fehlgeschlagen: ${e.stack || e.message}`);
     scheduleDbReconnect();
-    return false;
   }
 }
+
 // Starts (if not already running) a periodic retry loop that tries to
 // re-establish the MongoDB connection every 5s. Only one interval is ever
 // active at a time; initDatabase()'s success path clears it once a
@@ -1112,32 +959,21 @@ async function initDatabase() {
 function scheduleDbReconnect() {
   if (dbReconnectInterval || isShuttingDown) return;
   logger.warn('🔁 Starte MongoDB-Reconnect-Versuche (alle 5s)...');
-  dbReconnectInterval = setInterval(() => {
-    ensureDbConnection().catch(err => {
-      logger.error(`🔴 MongoDB-Reconnect fehlgeschlagen: ${err.message}`);
-    });
-  }, 5000);
+  dbReconnectInterval = setInterval(() => { ensureDbConnection(); }, 5000);
 }
- 
+
 async function ensureDbConnection() {
-  if (isShuttingDown) return false;
-  if (isDbConnected) return true;
-  if (dbInitPromise) return dbInitPromise;
- 
-  dbInitPromise = (async () => {
-    isReconnecting = true;
-    try {
-      await initDatabase();
-      return isDbConnected;
-    } finally {
-      isReconnecting = false;
-      dbInitPromise = null;
-    }
-  })();
- 
-  return dbInitPromise;
+  if (isDbConnected || isReconnecting || isShuttingDown) return isDbConnected;
+  isReconnecting = true;
+  try {
+    await initDatabase();
+    if (isDbConnected) logger.info('✅ MongoDB-Reconnect erfolgreich.');
+  } finally {
+    isReconnecting = false;
+  }
+  return isDbConnected;
 }
- 
+
 async function loadDailyPnLState() {
   if (!botStateCollection) return;
   try {
@@ -1150,22 +986,22 @@ async function loadDailyPnLState() {
     }
   } catch (e) {}
 }
- 
+
 async function persistDailyPnLState() {
   if (!botStateCollection || !isDbConnected) return;
   try { await botStateCollection.updateOne({ _id: 'dailyPnL' }, { $set: { value: dailyNetPnL, dateUTC: todayUTCString() } }, { upsert: true }); } catch (e) {}
 }
- 
+
 async function persistPeakCapital() {
   if (!botStateCollection || !isDbConnected) return;
   try { await botStateCollection.updateOne({ _id: 'peakCapital' }, { $set: { value: peakCapital } }, { upsert: true }); } catch (e) {}
 }
- 
+
 async function upsertTrade(symbol, tradeData) {
   activeTrades.set(symbol, tradeData);
   if (tradesCollection && isDbConnected) dbBulkQueue.push({ type: 'upsertTrade', symbol, data: tradeData });
 }
- 
+
 async function removeTrade(symbol, closedTradeRecord = null) {
   const trade = activeTrades.get(symbol);
   if (trade) {
@@ -1176,14 +1012,14 @@ async function removeTrade(symbol, closedTradeRecord = null) {
   priceFailureCounts.delete(symbol);
   if (tradesCollection && isDbConnected) dbBulkQueue.push({ type: 'removeTrade', symbol });
 }
- 
+
 async function persistClosedTradeRecord(record) {
   if (closedTradesCollection && isDbConnected) dbBulkQueue.push({ type: 'insertClosed', data: record });
   else pendingClosedTrades.push(record);
   updateSignalHistory(record);
   updateStreak(record.pnlUSD || 0);
 }
- 
+
 function updateSignalHistory(record) {
   if (record.isPartial) return;
   const key = `${record.symbol}_${record.direction}`;
@@ -1194,7 +1030,7 @@ function updateSignalHistory(record) {
   history.lastUpdate = Date.now();
   signalPerformanceHistory.set(key, history);
 }
- 
+
 function updateStreak(pnl) {
   if (pnl > 0) {
     currentStreak = currentStreak > 0 ? currentStreak + 1 : 1;
@@ -1204,7 +1040,7 @@ function updateStreak(pnl) {
     maxLossStreak = Math.min(maxLossStreak, currentStreak);
   }
 }
- 
+
 function shouldSkipSignal(symbol, direction, score) {
   const key = `${symbol}_${direction}`;
   const history = signalPerformanceHistory.get(key);
@@ -1213,7 +1049,7 @@ function shouldSkipSignal(symbol, direction, score) {
   if (score < 45 && history.totalPnL < 0) return true;
   return false;
 }
- 
+
 async function isCoinDynamicallyBlacklisted(symbol) {
   if (manualBlacklist.has(symbol)) return true;
   try {
@@ -1223,14 +1059,14 @@ async function isCoinDynamicallyBlacklisted(symbol) {
       .sort({ closeTime: -1 })
       .limit(3)
       .toArray();
- 
+
     if (recentTrades.length < 2) return false;
- 
+
     const recentConsecutiveLosses = recentTrades.every(t => (t.pnlUSD || 0) < 0);
     if (recentConsecutiveLosses) {
       const lastCloseTime = new Date(recentTrades[0].closeTime).getTime();
       const hoursSinceLoss = (Date.now() - lastCloseTime) / (1000 * 60 * 60);
- 
+
       if (hoursSinceLoss < 12) {
         logger.info(`🧠 [AI-Learning] Coin ${symbol} wurde temporär gesperrt wegen 2 Verlusten in Folge.`);
         return true;
@@ -1239,7 +1075,7 @@ async function isCoinDynamicallyBlacklisted(symbol) {
   } catch (e) {}
   return false;
 }
- 
+
 // ==========================================
 // 9. RISIKOMANAGEMENT & DYNAMISCHER ATR
 // ==========================================
@@ -1247,7 +1083,7 @@ function calculateDynamicLeverage(atr, currentPrice, baseLeverage = config.LEVER
   if (!currentPrice || currentPrice === 0 || !atr || atr === 0) return baseLeverage;
   const volatilityPercent = (atr / currentPrice) * 100;
   let adjustedLeverage = baseLeverage;
- 
+
   if (volatilityPercent > 3.0) {
     adjustedLeverage = Math.max(1, Math.floor(baseLeverage * 0.5));
   } else if (volatilityPercent > 2.0) {
@@ -1255,7 +1091,7 @@ function calculateDynamicLeverage(atr, currentPrice, baseLeverage = config.LEVER
   }
   return Number(adjustedLeverage);
 }
- 
+
 function checkGlobalDrawdown(currentEquity) {
   peakCapital = Math.max(peakCapital, currentEquity);
   const drawdown = peakCapital > 0 ? (peakCapital - currentEquity) / peakCapital * 100 : 0;
@@ -1268,7 +1104,7 @@ function checkGlobalDrawdown(currentEquity) {
   }
   return false;
 }
- 
+
 async function evaluateFundingAndSentiment(fundingRate, direction) {
   if (fundingRate === null || fundingRate === undefined) return { allowed: true };
   
@@ -1283,7 +1119,7 @@ async function evaluateFundingAndSentiment(fundingRate, direction) {
   }
   return { allowed: true };
 }
- 
+
 function checkDailyProfitTarget() {
   if (config.DAILY_PROFIT_TARGET > 0 && dailyNetPnL >= config.DAILY_PROFIT_TARGET) {
     isPaused = true;
@@ -1293,7 +1129,7 @@ function checkDailyProfitTarget() {
   }
   return false;
 }
- 
+
 async function recordTradePnL(pnlUSD) {
   dailyNetPnL += pnlUSD;
   await persistDailyPnLState();
@@ -1318,7 +1154,7 @@ async function recordTradePnL(pnlUSD) {
   }
   checkDailyProfitTarget();
 }
- 
+
 function calculateDynamicATRMultiplier(candles) {
   if (!candles || candles.length < 30) return config.ATR_STOP_MULT;
   const recentATR = calculateATR(candles.slice(-14), 14);
@@ -1330,7 +1166,7 @@ function calculateDynamicATRMultiplier(candles) {
   if (volatilityRatio < 0.7) return config.ATR_STOP_MULT * 0.9;
   return config.ATR_STOP_MULT;
 }
- 
+
 function calculateSharpeRatio(dailyReturns, riskFreeRate = 0.02) {
   if (dailyReturns.length < 2) return 0;
   const avgReturn = dailyReturns.reduce((a, b) => a + b, 0) / dailyReturns.length;
@@ -1338,46 +1174,45 @@ function calculateSharpeRatio(dailyReturns, riskFreeRate = 0.02) {
   const stdDev = Math.sqrt(variance);
   return stdDev === 0 ? 0 : ((avgReturn - riskFreeRate / 365) / stdDev) * Math.sqrt(365);
 }
- 
+
 function canOpenNewTrade(activeTradesCount, direction, notionalUSD = 0) {
   if (!isDbConnected) return { allowed: false, reason: 'skippedDbDisconnected' };
   if (activeTradesCount >= config.MAX_CONCURRENT_TRADES) return { allowed: false, reason: 'skippedMaxConcurrentTrades' };
   if (dailyNetPnL <= -config.MAX_DAILY_LOSS_USD) return { allowed: false, reason: 'skippedDailyLossLimit' };
- 
+
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
   if (checkGlobalDrawdown(currentEquity)) return { allowed: false, reason: 'skippedMaxDrawdown' };
- 
+
   if (direction) {
     const sameCount = [...activeTrades.values()].filter(t => t.direction === direction).length;
     if (sameCount >= config.MAX_SAME_DIRECTION) return { allowed: false, reason: 'skippedMaxSameDirection' };
   }
- 
+
   const totalNotional = [...activeTrades.values()].reduce((sum, t) => sum + (t.notionalUSD || 0), 0) + notionalUSD;
   const totalMarginUSD = totalNotional / config.LEVERAGE;
   if (totalMarginUSD > config.CAPITAL_USD * config.MAX_EXPOSURE_RATIO) return { allowed: false, reason: 'skippedExposureLimit' };
- 
+
   return { allowed: true, reason: null };
 }
- 
-function calculatePositionSize(entryPrice, stopLossPrice, capitalUSD, riskPercent, leverage = config.LEVERAGE) {
+
+function calculatePositionSize(entryPrice, stopLossPrice, capitalUSD, riskPercent) {
   const riskAmountUSD = capitalUSD * (riskPercent / 100);
-  const stopDistance = Math.abs(entryPrice - stopLossPrice);
-  if (stopDistance <= 0 || entryPrice <= 0 || leverage <= 0) return { positionSizeUnits: 0, notionalUSD: 0, riskAmountUSD: 0 };
-  const stopPct = stopDistance / entryPrice;
-  const notionalUSD = (riskAmountUSD / stopPct) * leverage;
-  const positionSizeUnits = notionalUSD / entryPrice;
+  const riskPerUnit = Math.abs(entryPrice - stopLossPrice);
+  if (riskPerUnit <= 0) return { positionSizeUnits: 0, notionalUSD: 0, riskAmountUSD: 0 };
+  const positionSizeUnits = riskAmountUSD / riskPerUnit;
+  const notionalUSD = positionSizeUnits * entryPrice;
   return { positionSizeUnits, notionalUSD, riskAmountUSD };
 }
- 
+
 function applySlippage(price, direction, side = 'entry') {
   const factor = side === 'entry'
     ? (direction === 'LONG' ? 1 + config.SLIPPAGE_PERCENT / 100 : 1 - config.SLIPPAGE_PERCENT / 100)
     : (direction === 'LONG' ? 1 - config.SLIPPAGE_PERCENT / 100 : 1 + config.SLIPPAGE_PERCENT / 100);
   return price * factor;
 }
- 
+
 function applyFees(notional) { return notional * (config.FEE_PERCENT / 100); }
- 
+
 function getFuturesSymbol(spotSymbol) {
   const parts = spotSymbol.split('-');
   if (parts.length !== 2) return null;
@@ -1385,13 +1220,225 @@ function getFuturesSymbol(spotSymbol) {
   if (base === 'BTC') base = 'XBT';
   return `${base}USDTM`;
 }
- 
+
 // ==========================================
 // 10. INDIKATOREN & HURST-EXPONENT
 // ==========================================
-// IMPROVED: Single source of truth for live/backtest indicators.
-const { calculateEMA, calculateEMASeries, calculateRSI, calculateATR, calculateADX, calculateHurstExponent, calculateMACD, calculateVWAP, calculateVolumeProfilePOC, calculateRelativeVolume, checkSwingBreakOfStructure, calculateChoppinessIndex, findSwingStop } = indicators;
- 
+function calculateEMA(prices, period) {
+  if (!prices || prices.length < period) return prices ? prices[prices.length - 1] : 0;
+  const k = 2 / (period + 1);
+  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
+  return ema;
+}
+
+function calculateEMASeries(values, period) {
+  if (!values || values.length < period) return [];
+  const k = 2 / (period + 1);
+  const series = new Array(values.length).fill(null);
+  let ema = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  series[period - 1] = ema;
+  for (let i = period; i < values.length; i++) {
+    ema = values[i] * k + ema * (1 - k);
+    series[i] = ema;
+  }
+  return series;
+}
+
+function calculateRSI(prices, period = 14) {
+  if (!prices || prices.length <= period) return 50;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = prices[i] - prices[i - 1];
+    if (diff >= 0) gains += diff; else losses += Math.abs(diff);
+  }
+  let avgGain = gains / period, avgLoss = losses / period;
+  for (let i = period + 1; i < prices.length; i++) {
+    const diff = prices[i] - prices[i - 1];
+    if (diff >= 0) {
+      avgGain = (avgGain * (period - 1) + diff) / period;
+      avgLoss = (avgLoss * (period - 1)) / period;
+    } else {
+      avgGain = (avgGain * (period - 1)) / period;
+      avgLoss = (avgLoss * (period - 1) + Math.abs(diff)) / period;
+    }
+  }
+  const rs = avgGain / (avgLoss === 0 ? 0.001 : avgLoss);
+  return 100 - (100 / (1 + rs));
+}
+
+function calculateATR(candles, period = 14) {
+  if (!candles || candles.length < period + 1) return 0;
+  let tr = [];
+  for (let i = 1; i < candles.length; i++) {
+    tr.push(Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low - candles[i - 1].close)
+    ));
+  }
+  return tr.slice(-period).reduce((a, b) => a + b, 0) / period;
+}
+
+// Finds the most recent swing low/high over `lookback` closed candles
+// (excludes the current, still-forming candle) to anchor the stop-loss to
+// real market structure instead of a rigid ATR multiple.
+function findSwingStop(candles, direction, lookback = 10) {
+  if (!candles || candles.length < lookback + 1) return null;
+  const sample = candles.slice(-lookback - 1, -1);
+  return direction === 'LONG'
+    ? Math.min(...sample.map(c => c.low))
+    : Math.max(...sample.map(c => c.high));
+}
+
+function calculateChoppinessIndex(candles, period = 14) {
+  if (!candles || candles.length < period + 1) return 50;
+  const sample = candles.slice(-period);
+  const highest = Math.max(...sample.map(c => c.high));
+  const lowest = Math.min(...sample.map(c => c.low));
+  let sumTR = 0;
+  for (let i = 1; i < sample.length; i++) {
+    sumTR += Math.max(sample[i].high - sample[i].low, Math.abs(sample[i].high - sample[i - 1].close), Math.abs(sample[i].low - sample[i - 1].close));
+  }
+  const range = highest - lowest;
+  if (range === 0) return 50;
+  return Number((100 * (Math.log10(sumTR / range) / Math.log10(period))).toFixed(1));
+}
+
+function calculateADX(candles, period = 14) {
+  if (!candles || candles.length < period * 2 + 10) return 0;
+  let tr = [], pDM = [], mDM = [];
+  for (let i = 1; i < candles.length; i++) {
+    const high = candles[i].high, low = candles[i].low;
+    const prevClose = candles[i - 1].close, prevHigh = candles[i - 1].high, prevLow = candles[i - 1].low;
+    tr.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
+    const upMove = high - prevHigh, downMove = prevLow - low;
+    pDM.push(upMove > downMove && upMove > 0 ? upMove : 0);
+    mDM.push(downMove > upMove && downMove > 0 ? downMove : 0);
+  }
+  let smoothTR = tr.slice(0, period).reduce((a, b) => a + b, 0);
+  let smoothpDM = pDM.slice(0, period).reduce((a, b) => a + b, 0);
+  let smoothmDM = mDM.slice(0, period).reduce((a, b) => a + b, 0);
+  let dxList = [];
+  for (let i = period; i < tr.length; i++) {
+    smoothTR   = smoothTR   - smoothTR   / period + tr[i]   / period;
+    smoothpDM  = smoothpDM  - smoothpDM  / period + pDM[i]  / period;
+    smoothmDM  = smoothmDM  - smoothmDM  / period + mDM[i]  / period;
+    const pDI = (smoothpDM / (smoothTR || 1)) * 100;
+    const mDI = (smoothmDM / (smoothTR || 1)) * 100;
+    const diDiff = Math.abs(pDI - mDI);
+    const diSum = pDI + mDI;
+    dxList.push(diSum === 0 ? 0 : (diDiff / diSum) * 100);
+  }
+  if (dxList.length < period) return 0;
+  return Number((dxList.slice(-period).reduce((a, b) => a + b, 0) / period).toFixed(1));
+}
+
+function calculateHurstExponent(prices) {
+  // Bug fixed: this previously computed a SINGLE Rescaled-Range value over
+  // the entire price window (H = log(R/S) / log(n)) - a single-scale
+  // estimate is noisy/biased and, worse, was inconsistent with
+  // backtest-engine.js's calculateHurstExponent, which already used the
+  // statistically correct approach (multiple window sizes, log-log
+  // regression of R/S vs. window size -> the slope is the Hurst exponent).
+  // Live and backtest now compute Hurst identically.
+  if (!prices || prices.length < 50) return 0.5;
+  const returns = [];
+  for (let i = 1; i < prices.length; i++) returns.push(Math.log(prices[i] / prices[i - 1]));
+
+  const sizes = [8, 16, 32].filter(s => s < returns.length / 2);
+  if (sizes.length < 2) return 0.5;
+
+  const points = [];
+  for (const size of sizes) {
+    const rsValues = [];
+    for (let i = 0; i + size <= returns.length; i += size) {
+      const segment = returns.slice(i, i + size);
+      const mean = segment.reduce((a, b) => a + b, 0) / segment.length;
+      let cumSum = 0, max = -Infinity, min = Infinity, variance = 0;
+      for (const r of segment) {
+        cumSum += r - mean;
+        max = Math.max(max, cumSum);
+        min = Math.min(min, cumSum);
+        variance += Math.pow(r - mean, 2);
+      }
+      const sd = Math.sqrt(variance / segment.length);
+      if (sd > 0 && max > min) rsValues.push((max - min) / sd);
+    }
+    if (rsValues.length) {
+      const avgRS = rsValues.reduce((a, b) => a + b, 0) / rsValues.length;
+      points.push([Math.log(size), Math.log(avgRS)]);
+    }
+  }
+  if (points.length < 2) return 0.5;
+
+  const meanX = points.reduce((a, p) => a + p[0], 0) / points.length;
+  const meanY = points.reduce((a, p) => a + p[1], 0) / points.length;
+  const num = points.reduce((a, p) => a + (p[0] - meanX) * (p[1] - meanY), 0);
+  const den = points.reduce((a, p) => a + Math.pow(p[0] - meanX, 2), 0);
+  const hurst = den ? num / den : 0.5;
+  return Number(Math.max(0, Math.min(1, hurst)).toFixed(3));
+}
+
+function calculateMACD(closes) {
+  if (!closes || closes.length < 35) return { macd: 0, signal: 0, histogram: 0 };
+  const ema12Series = calculateEMASeries(closes, 12);
+  const ema26Series = calculateEMASeries(closes, 26);
+  const macdSeries = [];
+  for (let i = 0; i < closes.length; i++) {
+    if (ema12Series[i] != null && ema26Series[i] != null) macdSeries.push(ema12Series[i] - ema26Series[i]);
+  }
+  if (macdSeries.length < 9) {
+    const macdLine = macdSeries[macdSeries.length - 1] || 0;
+    return { macd: macdLine, signal: 0, histogram: macdLine };
+  }
+  const signalSeries = calculateEMASeries(macdSeries, 9);
+  const macdLine = macdSeries[macdSeries.length - 1];
+  const signalLine = signalSeries[signalSeries.length - 1] ?? 0;
+  return { macd: macdLine, signal: signalLine, histogram: macdLine - signalLine };
+}
+
+// Punkt 8 - VWAP-Konsistenz: Berechnung lebt jetzt ausschließlich in
+// ./vwap-calculator.js und wird von Live-Bot und Backtest-Engine gemeinsam
+// genutzt, damit beide bei identischen Eingabedaten bitgenau dasselbe Ergebnis
+// liefern.
+const { calculateVWAP } = require('./vwap-calculator');
+
+function calculateVolumeProfilePOC(candles, lookback = 30, binsCount = 20) {
+  if (!candles || candles.length < lookback) return null;
+  const sample = candles.slice(-lookback);
+  let minPrice = Infinity, maxPrice = -Infinity;
+  sample.forEach(c => { if (c.low < minPrice) minPrice = c.low; if (c.high > maxPrice) maxPrice = c.high; });
+  const step = (maxPrice - minPrice) / binsCount;
+  if (step === 0) return minPrice;
+  const bins = new Array(binsCount).fill(0);
+  sample.forEach(c => {
+    const avgPrice = (c.high + c.low + c.close) / 3;
+    const binIndex = Math.min(Math.floor((avgPrice - minPrice) / step), binsCount - 1);
+    bins[binIndex] += c.volume;
+  });
+  let maxVolBin = 0, maxVol = 0;
+  bins.forEach((vol, idx) => { if (vol > maxVol) { maxVol = vol; maxVolBin = idx; } });
+  return Number((minPrice + (maxVolBin + 0.5) * step).toFixed(4));
+}
+
+function calculateRelativeVolume(candles, lookback = 20) {
+  if (!candles || candles.length < lookback + 1) return 1;
+  const current = candles[candles.length - 1].volume;
+  const previous = candles.slice(-lookback - 1, -1);
+  const avgVolume = previous.reduce((a, c) => a + c.volume, 0) / previous.length;
+  return avgVolume === 0 ? 1 : current / avgVolume;
+}
+
+function checkSwingBreakOfStructure(candles, lookback = 10) {
+  if (!candles || candles.length < lookback + 2) return { bosBullish: false, bosBearish: false };
+  const current = candles[candles.length - 1];
+  const prevCandles = candles.slice(-lookback - 2, -2);
+  const highestClose = Math.max(...prevCandles.map(c => c.close));
+  const lowestClose = Math.min(...prevCandles.map(c => c.close));
+  return { bosBullish: current.close > highestClose, bosBearish: current.close < lowestClose };
+}
+
 // Punkt 11 - Dynamisches Scoring-System: die Gewichtung der Indikatoren war
 // bisher statisch, obwohl unterschiedliche Marktphasen unterschiedliche
 // Anforderungen haben. In TRENDING-Märkten zählen ADX und MACD (klassische
@@ -1406,7 +1453,7 @@ const SIGNAL_SCORE_WEIGHTS = {
 // Fallback, falls marketPhase unbekannt/nicht übergeben ist - identisch zur
 // bisherigen statischen Gewichtung (ohne MACD-Anteil).
 const DEFAULT_SIGNAL_SCORE_WEIGHTS = { adx: 30, rsi: 20, volume: 20, trend1h: 15, trend4h: 15, macd: 0 };
- 
+
 function calculateSignalScore(params) {
   const weights = SIGNAL_SCORE_WEIGHTS[params.marketPhase] || DEFAULT_SIGNAL_SCORE_WEIGHTS;
   let score = 0;
@@ -1422,22 +1469,22 @@ function calculateSignalScore(params) {
   }
   return Math.round(Math.min(score, 100));
 }
- 
+
 // ==========================================
 // 11. KUCOIN MARKET DATA
 // ==========================================
 const FUTURES_GRANULARITY_MINUTES = { '1d': 1440, '4h': 240, '1h': 60, '15m': 15, '5m': 5, '1m': 1 };
- 
+
 async function fetchKucoinKlines(symbol, timeframe = '15m', limit = 100) {
   const granularity = FUTURES_GRANULARITY_MINUTES[timeframe];
   if (!granularity) return null;
   const futuresSymbol = getFuturesSymbol(symbol);
   if (!futuresSymbol) return null;
- 
+
   const to = Date.now();
   const from = to - (limit + 10) * granularity * 60_000;
   const url = `https://api-futures.kucoin.com/api/v1/kline/query?symbol=${futuresSymbol}&granularity=${granularity}&from=${from}&to=${to}`;
- 
+
   try {
     const res = await futuresApiGetWithRetry(url, { timeout: 5000 });
     if (res.data && res.data.code === '200000' && Array.isArray(res.data.data)) {
@@ -1457,15 +1504,15 @@ async function fetchKucoinKlines(symbol, timeframe = '15m', limit = 100) {
   } catch (e) {}
   return null;
 }
- 
+
 const ONE_HOUR_MS = 3600000, FOUR_HOUR_MS = 14400000;
- 
+
 function deriveHigherTimeframes(candles15m, targetTimeframe) {
   if (!candles15m || candles15m.length < 4) return null;
   const periods = { '1h': 4, '4h': 16, '1d': 96 };
   const period = periods[targetTimeframe];
   if (!period) return null;
- 
+
   const derived = [];
   for (let i = period - 1; i < candles15m.length; i += period) {
     const slice = candles15m.slice(i - period + 1, i + 1);
@@ -1487,7 +1534,7 @@ function deriveHigherTimeframes(candles15m, targetTimeframe) {
   }
   return derived;
 }
- 
+
 async function fetchKucoinTickerPrice(symbol) {
   try {
     const futuresSymbol = getFuturesSymbol(symbol);
@@ -1500,7 +1547,7 @@ async function fetchKucoinTickerPrice(symbol) {
   } catch (e) {}
   return null;
 }
- 
+
 async function fetchKucoinMarkPrice(symbol) {
   try {
     const futuresSymbol = getFuturesSymbol(symbol);
@@ -1513,7 +1560,7 @@ async function fetchKucoinMarkPrice(symbol) {
   } catch (e) {}
   return null;
 }
- 
+
 async function fetchFuturesData(symbol) {
   try {
     const futuresSymbol = getFuturesSymbol(symbol);
@@ -1528,7 +1575,7 @@ async function fetchFuturesData(symbol) {
   } catch (e) {}
   return null;
 }
- 
+
 async function fetchOrderBookMetrics(symbol) {
   try {
     const futuresSymbol = getFuturesSymbol(symbol);
@@ -1543,20 +1590,20 @@ async function fetchOrderBookMetrics(symbol) {
       const bestBid = parseFloat(bids[0][0]);
       const bestAsk = parseFloat(asks[0][0]);
       const spreadPct = bestBid > 0 ? ((bestAsk - bestBid) / bestBid) * 100 : 0;
- 
+
       const depth = config.ORDERBOOK_DEPTH_LEVELS || 10;
       const bidVolume = bids.slice(0, depth).reduce((sum, [_, size]) => sum + parseFloat(size || 0), 0);
       const askVolume = asks.slice(0, depth).reduce((sum, [_, size]) => sum + parseFloat(size || 0), 0);
       const bidAskRatio = askVolume > 0 ? bidVolume / askVolume : 1;
- 
+
       return { spreadPct, bidAskRatio };
     }
   } catch (e) {}
   return { spreadPct: 0, bidAskRatio: 1 };
 }
- 
+
 const contractSpecsCache = new Map();
- 
+
 async function loadFuturesContractSpecs() {
   try {
     const url = 'https://api-futures.kucoin.com/api/v1/contracts/active';
@@ -1578,28 +1625,28 @@ async function loadFuturesContractSpecs() {
     }
   } catch (e) {}
 }
- 
+
 function isFuturesContractTradable(spotSymbol) {
   const futuresSymbol = getFuturesSymbol(spotSymbol);
   if (!futuresSymbol) return false;
   return contractSpecsCache.has(futuresSymbol);
 }
- 
+
 function roundToContractSize(rawUnits, spotSymbol) {
   const futuresSymbol = getFuturesSymbol(spotSymbol);
   const spec = futuresSymbol ? contractSpecsCache.get(futuresSymbol) : null;
   if (!spec) return null;
- 
+
   const rawContracts = rawUnits / spec.multiplier;
   const contracts = Math.floor(rawContracts / spec.lotSize) * spec.lotSize;
   if (contracts <= 0) return null;
- 
+
   if (contracts > spec.maxOrderQty) {
     return { contracts: spec.maxOrderQty, positionSizeUnits: spec.maxOrderQty * spec.multiplier, cappedByMaxOrderQty: true };
   }
   return { contracts, positionSizeUnits: contracts * spec.multiplier };
 }
- 
+
 async function getTopKucoinPairs(limit = 100) {
   const url = 'https://api.kucoin.com/api/v1/market/allTickers';
   const blacklist = ['USDC-USDT', 'FDUSD-USDT', 'TUSD-USDT', 'EUR-USDT', 'DAI-USDT', 'USDP-USDT', 'KCS-USDT', 'WBTC-USDT'];
@@ -1615,14 +1662,14 @@ async function getTopKucoinPairs(limit = 100) {
   } catch (e) {}
   return ['BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'XRP-USDT'];
 }
- 
+
 // ==========================================
 // 12. CACHING & PRELOADING
 // ==========================================
 const klinesCache = new LRUCache(config.MAX_KLINES_CACHE_SIZE);
 const preloadQueue = [];
 let isPreloading = false;
- 
+
 async function preloadKlines(symbols, timeframe, limit) {
   if (!config.ENABLE_PRELOADING) return;
   const uncached = symbols.filter(s => !klinesCache.has(`${s}_${timeframe}`));
@@ -1630,7 +1677,7 @@ async function preloadKlines(symbols, timeframe, limit) {
   for (const symbol of uncached) preloadQueue.push({ symbol, timeframe, limit });
   if (!isPreloading) processPreloadQueue();
 }
- 
+
 async function processPreloadQueue() {
   if (isPreloading || preloadQueue.length === 0) return;
   isPreloading = true;
@@ -1641,12 +1688,12 @@ async function processPreloadQueue() {
   }
   isPreloading = false;
 }
- 
+
 async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
   const now = Date.now();
   const cacheKey = `${symbol}_${timeframe}`;
   const cached = klinesCache.get(cacheKey);
-  if (cached && cached.timeframe === timeframe && (now - cached.timestamp) < 120000) {
+  if (cached && cached.timeframe === timeframe && (now - cached.timestamp) < 55000) {
     return cached.candles;
   }
   const candles = await fetchKucoinKlines(symbol, timeframe, limit);
@@ -1655,7 +1702,7 @@ async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
   }
   return candles;
 }
- 
+
 // ==========================================
 // 13. MARKT-REGIME & KELLY SIZING
 // ==========================================
@@ -1664,7 +1711,7 @@ function detectMarketPhase(btcTrend, btcADX, btcVolatility) {
   if (btcADX < 20 && btcVolatility < 0.015) return 'RANGING';
   return 'VOLATILE';
 }
- 
+
 function getAdaptiveConfig(marketPhase) {
   const configs = {
     'TRENDING': { ADX_MIN_MULT: 1.0, ATR_STOP_MULT_ADJ: 0, TP1_MULT_ADJ: 0, VOLUME_MULT: 1.0 },
@@ -1673,7 +1720,7 @@ function getAdaptiveConfig(marketPhase) {
   };
   return configs[marketPhase] || configs['RANGING'];
 }
- 
+
 function calculateKellyRisk(winRate, avgWin, avgLoss, maxRiskPercent) {
   if (avgLoss === 0 || winRate === 0) return maxRiskPercent / 100;
   const winProb = winRate / 100;
@@ -1681,7 +1728,7 @@ function calculateKellyRisk(winRate, avgWin, avgLoss, maxRiskPercent) {
   const kelly = (winProb * ratio - (1 - winProb)) / ratio;
   return Math.max(0.001, Math.min(kelly * 0.5, maxRiskPercent / 100));
 }
- 
+
 // ==========================================
 // 14. STATISTIK & REPORTS
 // ==========================================
@@ -1711,7 +1758,7 @@ function formatPeriodPerformanceReport(stats, periodLabel, startDate, endDate) {
   if (stats.worstTrade) report += `• Schlechtester Trade: $${stats.worstTrade.toFixed(2)}\n`;
   return report;
 }
- 
+
 async function getPeriodPerformanceStats(daysBack) {
   if (daysBack <= 0) daysBack = 7;
   try {
@@ -1719,11 +1766,11 @@ async function getPeriodPerformanceStats(daysBack) {
     const now = new Date();
     const startDate = new Date(now.getTime() - daysBack * 24 * 60 * 60 * 1000);
     const trades = await closedTradesCollection.find({ closeTime: { $gte: startDate.getTime(), $lte: now.getTime() } }).toArray();
- 
+
     if (trades.length === 0) {
       return { totalTrades: 0, netPnL: 0, totalProfit: 0, totalLoss: 0, winRate: '0.0', avgWin: 0, avgLoss: 0, winnersCount: 0, losersCount: 0, tp1Count: 0, tp2Count: 0, slCount: 0, timeStopCount: 0, absoluteTimeLimitCount: 0, trailingStopCount: 0, profitFactor: 'N/A', bestTrade: null, worstTrade: null, sharpeRatio: '0.00', startDate: startDate.toISOString().slice(0, 10), endDate: now.toISOString().slice(0, 10) };
     }
- 
+
     const totalPnL = trades.reduce((sum, t) => sum + (t.pnlUSD || 0), 0);
     const fullCloses = trades.filter(t => !t.isPartial);
     const winners = fullCloses.filter(t => (t.pnlUSD || 0) > 0);
@@ -1731,21 +1778,21 @@ async function getPeriodPerformanceStats(daysBack) {
     const avgWin = winners.length > 0 ? winners.reduce((s, t) => s + t.pnlUSD, 0) / winners.length : 0;
     const avgLoss = losers.length > 0 ? losers.reduce((s, t) => s + t.pnlUSD, 0) / losers.length : 0;
     const winRate = fullCloses.length > 0 ? (winners.length / fullCloses.length * 100).toFixed(1) : '0';
- 
+
     const totalProfit = winners.reduce((sum, t) => sum + t.pnlUSD, 0);
     const totalLoss = Math.abs(losers.reduce((sum, t) => sum + t.pnlUSD, 0));
     const profitFactor = totalLoss > 0 ? (totalProfit / totalLoss).toFixed(2) : (totalProfit > 0 ? '∞' : '0.00');
- 
+
     const sortedByPnL = fullCloses.sort((a, b) => b.pnlUSD - a.pnlUSD);
     const bestTrade = sortedByPnL.length > 0 ? sortedByPnL[0].pnlUSD : null;
     const worstTrade = sortedByPnL.length > 0 ? sortedByPnL[sortedByPnL.length - 1].pnlUSD : null;
- 
+
     const reasonCounts = {};
     trades.forEach(t => {
       const reason = t.closeReason || 'unknown';
       reasonCounts[reason] = (reasonCounts[reason] || 0) + 1;
     });
- 
+
     const dailyPnLs = [];
     let currentDay = '', dayPnL = 0;
     for (const t of trades) {
@@ -1756,7 +1803,7 @@ async function getPeriodPerformanceStats(daysBack) {
       } else dayPnL += (t.pnlUSD || 0);
     }
     if (currentDay) dailyPnLs.push(dayPnL / config.CAPITAL_USD);
- 
+
     return {
       totalTrades: fullCloses.length, netPnL: totalPnL, totalProfit, totalLoss: -totalLoss,
       winRate, avgWin, avgLoss, winnersCount: winners.length, losersCount: losers.length,
@@ -1768,7 +1815,7 @@ async function getPeriodPerformanceStats(daysBack) {
     };
   } catch (e) { return null; }
 }
- 
+
 async function getTimeBasedAnalysis() {
   try {
     if (!closedTradesCollection || !isDbConnected) return null;
@@ -1785,7 +1832,7 @@ async function getTimeBasedAnalysis() {
     return { hourlyStats, dailyStats };
   } catch (e) { return null; }
 }
- 
+
 async function checkRiskLevels() {
   if (!config.RISK_WARNING_ENABLED || !isDbConnected || !closedTradesCollection) return;
   const weekStats = await getPeriodPerformanceStats(7);
@@ -1796,13 +1843,13 @@ async function checkRiskLevels() {
     }
   }
 }
- 
+
 function formatScanStatsReport(stats) {
   const lines = [`🔎 <b>SCAN-DIAGNOSE v21.7 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
   lines.push(`Coins geprüft: ${stats.total} | Signale gesendet: ${stats.signalsSent}`);
   if (stats.avgSignalScore !== undefined) lines.push(`Ø Signal-Score: ${stats.avgSignalScore}/100`);
   lines.push(`Marktphase: ${currentMarketPhase}\n`);
- 
+
   const trendTotal = (stats.trendMismatch1h || 0) + (stats.trendMismatch4h || 0) + (stats.trendMismatch || 0);
   if (trendTotal > 0) {
     lines.push(`<b>Trend-Filter (${trendTotal}):</b>`);
@@ -1810,7 +1857,7 @@ function formatScanStatsReport(stats) {
     if (stats.trendMismatch4h) lines.push(`  • 4h Trend: ${stats.trendMismatch4h}`);
     lines.push('');
   }
- 
+
   const reasons = [];
   if (stats.missingKlines) reasons.push(`Fehlende/Zu wenige Kerzen (missingKlines): ${stats.missingKlines}`);
   if (stats.skippedActiveTrade) reasons.push(`Offener Trade: ${stats.skippedActiveTrade}`);
@@ -1820,7 +1867,7 @@ function formatScanStatsReport(stats) {
   if (stats.newsBlackout) reasons.push(`News-Blackout (Makro-Event): ${stats.newsBlackout}`);
   if (stats.mlBlocked) reasons.push(`TensorFlow.js ML-Filter blockiert: ${stats.mlBlocked}`);
   if (stats.dqnBlocked) reasons.push(`DQN Agent (Reinforcement Learning) blockiert: ${stats.dqnBlocked}`);
-  if (stats.trendQualityLow) reasons.push(`Trend Quality Score (ADX/Hurst) zu niedrig: ${stats.trendQualityLow}`);
+  if (stats.trendQualityLow) reasons.push(`Trend Quality Score (ADX/Hurst/Chop) zu niedrig: ${stats.trendQualityLow}`);
   if (stats.noBOS) reasons.push(`Kein BOS: ${stats.noBOS}`);
   if (stats.rsiTooLow) reasons.push(`RSI zu niedrig: ${stats.rsiTooLow}`);
   if (stats.rsiTooHigh) reasons.push(`RSI zu hoch: ${stats.rsiTooHigh}`);
@@ -1834,15 +1881,15 @@ function formatScanStatsReport(stats) {
   if (stats.spreadTooHigh) reasons.push(`Orderbuch Spread zu hoch: ${stats.spreadTooHigh}`);
   if (stats.cooldownActive) reasons.push(`Signal-Cooldown aktiv: ${stats.cooldownActive}`);
   if (stats.positionTooSmallForLot) reasons.push(`Position zu klein für Min-Lot: ${stats.positionTooSmallForLot}`);
- 
+
   if (reasons.length > 0) {
     lines.push(`<b>Ausschlussgründe:</b>`);
     reasons.forEach(r => lines.push(`• ${r}`));
   }
- 
+
   return lines.join('\n');
 }
- 
+
 async function getDailyPerformanceStats() {
   const todayStr = todayUTCString();
   const todayStart = new Date(todayStr + 'T00:00:00.000Z').getTime();
@@ -1854,20 +1901,20 @@ async function getDailyPerformanceStats() {
     const trades = await closedTradesCollection.find({ closeTime: { $gte: todayStart, $lte: todayEnd } }).toArray();
     const closedPnL = trades.reduce((sum, t) => sum + (t.pnlUSD || 0), 0);
     const totalPnL = closedPnL + dailyNetPnL;
- 
+
     const fullCloses = trades.filter(t => !t.isPartial);
     const winners = fullCloses.filter(t => (t.pnlUSD || 0) > 0);
     const losers = fullCloses.filter(t => (t.pnlUSD || 0) <= 0);
     const avgWin = winners.length > 0 ? winners.reduce((s, t) => s + t.pnlUSD, 0) / winners.length : 0;
     const avgLoss = losers.length > 0 ? losers.reduce((s, t) => s + t.pnlUSD, 0) / losers.length : 0;
     const winRate = fullCloses.length > 0 ? (winners.length / fullCloses.length * 100).toFixed(1) : '0';
- 
+
     const reasonCounts = {};
     trades.forEach(t => {
       const reason = t.closeReason || 'unknown';
       reasonCounts[reason] = (reasonCounts[reason] || 0) + 1;
     });
- 
+
     return {
       totalTrades: fullCloses.length, netPnL: totalPnL, totalProfit: winners.reduce((s, t) => s + t.pnlUSD, 0),
       totalLoss: losers.reduce((s, t) => s + t.pnlUSD, 0), winRate, avgWin, avgLoss, winnersCount: winners.length, losersCount: losers.length,
@@ -1878,7 +1925,7 @@ async function getDailyPerformanceStats() {
     return { totalTrades: 0, netPnL: dailyNetPnL, totalProfit: 0, totalLoss: 0, winRate: '0.0', avgWin: 0, avgLoss: 0, winnersCount: 0, losersCount: 0, tp1Count: 0, tp2Count: 0, slCount: 0, timeStopCount: 0, absoluteTimeLimitCount: 0, trailingStopCount: 0 };
   }
 }
- 
+
 // ==========================================
 // 15. TRACKER SCHLEIFE & CROSS-HEDGING
 // ==========================================
@@ -1896,7 +1943,7 @@ async function fetchMarkPricesBatched(symbols) {
   }
   return priceMap;
 }
- 
+
 async function accrueFundingCost(symbol, trade, hoursElapsed) {
   const currentFundingPeriod = Math.floor(hoursElapsed / config.FUNDING_INTERVAL_HOURS);
   if (currentFundingPeriod <= (trade.lastFundingPeriod || 0)) return;
@@ -1908,7 +1955,7 @@ async function accrueFundingCost(symbol, trade, hoursElapsed) {
   trade.lastFundingPeriod = currentFundingPeriod;
   await upsertTrade(symbol, trade);
 }
- 
+
 // Punkt 7 - Race Condition im Tracker-Lock: trackerLock wird jetzt
 // ausschließlich über try/finally zurückgesetzt, sodass ein geworfener Fehler
 // (oder ein früher return im try-Block) den Lock niemals dauerhaft blockieren
@@ -1919,10 +1966,10 @@ async function checkActiveTrades() {
     return;
   }
   trackerLock = true;
- 
+
   try {
     lastTrackerCheckTime = Date.now();
- 
+
     const btcMark = await fetchKucoinMarkPrice('BTC-USDT') || await fetchKucoinTickerPrice('BTC-USDT');
     if (btcMark && activeTrades.size > 0) {
       const hedgeEvaluation = await hedgeManager.evaluateHedgeNeed(activeTrades, btcMark);
@@ -1936,12 +1983,12 @@ async function checkActiveTrades() {
         );
       }
     }
- 
+
     if (activeTrades.size === 0) return;
- 
+
     const symbols = [...activeTrades.keys()];
     const markPrices = await fetchMarkPricesBatched(symbols);
- 
+
     for (const [symbol, trade] of activeTrades.entries()) {
       try {
         const markPrice = markPrices.get(symbol) ?? null;
@@ -1951,7 +1998,7 @@ async function checkActiveTrades() {
           if (klines && klines.length > 0) fallbackClose = klines[klines.length - 1].close;
         }
         let currentPrice = markPrice ?? fallbackClose;
- 
+
         if (currentPrice === null) {
           const failCount = (priceFailureCounts.get(symbol) || 0) + 1;
           priceFailureCounts.set(symbol, failCount);
@@ -1961,9 +2008,9 @@ async function checkActiveTrades() {
           continue;
         }
         priceFailureCounts.delete(symbol);
- 
+
         let highPrice = currentPrice, lowPrice = currentPrice, trailingATR = trade.atrAtEntry;
- 
+
         if (trade.tp1Hit) {
           const klines1m = await fetchKucoinKlinesCached(symbol, '1m', 20);
           if (klines1m && klines1m.length > 0) {
@@ -1978,20 +2025,20 @@ async function checkActiveTrades() {
           else trade.lowestSinceTP1 = Math.min(trade.lowestSinceTP1 || trade.entry, lowPrice);
           await upsertTrade(symbol, trade);
         }
- 
+
         const cleanSymbol = escapeHtml(symbol.replace('-USDT', ''));
         const hoursElapsed = (Date.now() - trade.startTime) / 3_600_000;
         const remainingEntryFee = (trade.entryFeeUSD || 0) - (trade.entryFeePaidUSD || 0);
- 
+
         await accrueFundingCost(symbol, trade, hoursElapsed);
         const fundingCostSoFar = trade.fundingCostUSD || 0;
- 
+
         if (!trade.tp1Hit && hoursElapsed >= trade.maxHoldHours * 0.75 && !trade.timeStopWarningSent) {
           trade.timeStopWarningSent = true;
           await upsertTrade(symbol, trade);
           await sendTelegramAlert(`⏱️ <b>TIME-STOP WARNUNG: ${cleanSymbol}/USDT</b>`);
         }
- 
+
         if (!trade.tp1Hit && hoursElapsed >= trade.maxHoldHours) {
           const exitPrice = applySlippage(currentPrice, trade.direction, 'exit');
           const pnlPerUnit = trade.direction === 'LONG' ? exitPrice - trade.entry : trade.entry - exitPrice;
@@ -2001,7 +2048,7 @@ async function checkActiveTrades() {
           await removeTrade(symbol, { symbol, direction: trade.direction, closeTime: Date.now(), closeReason: 'time-stop', pnlUSD, exitPrice });
           continue;
         }
- 
+
         if (trade.tp1Hit && hoursElapsed >= config.ABSOLUTE_MAX_HOLD_HOURS) {
           const exitPrice = applySlippage(currentPrice, trade.direction, 'exit');
           const pnlPerUnit = trade.direction === 'LONG' ? exitPrice - trade.entry : trade.entry - exitPrice;
@@ -2011,7 +2058,7 @@ async function checkActiveTrades() {
           await removeTrade(symbol, { symbol, direction: trade.direction, closeTime: Date.now(), closeReason: 'absolute-time-limit', pnlUSD, exitPrice });
           continue;
         }
- 
+
         // Punkt 13 - Break-Even früher aktivieren: bisher wanderte der
         // Stop-Loss erst NACH TP1 auf Break-Even. Jetzt gibt es zusätzlich
         // ein früheres Break-Even-Level bei entry ± (ATR*0.5). Sobald der
@@ -2020,7 +2067,7 @@ async function checkActiveTrades() {
         // gesetzt - nicht exakt auf Entry, damit normales Rauschen den Trade
         // nicht sofort wieder ausstoppt.
         if (!trade.tp1Hit && !trade.breakEvenActivated) {
-          const beDistance = (trade.atrAtEntry || 0) * 1.2;
+          const beDistance = (trade.atrAtEntry || 0) * 0.5;
           const beTrail = (trade.atrAtEntry || 0) * 0.1;
           if (beDistance > 0) {
             const beLevel = trade.direction === 'LONG' ? trade.entry + beDistance : trade.entry - beDistance;
@@ -2037,7 +2084,7 @@ async function checkActiveTrades() {
             }
           }
         }
- 
+
         if (config.TRAILING_STOP_ENABLED && trade.tp1Hit) {
           const trailDistance = trailingATR * config.TRAILING_ATR_MULT;
           let newStop = null;
@@ -2053,7 +2100,7 @@ async function checkActiveTrades() {
             await upsertTrade(symbol, trade);
           }
         }
- 
+
         if (trade.direction === 'LONG') {
           if (highPrice >= trade.tp2) {
             const exitPrice = applySlippage(trade.tp2, 'LONG', 'exit');
@@ -2063,7 +2110,7 @@ async function checkActiveTrades() {
             await removeTrade(symbol, { symbol, direction: trade.direction, closeTime: Date.now(), closeReason: 'tp2', pnlUSD, exitPrice });
             continue;
           }
- 
+
           if (!trade.tp1Hit && highPrice >= trade.tp1) {
             trade.tp1Hit = true;
             const exitPrice = applySlippage(trade.tp1, 'LONG', 'exit');
@@ -2071,7 +2118,7 @@ async function checkActiveTrades() {
             const partialEntryFee = (trade.entryFeeUSD || 0) * (config.TP1_CLOSE_PERCENT / 100);
             const partialFundingCost = fundingCostSoFar * (config.TP1_CLOSE_PERCENT / 100);
             const partialPnl = (exitPrice - trade.entry) * partialUnits - applyFees(trade.notionalUSD * config.TP1_CLOSE_PERCENT / 100) - partialEntryFee - partialFundingCost;
- 
+
             trade.positionSizeUnits -= partialUnits;
             trade.partiallyClosed = true;
             trade.notionalUSD = trade.positionSizeUnits * trade.entry;
@@ -2079,13 +2126,13 @@ async function checkActiveTrades() {
             trade.fundingCostUSD = fundingCostSoFar - partialFundingCost;
             trade.stopLoss = trade.entry;
             trade.highestSinceTP1 = exitPrice;
- 
+
             await upsertTrade(symbol, trade);
             await recordTradePnL(partialPnl);
             await persistClosedTradeRecord({ symbol, direction: trade.direction, closeTime: Date.now(), closeReason: 'tp1-partial', pnlUSD: partialPnl, exitPrice, isPartial: true });
             await sendTelegramAlert(`🎯 <b>TP1 ERREICHT: ${cleanSymbol}/USDT (LONG)</b> Teil-PnL: $${partialPnl.toFixed(2)}`);
           }
- 
+
           if (lowPrice <= trade.stopLoss) {
             const exitPrice = applySlippage(trade.stopLoss, 'LONG', 'exit');
             const pnlUSD = (exitPrice - trade.entry) * trade.positionSizeUnits - applyFees(trade.notionalUSD) - remainingEntryFee - (trade.fundingCostUSD || 0);
@@ -2104,7 +2151,7 @@ async function checkActiveTrades() {
             await removeTrade(symbol, { symbol, direction: trade.direction, closeTime: Date.now(), closeReason: 'tp2', pnlUSD, exitPrice });
             continue;
           }
- 
+
           if (!trade.tp1Hit && lowPrice <= trade.tp1) {
             trade.tp1Hit = true;
             const exitPrice = applySlippage(trade.tp1, 'SHORT', 'exit');
@@ -2112,7 +2159,7 @@ async function checkActiveTrades() {
             const partialEntryFee = (trade.entryFeeUSD || 0) * (config.TP1_CLOSE_PERCENT / 100);
             const partialFundingCost = fundingCostSoFar * (config.TP1_CLOSE_PERCENT / 100);
             const partialPnl = (trade.entry - exitPrice) * partialUnits - applyFees(trade.notionalUSD * config.TP1_CLOSE_PERCENT / 100) - partialEntryFee - partialFundingCost;
- 
+
             trade.positionSizeUnits -= partialUnits;
             trade.partiallyClosed = true;
             trade.notionalUSD = trade.positionSizeUnits * trade.entry;
@@ -2120,13 +2167,13 @@ async function checkActiveTrades() {
             trade.fundingCostUSD = fundingCostSoFar - partialFundingCost;
             trade.stopLoss = trade.entry;
             trade.lowestSinceTP1 = exitPrice;
- 
+
             await upsertTrade(symbol, trade);
             await recordTradePnL(partialPnl);
             await persistClosedTradeRecord({ symbol, direction: trade.direction, closeTime: Date.now(), closeReason: 'tp1-partial', pnlUSD: partialPnl, exitPrice, isPartial: true });
             await sendTelegramAlert(`🎯 <b>TP1 ERREICHT: ${cleanSymbol}/USDT (SHORT)</b> Teil-PnL: $${partialPnl.toFixed(2)}`);
           }
- 
+
           if (highPrice >= trade.stopLoss) {
             const exitPrice = applySlippage(trade.stopLoss, 'SHORT', 'exit');
             const pnlUSD = (trade.entry - exitPrice) * trade.positionSizeUnits - applyFees(trade.notionalUSD) - remainingEntryFee - (trade.fundingCostUSD || 0);
@@ -2147,7 +2194,7 @@ async function checkActiveTrades() {
     trackerLock = false;
   }
 }
- 
+
 // ==========================================
 // 16. SCANNER ENGINE & EVALUATION GATES
 // ==========================================
@@ -2157,7 +2204,7 @@ async function getBitcoinTrend() {
   const closes = rawData.map(c => c.close);
   return calculateEMA(closes, 20) > calculateEMA(closes, 50) ? 'BULLISH' : 'BEARISH';
 }
- 
+
 async function asyncPool(concurrency, items, iteratorFn) {
   const results = [];
   const executing = [];
@@ -2172,15 +2219,10 @@ async function asyncPool(concurrency, items, iteratorFn) {
   }
   return Promise.all(results);
 }
- 
-// IMPROVED: all gate decisions flow through centralized filterState-aware implementation.
+
 function evaluateDirectionGates(dir, p, scanStats) {
-  return evaluateDirectionGatesCentral(dir, p, scanStats, config, filterState);
-}
- 
-function evaluateDirectionGatesLegacy(dir, p, scanStats) {
   const isLong = dir === 'LONG';
- 
+
   // --- Hard gates: structural preconditions. Without trend alignment and a
   // break of structure this isn't the strategy the bot claims to trade, so
   // these still reject immediately.
@@ -2188,23 +2230,23 @@ function evaluateDirectionGatesLegacy(dir, p, scanStats) {
     const trendOk4h = isLong ? p.trend4h === 'BULLISH' : p.trend4h === 'BEARISH';
     if (!trendOk4h) return 'trendMismatch4h';
   }
- 
+
   const trend1hOk = isLong ? p.trend1h === 'BULLISH' : p.trend1h === 'BEARISH';
   if (!trend1hOk) return 'trendMismatch1h';
- 
+
   if (filterState.btctrend.enabled && !config.ALLOW_COUNTER_BTC_TREND) {
     const against = (p.btcTrend === 'BEARISH' && isLong) || (p.btcTrend === 'BULLISH' && !isLong);
     if (against) return 'btcCounterTrendBlocked';
   }
- 
+
   if (filterState.bos.enabled) {
     const bos = isLong ? p.bosBullish : p.bosBearish;
     if (!bos) return 'noBOS';
   }
- 
+
   const fundingOk = isLong ? p.fundingRate <= config.MAX_FUNDING_RATE : p.fundingRate >= config.MIN_FUNDING_RATE;
   if (!fundingOk) return 'fundingBlocked';
- 
+
   // --- Soft gates: previously a rigid AND-chain of ADX / Hurst / Chop / RSI
   // zone / POC-VWAP location / MACD / relative volume. Several of these
   // measure overlapping information (ADX, Hurst and Chop are all proxies for
@@ -2215,52 +2257,62 @@ function evaluateDirectionGatesLegacy(dir, p, scanStats) {
   // recorded for the existing /filter Telegram diagnostics, but no longer
   // singularly veto a setup.
   let score = 0, max = 0;
- 
-  // Trendqualität bewusst auf zwei komplementärere Signale reduziert:
-  // ADX + Hurst. Choppiness wird nicht mehr zusätzlich gewichtet.
-  // Dafür bekommen RSI und relatives Volumen mehr Gewicht.
+
+  // --- Punkt 10 - Trend Quality Score: ADX, Hurst und Chop maßen bisher alle
+  // "Trendstärke" getrennt (25+20+15 = 60% der maximal erreichbaren Punkte)
+  // und verdoppelten damit effektiv dieselbe Information im Confluence-Score.
+  // Sie werden jetzt zu einem einzigen gewichteten Score zusammengefasst:
+  //   trendQuality = (adx/100 * 0.5) + (hurst * 0.3) + ((100-chop)/100 * 0.2)
+  // Ergebnis liegt zwischen 0 und 1 und ersetzt die drei separaten Blöcke.
+  // Die einzelnen Filter bleiben über die FILTER_REGISTRY ein-/ausschaltbar;
+  // ist einer deaktiviert, wird sein Gewichtsanteil unter den verbleibenden
+  // aktiven neu verteilt, damit z.B. "nur ADX aus" nicht automatisch auch
+  // Hurst/Chop unwirksam macht.
+  const chopUsable = filterState.chop.enabled && p.chop;
   let trendRaw = 0, trendWeightSum = 0;
-  if (filterState.adx.enabled) { trendRaw += Math.max(0, Math.min(1, p.adx / 100)) * 0.6; trendWeightSum += 0.6; }
-  if (filterState.hurst.enabled) { trendRaw += Math.max(0, Math.min(1, p.hurst)) * 0.4; trendWeightSum += 0.4; }
- 
+  if (filterState.adx.enabled) { trendRaw += Math.max(0, Math.min(1, p.adx / 100)) * 0.5; trendWeightSum += 0.5; }
+  if (filterState.hurst.enabled) { trendRaw += Math.max(0, Math.min(1, p.hurst)) * 0.3; trendWeightSum += 0.3; }
+  if (chopUsable) { trendRaw += Math.max(0, Math.min(1, (100 - p.chop) / 100)) * 0.2; trendWeightSum += 0.2; }
+
   if (trendWeightSum > 0) {
-    max += 50;
-    const trendQuality = trendRaw / trendWeightSum;
-    score += 50 * trendQuality;
+    max += 60;
+    const trendQuality = trendRaw / trendWeightSum; // renormalisiert auf 0..1
+    score += 60 * trendQuality;
     const effectiveADX = p.adaptiveADX || config.ADX_MIN;
     const belowThreshold =
       (filterState.adx.enabled && p.adx < effectiveADX) ||
-      (filterState.hurst.enabled && p.hurst < config.MIN_HURST_EXPONENT);
+      (filterState.hurst.enabled && p.hurst < config.MIN_HURST_EXPONENT) ||
+      (chopUsable && p.chop > config.MAX_CHOP_INDEX);
     if (belowThreshold) scanStats.trendQualityLow++;
   }
- 
-  max += 20;
+
+  max += 15;
   const rsiInZone = isLong
     ? (!filterState.rsi_long_min.enabled || p.rsi >= config.RSI_LONG_MIN) && p.rsi <= config.RSI_LONG_MAX
     : p.rsi >= config.RSI_SHORT_MIN && (!filterState.rsi_short_max.enabled || p.rsi <= config.RSI_SHORT_MAX);
-  if (rsiInZone) score += 20;
+  if (rsiInZone) score += 15;
   else scanStats[isLong ? (p.rsi < config.RSI_LONG_MIN ? 'rsiTooLow' : 'rsiTooHigh') : (p.rsi < config.RSI_SHORT_MIN ? 'rsiTooLow' : 'rsiTooHigh')]++;
- 
+
   max += 10;
   const priceOk = p.poc && p.vwap && (isLong ? (p.currentPrice >= p.poc && p.currentPrice >= p.vwap) : (p.currentPrice <= p.poc && p.currentPrice <= p.vwap));
   if (priceOk) score += 10; else scanStats.pocVwapFail++;
- 
+
   max += 10;
   const macdOk = isLong ? p.macd.histogram >= 0 : p.macd.histogram <= 0;
   if (macdOk) score += 10; else scanStats.macdFail++;
- 
+
   if (filterState.relvol.enabled) {
-    max += 10;
+    max += 5;
     const effectiveVolume = p.adaptiveVolume || config.MIN_RELATIVE_VOLUME;
-    if (effectiveVolume <= 0 || p.relativeVolume >= effectiveVolume) score += 10;
-    else { score += Math.max(0, 10 * (p.relativeVolume / effectiveVolume)); scanStats.relVolTooLow++; }
+    if (effectiveVolume <= 0 || p.relativeVolume >= effectiveVolume) score += 5;
+    else { score += Math.max(0, 5 * (p.relativeVolume / effectiveVolume)); scanStats.relVolTooLow++; }
   }
- 
+
   const gateScore = max > 0 ? Math.round(100 * score / max) : 100;
   if (gateScore < config.MIN_GATE_SCORE) return 'lowConfluenceScore';
   return null;
 }
- 
+
 function createEmptyScanStats() {
   return {
     total: 0, signalsSent: 0, totalSignalScore: 0, avgSignalScore: 0,
@@ -2272,56 +2324,52 @@ function createEmptyScanStats() {
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0, rrrBelowMinimum: 0
+    timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0
   };
 }
- 
+
 let isScanning = false;
- 
-// Punkt 14 - Makro-Release-Filter
-// Der bisherige öffentliche Faireconomy/ForexFactory-Feed wird nicht mehr
-// verwendet. Der Kalender kommt aus macro-engine.js (FRED) und behält bei
-// API-Fehlern den letzten erfolgreichen Stand. Manuelle NEWS_BLACKOUT_TIMES
-// bleiben als Fallback erhalten.
-async function refreshMacroCalendar(force = false) {
-  return macroCalendar.refresh(force);
+
+// Punkt 14 - News-Filter: Schutz vor hoher Volatilität durch Makro-News
+// (FOMC, CPI, NFP etc.). NEWS_BLACKOUT_TIMES ist eine komma-getrennte Liste
+// von ISO-Zeitstempeln (UTC), die z.B. manuell aus einem Wirtschaftskalender
+// wie ForexFactory gepflegt oder per Deploy-Skript aktualisiert werden kann.
+// Blackout-Fenster: 30 Minuten vor bis 60 Minuten nach jedem Event - in
+// diesem Fenster wird der komplette Scan ausgesetzt.
+const NEWS_BLACKOUT_BEFORE_MS = 30 * 60 * 1000;
+const NEWS_BLACKOUT_AFTER_MS = 60 * 60 * 1000;
+
+function loadNewsEvents() {
+  const raw = process.env.NEWS_BLACKOUT_TIMES;
+  if (!raw) return [];
+  return raw.split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(s => Date.parse(s))
+    .filter(t => Number.isFinite(t));
 }
- 
+
+const newsEvents = loadNewsEvents();
+
 function isNewsBlackout(now = Date.now()) {
-  return macroCalendar.isBlackout(now);
+  return newsEvents.some(t => now >= t - NEWS_BLACKOUT_BEFORE_MS && now <= t + NEWS_BLACKOUT_AFTER_MS);
 }
- 
-// Initialer Makro-Import; ohne FRED_API_KEY bleiben manuelle ENV-Events aktiv.
-refreshMacroCalendar().catch(e => logger.warn(`[Macro] Initialer Refresh fehlgeschlagen: ${e.message}`));
- 
+
 async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
   logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.7 (mit DQN)...`);
- 
-  if (isPaused) {
-    logger.warn('⚠️ Scan abgebrochen: Bot pausiert.');
+
+  if (!isDbConnected || isPaused) {
+    logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
     isScanning = false;
     return;
   }
-  if (!isDbConnected) {
-    let dbReady = false;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try { dbReady = await ensureDbConnection(); } catch (e) { logger.warn(`[DB] Scan-Reconnect Versuch ${attempt}/3 fehlgeschlagen: ${e.message}`); }
-      if (dbReady) break;
-      if (attempt < 3) await sleep(1000 * attempt);
-    }
-    if (!dbReady) {
-      logger.warn('⚠️ Scan abgebrochen: MongoDB nach 3 Retries nicht verfügbar.');
-      isScanning = false;
-      return;
-    }
-  }
- 
+
   const scanStats = createEmptyScanStats();
   const signalBatch = [];
- 
+
   // Bug fixed: the macro/sentiment check used to run BEFORE this try block.
   // If macroEngine.evaluateMacroEnvironment() threw (e.g. the Fear & Greed
   // API call failed in an unexpected way), the exception propagated out of
@@ -2333,35 +2381,37 @@ async function scanMarket() {
   try {
     if (isNewsBlackout()) {
       scanStats.newsBlackout = (scanStats.newsBlackout || 0) + 1;
-      const macroStatus = macroCalendar.getStatus();
-      const names = macroStatus.active.map(e => e.name).join(', ');
-      logger.warn(`⚠️ Scan wegen Makro-Blackout ausgesetzt: ${names || 'HIGH-Impact Event'}.`);
+      logger.warn('⚠️ Scan wegen News-Blackout (Makro-Event, z.B. FOMC/CPI/NFP) ausgesetzt.');
       return;
     }
- 
+
     const macroStatus = await macroEngine.evaluateMacroEnvironment();
     if (!macroStatus.safe) {
       logger.warn(`⚠️ Scan wegen Makro-Risiko ausgesetzt (Sentiment: ${macroStatus.sentimentClass}, Wert: ${macroStatus.sentimentValue}).`);
       return;
     }
- 
-    const btcTrend = await getBitcoinTrend().catch(() => 'NEUTRAL');
-    const btcKlines = await fetchKucoinKlinesCached('BTC-USDT', '15m', 100).catch(() => null);
-    const btcADX = btcKlines ? calculateADX(btcKlines, 14) : 20;
-    const btcATR = btcKlines ? calculateATR(btcKlines, 14) : 0;
-    const btcPrice = btcKlines ? btcKlines[btcKlines.length - 1].close : 0;
-    const btcVolatility = btcPrice > 0 ? btcATR / btcPrice : 0.02;
- 
+
+    const btcTrend = await getBitcoinTrend();
+    const btcKlines = await fetchKucoinKlinesCached('BTC-USDT', '15m', 100);
+    const btcDataCheck = dataValidator.candles(btcKlines, { timeframeMs: 15 * 60 * 1000, minLength: 20 });
+    if (!btcDataCheck.valid) {
+      throw new Error(`[DATA-QUALITY] BTC-USDT/15m ungültig: ${btcDataCheck.reason}`);
+    }
+    const btcADX = calculateADX(btcKlines, 14);
+    const btcATR = calculateATR(btcKlines, 14);
+    const btcPrice = btcKlines[btcKlines.length - 1].close;
+    const btcVolatility = btcPrice > 0 ? btcATR / btcPrice : 0;
+
     currentMarketPhase = detectMarketPhase(btcTrend, btcADX, btcVolatility);
     adaptiveConfig = config.ENABLE_ADAPTIVE_PARAMS 
       ? getAdaptiveConfig(currentMarketPhase) 
       : { ADX_MIN_MULT: 1, ATR_STOP_MULT_ADJ: 0, TP1_MULT_ADJ: 0, VOLUME_MULT: 1 };
- 
+
     const adaptiveADX = config.ADX_MIN * adaptiveConfig.ADX_MIN_MULT;
     const adaptiveATR = config.ATR_STOP_MULT + adaptiveConfig.ATR_STOP_MULT_ADJ;
     const adaptiveTP1 = config.TP1_MULT + adaptiveConfig.TP1_MULT_ADJ;
     const adaptiveVolume = config.MIN_RELATIVE_VOLUME * adaptiveConfig.VOLUME_MULT;
- 
+
     let adaptiveRisk = config.RISK_PERCENT * macroStatus.riskMultiplier;
     if (config.ENABLE_KELLY_SIZING) {
       const weekStats = await getPeriodPerformanceStats(7).catch(() => null);
@@ -2374,7 +2424,7 @@ async function scanMarket() {
         ) * 100 * macroStatus.riskMultiplier;
       }
     }
- 
+
     let timeFilterBlocked = false;
     if (filterState.timetrend.enabled && config.ENABLE_TIME_FILTER) {
       const timeStats = await getTimeBasedAnalysis();
@@ -2389,49 +2439,52 @@ async function scanMarket() {
         }
       }
     }
- 
+
     logger.info(`📊 Phase: ${currentMarketPhase} | Sentiment: ${macroStatus.sentimentClass} (${macroStatus.sentimentValue}) | ADX: ${adaptiveADX.toFixed(1)} | Risk: ${adaptiveRisk.toFixed(2)}%`);
- 
-    const spotWatchlist = await getTopKucoinPairs(config.TOP_COIN_LIMIT).catch(() => ['BTC-USDT', 'ETH-USDT']);
+
+    const spotWatchlist = await getTopKucoinPairs(config.TOP_COIN_LIMIT).catch((e) => {
+      logger.error(`🔴 [DATA-QUALITY] Watchlist konnte nicht geladen werden: ${e.message}`);
+      return [];
+    });
     const dynamicWatchlist = contractSpecsCache.size > 0 
       ? spotWatchlist.filter(isFuturesContractTradable) 
       : spotWatchlist;
- 
+
     if (dynamicWatchlist.length === 0) {
       logger.warn('⚠️ Watchlist ist leer!');
       isScanning = false;
       return;
     }
- 
+
     if (config.ENABLE_PRELOADING) {
       preloadKlines(dynamicWatchlist.slice(0, 20), '15m', 100);
     }
- 
+
     let signalsSent = 0;
- 
+
     await asyncPool(config.SCAN_CONCURRENCY, dynamicWatchlist, async (symbol) => {
       scanStats.total++;
- 
+
       if (activeTrades.has(symbol)) { 
         scanStats.skippedActiveTrade++; 
         return; 
       }
- 
+
       if (await isCoinDynamicallyBlacklisted(symbol)) {
         scanStats.skippedDynamicBlacklist++;
         return;
       }
- 
+
       if (timeFilterBlocked) {
         scanStats.timeBlocked++;
         return;
       }
- 
+
       if (signalsSent >= config.MAX_SIGNALS_PER_SCAN) { 
         scanStats.skippedMaxSignals++; 
         return; 
       }
- 
+
       const preCheck = canOpenNewTrade(activeTrades.size, null);
       if (!preCheck.allowed) {
         if (preCheck.reason && scanStats.hasOwnProperty(preCheck.reason)) {
@@ -2441,18 +2494,24 @@ async function scanMarket() {
         }
         return;
       }
- 
+
       try {
-        const raw15m = await fetchKucoinKlinesCached(symbol, '15m', config.KLINES_SCAN_LIMIT);
+        const raw15m = await fetchKucoinKlinesCached(symbol, '15m', 100);
+        const dataCheck = raw15m ? dataValidator.candles(raw15m, { timeframeMs: 15 * 60 * 1000, minLength: 20 }) : { valid: false, reason: 'missing-data' };
+        if (!dataCheck.valid) {
+          scanStats.missingKlines++;
+          logger.warn(`⚠️ [DATA-QUALITY] ${symbol}/15m verworfen: ${dataCheck.reason}`);
+          return;
+        }
         if (!raw15m || raw15m.length < 20) { 
           scanStats.missingKlines++; 
           return; 
         }
- 
+
         let raw1h = config.ENABLE_MULTI_TF_DERIVATION 
           ? deriveHigherTimeframes(raw15m, '1h') 
           : await fetchKucoinKlinesCached(symbol, '1h', 50);
- 
+
         if (!raw1h) { 
           scanStats.missingKlines++; 
           return; 
@@ -2467,7 +2526,7 @@ async function scanMarket() {
           scanStats.missingKlines++;
           return;
         }
- 
+
         let raw4h = null;
         if (config.REQUIRE_4H_TREND) {
           if (config.ENABLE_MULTI_TF_DERIVATION) {
@@ -2480,23 +2539,23 @@ async function scanMarket() {
           }
           if (raw4h) raw4h = raw4h.filter(c => c.time + FOUR_HOUR_MS <= Date.now());
         }
- 
+
         const futuresData = await fetchFuturesData(symbol).catch(() => null);
         const orderBookMetrics = await fetchOrderBookMetrics(symbol).catch(() => ({ spreadPct: 0, bidAskRatio: 1 }));
- 
+
         const orderFlowEval = orderFlowManager.evaluateOrderFlow(raw15m, orderBookMetrics);
- 
+
         const closes4h = raw4h ? raw4h.map(c => c.close) : [];
         const closes1h = raw1h.map(c => c.close);
         const closes15m = raw15m.map(c => c.close);
         const currentPrice = closes15m[closes15m.length - 1];
- 
+
         const trend4h = closes4h.length >= 50 
           ? (calculateEMA(closes4h, 20) > calculateEMA(closes4h, 50) ? 'BULLISH' : 'BEARISH') 
           : 'NEUTRAL';
         const trend1h = calculateEMA(closes1h, 20) > calculateEMA(closes1h, 50) ? 'BULLISH' : 'BEARISH';
         const trend15m = calculateEMA(closes15m, config.TREND_EMA_FAST_15M) > calculateEMA(closes15m, config.TREND_EMA_SLOW_15M) ? 'BULLISH' : 'BEARISH';
- 
+
         const adx = calculateADX(raw15m, 14);
         const hurst = calculateHurstExponent(closes15m);
         const chop = calculateChoppinessIndex(raw15m, 14);
@@ -2508,21 +2567,20 @@ async function scanMarket() {
         const { bosBullish, bosBearish } = checkSwingBreakOfStructure(raw15m, config.BOS_LOOKBACK);
         const relativeVolume = calculateRelativeVolume(raw15m, 20);
         const fundingRate = futuresData ? futuresData.fundingRate : 0;
- 
+
         const gateParams = {
-          trend4h, trend1h, trend15m, btcTrend, adx, hurst, bosBullish, bosBearish,
+          trend4h, trend1h, trend15m, btcTrend, adx, hurst, chop, bosBullish, bosBearish,
           rsi, poc, vwap, currentPrice, macd, fundingRate, relativeVolume,
           adaptiveADX, adaptiveVolume
         };
- 
+
         var direction = null;
         const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
         let primaryFail = evaluateDirectionGates(primaryDir, gateParams, scanStats);
- 
+
         if (!primaryFail) {
           direction = primaryDir;
-        } else if (primaryDir !== 'LONG' || config.ENABLE_SHORT_SIGNALS === true) {
-          // FIX: never evaluate/emit a secondary SHORT when shorts are disabled.
+        } else if (config.ENABLE_SHORT_SIGNALS || primaryDir === 'LONG') {
           const secondaryFail = evaluateDirectionGates(
             primaryDir === 'LONG' ? 'SHORT' : 'LONG', 
             gateParams,
@@ -2536,7 +2594,7 @@ async function scanMarket() {
         } else {
           scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
         }
- 
+
         if (direction !== null) {
           if (direction === 'LONG' && orderFlowEval.pressure === 'BEARISH_DOMINANT' && orderFlowEval.score < 35) {
             scanStats.orderFlowBlocked++;
@@ -2546,30 +2604,30 @@ async function scanMarket() {
             scanStats.orderFlowBlocked++;
             return;
           }
- 
+
           const sentimentCheck = await evaluateFundingAndSentiment(fundingRate, direction);
           if (!sentimentCheck.allowed) {
             scanStats.fundingBlocked = (scanStats.fundingBlocked || 0) + 1;
             return;
           }
- 
+
           const cooldownKey = `${symbol}_${direction}`;
           const lastSent = await getAlertTimestamp(cooldownKey);
           if (Date.now() - lastSent <= 2 * 3_600_000) {
             scanStats.cooldownActive++;
             return;
           }
- 
+
           if (!checkCorrelationLimit(symbol, direction, activeTrades, config.ENABLE_CORRELATION_LIMITS)) {
             scanStats.correlationBlocked++;
             return;
           }
- 
+
           const signalScore = calculateSignalScore({
             adx, rsi, relativeVolume, trend1h, trend4h, direction,
             marketPhase: currentMarketPhase, macdHistogram: macd.histogram
           });
- 
+
           if (config.ENABLE_ORDERBOOK_ANALYSIS && signalScore > 60) {
             const obOk = direction === 'LONG' ? orderBookMetrics.bidAskRatio > 0.9 : orderBookMetrics.bidAskRatio < 1.1;
             if (!obOk) {
@@ -2577,12 +2635,12 @@ async function scanMarket() {
               return;
             }
           }
- 
+
           const pocDistancePct = poc && currentPrice ? ((currentPrice - poc) / currentPrice) * 100 : 0;
           const vwapDistancePct = vwap && currentPrice ? ((currentPrice - vwap) / currentPrice) * 100 : 0;
           const macdHistogramPct = currentPrice ? (macd.histogram / currentPrice) * 100 : 0;
           const atrPct = currentPrice ? (atr / currentPrice) * 100 : 0;
- 
+
           const mlFeatures = buildMLFeatures({
             adx, rsi, relativeVolume, signalScore, atrPct, hurst,
             macdHistogramPct, pocDistancePct, vwapDistancePct,
@@ -2593,13 +2651,13 @@ async function scanMarket() {
             spreadPct: orderBookMetrics.spreadPct,
             volatilityRatio: btcATR > 0 ? atr / btcATR : 1
           });
- 
+
           const mlPrediction = predictSignalSuccess(mlFeatures);
           if (mlPrediction.trained && mlPrediction.probability < config.ML_MIN_PREDICTION_PROBABILITY) {
             scanStats.mlBlocked++;
             return;
           }
- 
+
           // ==========================================
           // 🧠 DQN AGENT VETO-GATE (AKTIVIERT)
           // ==========================================
@@ -2609,10 +2667,11 @@ async function scanMarket() {
               marketPhase: currentMarketPhase, atrPct, pocDistancePct,
               vwapDistancePct, orderBookImbalance: orderBookMetrics.bidAskRatio,
               spreadPct: orderBookMetrics.spreadPct, volatilityRatio: btcATR > 0 ? atr / btcATR : 1,
-              mlProbability: mlPrediction.probability
+              mlProbability: mlPrediction.probability,
+              confluenceScore: signalScore
             });
             const dqnAction = dqnAgent.act(dqnState);
- 
+
             // Wenn Action = 0 (Veto/Ablehnen) und außerhalb der Exploration (Epsilon)
             if (dqnAction === 0 && Math.random() >= dqnAgent.epsilon) {
               scanStats.dqnBlocked++;
@@ -2620,14 +2679,14 @@ async function scanMarket() {
               return;
             }
           }
- 
+
           if (shouldSkipSignal(symbol, direction, signalScore)) {
             scanStats.signalHistoryBlocked++;
             return;
           }
- 
+
           const volEvaluation = await volManager.evaluateVolatilityMultiplier(symbol, atr, currentPrice);
- 
+
           // Punkt 12 - Entry-Zonen statt fixem Market-Entry: statt immer exakt
           // zum letzten Schlusskurs zu handeln, wird eine Entry-Zone zwischen
           // dem Close der vorletzten und der aktuellen (letzten abgeschlossenen)
@@ -2638,10 +2697,10 @@ async function scanMarket() {
           const entryZoneLow = Math.min(prevClose15m, currentPrice);
           const entryZoneHigh = Math.max(prevClose15m, currentPrice);
           const entryZoneMid = (entryZoneLow + entryZoneHigh) / 2;
- 
+
           const entryPrice = applySlippage(entryZoneMid, direction, 'entry');
           const atrStopDistance = atr * adaptiveATR * volEvaluation.volFactor;
- 
+
           // Structure-based stop: prefer the most recent swing low/high over
           // a rigid ATR multiple, bounded to 0.8x-3x the ATR distance so a
           // stray wick can't place the stop absurdly close or absurdly far.
@@ -2653,47 +2712,63 @@ async function scanMarket() {
               stopDistance = Math.min(Math.max(swingDistance, atrStopDistance * 0.8), atrStopDistance * 3);
             }
           }
- 
+
           const stopLoss = direction === 'LONG' ? entryPrice - stopDistance : entryPrice + stopDistance;
- 
+
           // Enforce a minimum risk:reward ratio on TP1. With the default
           // TP1_MULT (1.3) vs ATR_STOP_MULT (2.3) this previously produced
           // RRR ~0.57 - a structurally losing setup even at >50% win rate.
-          const actualStopDistance = Math.abs(entryPrice - stopLoss); const tp1Distance = Math.max(stopDistance * adaptiveTP1, actualStopDistance * config.MIN_RRR); if (actualStopDistance <= 0 || (tp1Distance / actualStopDistance) < config.MIN_RRR) { scanStats.rrrBelowMinimum = (scanStats.rrrBelowMinimum || 0) + 1; return; }
+          const tp1Distance = Math.max(stopDistance * adaptiveTP1, stopDistance * config.MIN_RRR);
           const tp2Distance = Math.max(stopDistance * config.TP2_MULT, tp1Distance * 1.3);
           const tp1 = direction === 'LONG' ? entryPrice + tp1Distance : entryPrice - tp1Distance;
           const tp2 = direction === 'LONG' ? entryPrice + tp2Distance : entryPrice - tp2Distance;
- 
-          const dynamicLeverage = calculateDynamicLeverage(atr, currentPrice, config.LEVERAGE);
-           const rawSizing = calculatePositionSize(entryPrice, stopLoss, config.CAPITAL_USD, adaptiveRisk, dynamicLeverage);
+
+          const rawSizing = calculatePositionSize(entryPrice, stopLoss, config.CAPITAL_USD, adaptiveRisk);
           const contractSizing = roundToContractSize(rawSizing.positionSizeUnits, symbol);
- 
+
           if (!contractSizing) {
             scanStats.positionTooSmallForLot++;
             return;
           }
- 
+
           const sizing = {
             positionSizeUnits: contractSizing.positionSizeUnits,
             notionalUSD: contractSizing.positionSizeUnits * entryPrice,
             riskAmountUSD: Math.abs(entryPrice - stopLoss) * contractSizing.positionSizeUnits,
             contracts: contractSizing.contracts
           };
- 
+
           if (signalsSent >= config.MAX_SIGNALS_PER_SCAN) return;
           if (activeTrades.has(symbol)) return;
- 
-          const finalCheck = canOpenNewTrade(activeTrades.size, direction, sizing.notionalUSD);
+
+          const finalCheck = riskEngine.evaluate({
+            equityUSD: config.CAPITAL_USD + dailyNetPnL,
+            dailyPnL: dailyNetPnL,
+            peakEquityUSD: peakCapital,
+            activeTrades: [...activeTrades.values()],
+            direction,
+            notionalUSD: sizing.notionalUSD,
+            maxConcurrent: config.MAX_CONCURRENT_TRADES,
+            maxSameDirection: config.MAX_SAME_DIRECTION,
+            maxExposureRatio: config.MAX_EXPOSURE_RATIO,
+            maxDailyLossUSD: config.MAX_DAILY_LOSS_USD,
+            maxDrawdownPercent: config.MAX_DRAWDOWN_PERCENT,
+            leverage: config.LEVERAGE
+          });
           if (!finalCheck.allowed) {
-            scanStats[finalCheck.reason] = (scanStats[finalCheck.reason] || 0) + 1;
+            const reason = `risk_${String(finalCheck.reason).replace(/[^a-z0-9_-]/gi, '_')}`;
+            scanStats[reason] = (scanStats[reason] || 0) + 1;
+            await auditLogger.write('SIGNAL_BLOCKED_RISK', { symbol, direction, reason: finalCheck.reason });
             return;
           }
- 
+
           await persistAlertHistoryEntry(cooldownKey, Date.now());
           signalsSent++;
           scanStats.signalsSent++;
           scanStats.totalSignalScore += signalScore;
- 
+
+          const dynamicLeverage = calculateDynamicLeverage(atr, currentPrice, config.LEVERAGE);
+
           await upsertTrade(symbol, {
             symbol, direction, entry: entryPrice, stopLoss, tp1, tp2,
             // Punkt 6 - ML-Feature-Leakage: Preis zum Zeitpunkt der
@@ -2747,7 +2822,7 @@ async function scanMarket() {
             mlConfidenceAtEntry: mlPrediction.confidence,
             mlModelVersionAtEntry: mlModel.getStats().modelVersion || null
           });
- 
+
           const safeSymbol = escapeHtml(symbol);
           const signalText = 
             `🚀 <b>NEUES SIGNAL: ${safeSymbol} (${direction})</b> [Score: ${signalScore}/100]\n` +
@@ -2757,7 +2832,7 @@ async function scanMarket() {
             `ADX: ${adx} | Hurst: ${hurst} | CVD-Score: ${orderFlowEval.score}\n` +
             `🧠 TensorFlow.js: ${mlPrediction.trained ? (mlPrediction.probability * 100).toFixed(1) + '% Erfolgswahrscheinlichkeit' : 'noch nicht trainiert'}\n` +
             `🤖 DQN Epsilon: ${dqnAgent.getStats().epsilon}`;
- 
+
           if (config.ENABLE_BATCH_SIGNALS) {
             signalBatch.push({ text: signalText });
           } else {
@@ -2768,15 +2843,15 @@ async function scanMarket() {
         logger.error(`[SCAN ERROR] ${symbol}: ${e.message}`);
       }
     });
- 
+
     if (config.ENABLE_BATCH_SIGNALS && signalBatch.length > 0) {
       await sendBatchedSignalAlert(signalBatch);
     }
- 
+
     if (scanStats.signalsSent > 0) {
       scanStats.avgSignalScore = Math.round(scanStats.totalSignalScore / scanStats.signalsSent);
     }
- 
+
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
     
     if (marketPhaseLogsCollection && isDbConnected) {
@@ -2790,16 +2865,16 @@ async function scanMarket() {
       }).catch(err => logger.error(`[MARKET PHASE LOG ERROR] ${err.message}`));
     }
     logger.info(`📈 [PHASE-LOG] Phase: ${currentMarketPhase} | Gecheckt: ${scanStats.total} | Signale: ${signalsSent}`);
- 
+
     lastScanStats = scanStats;
     scanCounter++;
- 
+
     if (scanCounter % config.SCAN_STATS_TELEGRAM_EVERY_N_SCANS === 0) {
       await sendTelegramAlert(formatScanStatsReport(scanStats));
     }
- 
+
     await checkRiskLevels();
- 
+
   } catch (err) {
     logger.error(`[SCAN CRITICAL ERROR] ${err.message}`);
     logger.error(err.stack);
@@ -2807,7 +2882,7 @@ async function scanMarket() {
     isScanning = false;
   }
 }
- 
+
 // ==========================================
 // 17. TELEGRAM COMMANDS & POLLING
 // ==========================================
@@ -2816,13 +2891,13 @@ function isAuthorizedChat(chatId) {
   const allowed = targetIds.split(',').map(id => id.trim()).filter(Boolean);
   return allowed.includes(String(chatId));
 }
- 
+
 async function handleTelegramCommand(chatId, text) {
   logger.info(`📨 Telegram Command: chatId=${chatId}, text="${text}"`);
   const parts = text.trim().split(/\s+/);
   const command = parts[0].toLowerCase();
   const args = parts.slice(1);
- 
+
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
       `<b>🤖 TRADING BOT v21.7 - DQN & MODULAR SYSTEM</b>\n` +
@@ -2846,6 +2921,7 @@ async function handleTelegramCommand(chatId, text) {
       `<b>🤖 Künstliche Intelligenz & DQN:</b>\n` +
       `/ki [Frage] - Marktanalyse per KI abfragen\n` +
       `/report - Automatisches KI-Trading Briefing\n` +
+      `/dqn [on|off|status] - DQN Paper-Learning/Veto steuern\n` +
       `/retrain - TensorFlow.js & DQN Agent neu trainieren\n\n` +
       `<b>🚨 Trade-Steuerung:</b>\n` +
       `/close [Symbol] - Einzelnen Trade schließen (z. B. <code>/close BTC-USDT</code>)\n` +
@@ -2866,7 +2942,27 @@ async function handleTelegramCommand(chatId, text) {
     );
     return;
   }
- 
+
+  if (command === '/dqn') {
+    const action = (args[0] || 'status').toLowerCase();
+    if (!['on','off','status'].includes(action)) {
+      await sendTelegramReply(chatId, '⚠️ Syntax: <code>/dqn on</code>, <code>/dqn off</code> oder <code>/dqn status</code>');
+      return;
+    }
+    if (action === 'status') {
+      const st = dqnAgent.getStats();
+      await sendTelegramReply(chatId, `🤖 <b>DQN STATUS</b>\n• Aktiv: <b>${config.DQN_ENABLED ? '🟢 JA' : '🔴 NEIN'}</b>\n• Initialisiert: ${st.isInitialized ? 'Ja' : 'Nein'}\n• Epsilon: ${st.epsilon}\n• Memory: ${st.memorySize}\n• Modus: Paper Trading / Learning`);
+      return;
+    }
+    try {
+      await setDqnEnabled(action === 'on');
+      await sendTelegramReply(chatId, action === 'on' ? '🟢 <b>DQN AKTIVIERT</b> – Paper-Learning/Veto ist eingeschaltet.' : '🔴 <b>DQN DEAKTIVIERT</b> – Bot läuft ohne DQN-Veto und ohne DQN-Training.');
+    } catch (e) {
+      await sendTelegramReply(chatId, `❌ DQN-Änderung fehlgeschlagen: ${escapeHtml(e.message)}`);
+    }
+    return;
+  }
+
   if (command === '/optimize') {
     const symbolArg = args[0] ? args[0].toUpperCase() : 'BTC-USDT';
     const days = args[1] ? Number(args[1]) : 14;
@@ -2878,8 +2974,7 @@ async function handleTelegramCommand(chatId, text) {
       const best = await optimizeHyperparameters(symbolArg, days, cfg);
       
       if (best) {
-        config.ATR_STOP_MULT = best.atrMultiplier;
-        config.ADX_MIN = best.adxMin;
+        await auditLogger.write('OPTIMIZATION_COMPLETED', { symbol: symbolArg, days, bestParams: best });
         
         let report = `🎯 <b>OPTIMIERUNG ERFOLGREICH BEENDET!</b>\n`;
         report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
@@ -2890,7 +2985,7 @@ async function handleTelegramCommand(chatId, text) {
         report += `• Net Profit: $${best.metrics.netProfit.toFixed(2)}\n`;
         report += `• Win-Rate: ${best.metrics.winRate.toFixed(2)}%\n`;
         report += `• Sharpe Ratio: ${best.metrics.sharpe.toFixed(2)}\n\n`;
-        report += `✅ <i>Die Live-Parameter des Bots wurden automatisch aktualisiert!</i>`;
+        report += `ℹ️ <i>Research-Ergebnis: Live-Parameter wurden NICHT verändert.</i>`;
         
         await sendTelegramReply(chatId, report);
       } else {
@@ -2902,23 +2997,23 @@ async function handleTelegramCommand(chatId, text) {
     }
     return;
   }
- 
+
   if (command === '/drawndown' || command === '/dd') {
     const currentEquity = config.CAPITAL_USD + dailyNetPnL;
     const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(2) : 0;
     const maxAllowed = config.MAX_DRAWDOWN_PERCENT;
- 
+
     let msg = `📉 <b>AKTUELLER DRAWDOWN STATUS</b>\n━━━━━━━━━━━━━━━━━━━━\n`;
     msg += `• Aktuelles Kapital: <b>$${currentEquity.toFixed(2)}</b>\n`;
     msg += `• Peak Kapital: <b>$${peakCapital.toFixed(2)}</b>\n`;
     msg += `• Aktueller Drawdown: <b>${drawdownPercent}%</b>\n`;
     msg += `• Max. Erlaubter Drawdown: <b>${maxAllowed}%</b>\n`;
     msg += `• Bot-Status: ${isPaused ? '⏸️ Pausiert' : '▶️ Aktiv'}`;
- 
+
     await sendTelegramReply(chatId, msg);
     return;
   }
- 
+
   if (command === '/ki' || command === '/gemini') {
     const promptText = args.join(' ') || 'Wie schätzt du die allgemeine Lage von Bitcoin und dem Kryptomarkt heute ein? Antworte kurz und präzise.';
     
@@ -2932,7 +3027,7 @@ async function handleTelegramCommand(chatId, text) {
         model: 'gemini-3.5-flash-lite',
         contents: promptText,
       });
- 
+
       const aiAnswer = response.text || 'Keine Antwort erhalten.';
       
       let report = `🤖 <b>GEMINI MARKTANALYSE</b>\n`;
@@ -2946,7 +3041,7 @@ async function handleTelegramCommand(chatId, text) {
     }
     return;
   }
- 
+
   if (command === '/report' || command === '/briefing') {
     await sendTelegramReply(chatId, `📊 <i>Sammle Marktdaten und erstelle KI-Briefing...</i>`);
     
@@ -2961,7 +3056,7 @@ async function handleTelegramCommand(chatId, text) {
       if (openTradesCount > 0) {
         tradesSummary = [...activeTrades.entries()].map(([sym, t]) => `${sym} (${t.direction}, Entry: ${t.entry})`).join(', ');
       }
- 
+
       const prompt = `Erstelle einen professionellen Trading-Lagebericht basierend auf diesen Daten:
       - Aktuelle Marktphase des Bots: ${currentMarketPhase}
       - Heutige Netto-PnL: $${dailyNetPnL.toFixed(2)}
@@ -2969,12 +3064,12 @@ async function handleTelegramCommand(chatId, text) {
       - Offene Trades (${openTradesCount}): ${tradesSummary}
       
       Analysiere das kurz, professionell und motivierend auf Deutsch.`;
- 
+
       const response = await ai.models.generateContent({
         model: 'gemini-3.5-flash-lite',
         contents: prompt,
       });
- 
+
       const aiAnswer = response.text || 'Keine Analyse erhalten.';
       
       let report = `📈 <b>KI-TRADING BRIEFING</b>\n`;
@@ -2988,7 +3083,7 @@ async function handleTelegramCommand(chatId, text) {
     }
     return;
   }
- 
+
   if (command === '/backtest') {
     const symbol = args[0] ? args[0].toUpperCase() : 'BTC-USDT';
     const days = args[1] ? Number(args[1]) : 30;
@@ -3016,7 +3111,7 @@ async function handleTelegramCommand(chatId, text) {
     }
     return;
   }
- 
+
   if (command === '/filters') {
     let msg = `<b>⚙️ DYNAMISCHE FILTER ÜBERSICHT</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
     Object.keys(FILTER_REGISTRY).forEach(key => {
@@ -3034,7 +3129,7 @@ async function handleTelegramCommand(chatId, text) {
           diffStr = ` (<i>Default</i>)`;
         }
       }
- 
+
       msg += `${statusEmoji} <b>${reg.name}</b> (<code>${key}</code>):\n`;
       msg += `   • Wert: <b>${currentVal}</b>${diffStr}\n`;
       msg += `   • Status: ${state.enabled ? 'Aktiv' : '<b>DEAKTIVIERT</b>'}\n\n`;
@@ -3043,17 +3138,17 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, msg);
     return;
   }
- 
+
   if (command === '/filter') {
     const subAction = args[0] ? args[0].toLowerCase() : null;
     const filterKey = args[1] ? args[1].toLowerCase() : null;
     const confirmFlag = args[2] ? args[2].toLowerCase() : null;
- 
+
     if (!subAction) {
       await sendTelegramReply(chatId, '⚠️ Syntax: <code>/filter [on|off|soft|hard|reset] [key]</code>\nBeispiel: <code>/filter soft adx</code>');
       return;
     }
- 
+
     if (subAction === 'reset' && (filterKey === 'all' || !filterKey)) {
       if (filterKey === 'all' && confirmFlag === 'confirm') {
         Object.keys(FILTER_REGISTRY).forEach(k => {
@@ -3071,17 +3166,17 @@ async function handleTelegramCommand(chatId, text) {
         return;
       }
     }
- 
+
     if (!filterKey || !FILTER_REGISTRY[filterKey]) {
       const validKeys = Object.keys(FILTER_REGISTRY).map(k => `<code>${k}</code>`).join(', ');
       await sendTelegramReply(chatId, `⚠️ Ungültiger Filter-Key: <b>${escapeHtml(filterKey || '')}</b>\nGültige Keys: ${validKeys}`);
       return;
     }
- 
+
     const reg = FILTER_REGISTRY[filterKey];
     const cKey = reg.configKey;
     const oldVal = config[cKey];
- 
+
     if (subAction === 'on') {
       filterState[filterKey].enabled = true;
       await persistFilterState();
@@ -3089,7 +3184,7 @@ async function handleTelegramCommand(chatId, text) {
       await sendTelegramReply(chatId, `🟢 Filter <b>${reg.name}</b> wurde <b>AKTIVIERT</b>.`);
       return;
     }
- 
+
     if (subAction === 'off') {
       filterState[filterKey].enabled = false;
       await persistFilterState();
@@ -3097,7 +3192,7 @@ async function handleTelegramCommand(chatId, text) {
       await sendTelegramReply(chatId, `🔴 Filter <b>${reg.name}</b> wurde <b>DEAKTIVIERT</b> (Gate wird übersprungen).`);
       return;
     }
- 
+
     if (subAction === 'reset') {
       config[cKey] = reg.default;
       filterState[filterKey].enabled = true;
@@ -3106,7 +3201,7 @@ async function handleTelegramCommand(chatId, text) {
       await sendTelegramReply(chatId, `🔄 Filter <b>${reg.name}</b> auf Standard zurückgesetzt (<b>${reg.default}</b>).`);
       return;
     }
- 
+
     if (subAction === 'soft' || subAction === 'hard') {
       if (reg.type === 'boolean') {
         const newVal = subAction === 'soft' ? !reg.default : reg.default;
@@ -3116,31 +3211,31 @@ async function handleTelegramCommand(chatId, text) {
         await sendTelegramReply(chatId, `⚙️ Boolean-Filter <b>${reg.name}</b> geändert: <b>${oldVal}</b> ➔ <b>${newVal}</b>`);
         return;
       }
- 
+
       let delta = reg.step;
       if (subAction === 'soft') {
         delta = reg.direction === 'higher_is_harder' ? -reg.step : reg.step;
       } else {
         delta = reg.direction === 'higher_is_harder' ? reg.step : -reg.step;
       }
- 
+
       let newVal = parseFloat((config[cKey] + delta).toFixed(4));
       if (reg.min !== undefined) newVal = Math.max(reg.min, newVal);
       if (reg.max !== undefined) newVal = Math.min(reg.max, newVal);
- 
+
       config[cKey] = newVal;
       await persistFilterState();
       await logFilterChange(filterKey, subAction.toUpperCase(), oldVal, newVal);
- 
+
       const actionText = subAction === 'soft' ? '🟢 Weicher gestellt' : '🔴 Härter gestellt';
       await sendTelegramReply(chatId, `${actionText}: <b>${reg.name}</b>\n• Alter Wert: ${oldVal}\n• Neuer Wert: <b>${newVal}</b> (Limit: ${reg.min} - ${reg.max})`);
       return;
     }
- 
+
     await sendTelegramReply(chatId, `⚠️ Unbekannte Filter-Aktion: <b>${escapeHtml(subAction)}</b>. Nutze /help.`);
     return;
   }
- 
+
   if (command === '/db') {
     if (!isDbConnected) {
       await sendTelegramReply(chatId, `🔴 <b>MONGODB STATUS:</b> Getrennt / Keine Verbindung!`);
@@ -3162,7 +3257,7 @@ async function handleTelegramCommand(chatId, text) {
     }
     return;
   }
- 
+
   if (command === '/close') {
     const symbolArg = args[0] ? args[0].toUpperCase() : null;
     if (!symbolArg) {
@@ -3179,7 +3274,7 @@ async function handleTelegramCommand(chatId, text) {
     const exitPrice = applySlippage(currentPrice, trade.direction, 'exit');
     const pnlPerUnit = trade.direction === 'LONG' ? exitPrice - trade.entry : trade.entry - exitPrice;
     const pnlUSD = pnlPerUnit * trade.positionSizeUnits - applyFees(trade.notionalUSD) - (trade.fundingCostUSD || 0);
- 
+
     await recordTradePnL(pnlUSD);
     await removeTrade(fullSymbol, {
       symbol: fullSymbol,
@@ -3192,7 +3287,7 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, `🛑 Trade für <b>${escapeHtml(fullSymbol)}</b> manuell geschlossen. PnL: $${pnlUSD.toFixed(2)}`);
     return;
   }
- 
+
   if (command === '/closeall') {
     if (activeTrades.size === 0) {
       await sendTelegramReply(chatId, 'ℹ️ Keine aktiven Trades zum Schließen vorhanden.');
@@ -3217,7 +3312,7 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, `🚨 Alle <b>${count}</b> aktiven Trades wurden manuell geschlossen!`);
     return;
   }
- 
+
   if (command === '/setsl') {
     const symbolArg = args[0] ? args[0].toUpperCase() : null;
     const newSl = parseFloat(args[1]);
@@ -3236,7 +3331,7 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, `✅ Stop-Loss für <b>${escapeHtml(fullSymbol)}</b> auf <b>$${newSl}</b> angepasst.`);
     return;
   }
- 
+
   if (command === '/settp') {
     const symbolArg = args[0] ? args[0].toUpperCase() : null;
     const target = args[1] ? args[1].toLowerCase() : null;
@@ -3256,7 +3351,7 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, `✅ <b>${target.toUpperCase()}</b> für <b>${escapeHtml(fullSymbol)}</b> auf <b>$${newTp}</b> angepasst.`);
     return;
   }
- 
+
   if (command === '/setrisk') {
     const newRisk = parseFloat(args[0]);
     if (isNaN(newRisk) || newRisk <= 0 || newRisk > 10) {
@@ -3270,7 +3365,7 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, `⚙️ Risiko pro Trade angepasst auf: <b>${newRisk}%</b>`);
     return;
   }
- 
+
   if (command === '/setprofile') {
     const profileArg = args[0] ? args[0].toLowerCase() : null;
     if (!profileArg || !STRATEGY_PROFILES[profileArg]) {
@@ -3288,11 +3383,11 @@ async function handleTelegramCommand(chatId, text) {
     config.RSI_SHORT_MAX = activeProfile.RSI_SHORT_MAX;
     config.MIN_RELATIVE_VOLUME = activeProfile.MIN_RELATIVE_VOLUME;
     config.BOS_LOOKBACK = activeProfile.BOS_LOOKBACK;
- 
+
     await sendTelegramReply(chatId, `🔄 Strategie-Profil gewechselt auf: <b>${profileArg.toUpperCase()}</b>`);
     return;
   }
- 
+
   if (command === '/blacklist') {
     const symbolArg = args[0] ? args[0].toUpperCase() : null;
     if (!symbolArg) {
@@ -3307,7 +3402,7 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, `🚫 <b>${escapeHtml(fullSymbol)}</b> wurde zur manuellen Blacklist hinzugefügt.`);
     return;
   }
- 
+
   if (command === '/unblacklist') {
     const symbolArg = args[0] ? args[0].toUpperCase() : null;
     if (!symbolArg) {
@@ -3322,7 +3417,7 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, `✅ <b>${escapeHtml(fullSymbol)}</b> wurde von der Blacklist entfernt.`);
     return;
   }
- 
+
   if (command === '/showblacklist') {
     const list = [...manualBlacklist];
     let msg = `📜 <b>MANUELLE BLACKLIST (${list.length}):</b>\n`;
@@ -3331,7 +3426,7 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, msg);
     return;
   }
- 
+
   if (command === '/retrain') {
     await sendTelegramReply(chatId, '🧠 <i>Starte manuelles KI-Training (TensorFlow.js & DQN Agent)...</i>');
     const res = await trainSignalMLModel(true);
@@ -3343,7 +3438,7 @@ async function handleTelegramCommand(chatId, text) {
     }
     return;
   }
- 
+
   if (command === '/logs') {
     const logsToShow = recentLogs.slice(-15);
     if (logsToShow.length === 0) {
@@ -3354,7 +3449,7 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, `📋 <b>LETZTE LOGS (15):</b>\n<pre>${logText}</pre>`);
     return;
   }
- 
+
   if (command === '/setcapital') {
     if (!args[0]) {
       await sendTelegramReply(chatId, `⚠️ Bitte gib einen Betrag an.\nBeispiel: <code>/setcapital 15000</code>`);
@@ -3365,7 +3460,7 @@ async function handleTelegramCommand(chatId, text) {
       await sendTelegramReply(chatId, `❌ Ungültiger Kapital-Betrag: <b>${args[0]}</b>`);
       return;
     }
- 
+
     config.CAPITAL_USD = newCapital;
     peakCapital = Math.max(peakCapital, newCapital);
     await persistPeakCapital();
@@ -3373,7 +3468,7 @@ async function handleTelegramCommand(chatId, text) {
     if (botStateCollection && isDbConnected) {
       await botStateCollection.updateOne({ _id: 'runtimeConfig' }, { $set: { CAPITAL_USD: newCapital } }, { upsert: true });
     }
- 
+
     await sendTelegramReply(chatId, 
       `✅ <b>Kapital erfolgreich angepasst!</b>\n` +
       `• Neues Startkapital: <b>$${newCapital.toFixed(2)}</b>\n` +
@@ -3381,7 +3476,7 @@ async function handleTelegramCommand(chatId, text) {
     );
     return;
   }
- 
+
   if (command === '/setpeak' || command === '/setpeakcapital') {
     if (!args[0]) {
       await sendTelegramReply(chatId, `⚠️ Bitte gib einen Betrag an.\nBeispiel: <code>/setpeak 12000</code>`);
@@ -3392,17 +3487,17 @@ async function handleTelegramCommand(chatId, text) {
       await sendTelegramReply(chatId, `❌ Ungültiger Betrag: <b>${args[0]}</b>`);
       return;
     }
- 
+
     peakCapital = newPeak;
     await persistPeakCapital();
- 
+
     await sendTelegramReply(chatId, 
       `✅ <b>Peak Capital erfolgreich angepasst!</b>\n` +
       `• Neues Peak Capital: <b>$${peakCapital.toFixed(2)}</b>`
     );
     return;
   }
- 
+
   if (command === '/setleverage') {
     if (!args[0]) {
       await sendTelegramReply(chatId, `⚠️ Bitte gib den Hebel an (1 - 100).\nBeispiel: <code>/setleverage 5</code>`);
@@ -3413,20 +3508,20 @@ async function handleTelegramCommand(chatId, text) {
       await sendTelegramReply(chatId, `❌ Ungültiger Hebel. Wähle eine Zahl zwischen 1 und 100.`);
       return;
     }
- 
+
     config.LEVERAGE = newLeverage;
     
     if (botStateCollection && isDbConnected) {
       await botStateCollection.updateOne({ _id: 'runtimeConfig' }, { $set: { LEVERAGE: newLeverage } }, { upsert: true });
     }
- 
+
     await sendTelegramReply(chatId, 
       `⚡ <b>Hebel erfolgreich angepasst!</b>\n` +
       `• Neuer Hebel für Signale: <b>${newLeverage}x</b> (${config.MARGIN_MODE})`
     );
     return;
   }
- 
+
   if (command === '/status') {
     const lines = [];
     lines.push(`🤖 <b>BOT STATUS v21.7 ULTIMATE DQN</b>`);
@@ -3451,7 +3546,7 @@ async function handleTelegramCommand(chatId, text) {
     const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : 0;
     lines.push(`Drawdown: ${drawdownPercent}%`);
     lines.push(`KuCoin Fehler: ${kucoinErrorCount} | Circuit Breaker: ${Date.now() < kucoinCircuitOpenUntil ? '🚨 AKTIV' : '✅ Inaktiv'}`);
- 
+
     if (activeTrades.size > 0) {
       lines.push('');
       lines.push('<b>Offene Trades:</b>');
@@ -3466,7 +3561,7 @@ async function handleTelegramCommand(chatId, text) {
     await sendTelegramReply(chatId, lines.join('\n'));
     return;
   }
- 
+
   if (command === '/scan') {
     if (isPaused) {
       await sendTelegramReply(chatId, '⚠️ Der Bot ist aktuell pausiert. Nutze erst /resume, um den Scan zu starten.');
@@ -3503,7 +3598,7 @@ async function handleTelegramCommand(chatId, text) {
     }
     return;
   }
- 
+
   if (command === '/week') {
     await sendTelegramReply(chatId, '📊 <i>Berechne Wochen-Performance...</i>');
     const stats = await getPeriodPerformanceStats(7);
@@ -3511,7 +3606,7 @@ async function handleTelegramCommand(chatId, text) {
     else await sendTelegramReply(chatId, '❌ Fehler beim Abrufen der Wochen-Performance.');
     return;
   }
- 
+
   if (command === '/month') {
     await sendTelegramReply(chatId, '📊 <i>Berechne Monats-Performance...</i>');
     const stats = await getPeriodPerformanceStats(30);
@@ -3519,150 +3614,83 @@ async function handleTelegramCommand(chatId, text) {
     else await sendTelegramReply(chatId, '❌ Fehler beim Abrufen der Monats-Performance.');
     return;
   }
- 
+
   if (command === '/scanstats') {
     if (lastScanStats) await sendTelegramReply(chatId, formatScanStatsReport(lastScanStats));
     else await sendTelegramReply(chatId, 'Noch keine Scan-Statistik verfügbar.');
     return;
   }
- 
+
   if (command === '/pause') {
     isPaused = true;
     await persistPauseState();
     await sendTelegramReply(chatId, '⏸️ Bot pausiert.');
     return;
   }
- 
+
   if (command === '/resume') {
     isPaused = false;
     await persistPauseState();
     await sendTelegramReply(chatId, '▶️ Bot wieder aktiv.');
     return;
   }
- 
+
   await sendTelegramReply(chatId, `❓ Unbekannter Befehl: "${escapeHtml(command)}"\n/help für Hilfe.`);
 }
- 
+
 let telegramOffset = 0;
- 
+
 async function pollTelegramUpdates() {
-  const token = configTelegram.botToken || config.TELEGRAM_BOT_TOKEN;
-  if (!token) return;
- 
-  // Prevent accidental double invocation inside the same process.
-  if (telegramPollingActive) {
-    logger.warn('⚠️ Telegram Polling läuft bereits – zweiter Poller wird nicht gestartet.');
-    return;
-  }
-  telegramPollingActive = true;
- 
-  const heartbeat = setInterval(() => {
+  setInterval(() => {
     if (!isShuttingDown) logger.info('💓 Telegram polling alive');
   }, 1800000);
- 
-  try {
-    while (!isShuttingDown) {
-      try {
-        const res = await axios.get(`https://api.telegram.org/bot${token}/getUpdates`, {
-          params: { offset: telegramOffset, timeout: 25 },
-          timeout: 30000
-        });
- 
-        telegramConflictCount = 0;
-        const updates = res.data?.result || [];
- 
-        for (const update of updates) {
-          telegramOffset = update.update_id + 1;
-          const msg = update.message;
-          if (!msg || !msg.text) continue;
-          if (!isAuthorizedChat(msg.chat.id)) continue;
-          await handleTelegramCommand(msg.chat.id, msg.text);
-        }
-      } catch (e) {
-        if (e.response?.status === 409) {
-          telegramConflictCount++;
-          const backoff = Math.min(60000, 10000 * telegramConflictCount);
- 
-          logger.error(
-            `Telegram poll error: HTTP 409 – ein anderer Telegram-Poller verwendet diesen Bot-Token. ` +
-            `Backoff ${backoff / 1000}s (Konflikt #${telegramConflictCount}).`
-          );
- 
-          // Do NOT call deleteWebhook here. A webhook and a competing
-          // getUpdates consumer are different problems; deleting the webhook
-          // does not stop another process polling the same token.
-          await sleep(backoff);
-          continue;
-        }
- 
-        logger.error(`Telegram poll error: ${e.message}`);
-        await sleep(5000);
+  
+  const token = configTelegram.botToken || config.TELEGRAM_BOT_TOKEN;
+  if (!token) return;
+
+  while (!isShuttingDown) {
+    try {
+      const res = await axios.get(`https://api.telegram.org/bot${token}/getUpdates`, {
+        params: { offset: telegramOffset, timeout: 25 },
+        timeout: 30000
+      });
+      const updates = res.data?.result || [];
+      for (const update of updates) {
+        telegramOffset = update.update_id + 1;
+        const msg = update.message;
+        if (!msg || !msg.text) continue;
+        if (!isAuthorizedChat(msg.chat.id)) continue;
+        await handleTelegramCommand(msg.chat.id, msg.text);
       }
+    } catch (e) {
+      if (e.response?.status === 409) {
+        try { await axios.get(`https://api.telegram.org/bot${token}/deleteWebhook`); } catch (e2) {}
+      }
+      logger.error(`Telegram poll error: ${e.message}`);
+      await sleep(5000);
     }
-  } finally {
-    clearInterval(heartbeat);
-    telegramPollingActive = false;
   }
 }
+
 // ==========================================
 // 18. EXPRESS ENDPOINTS & WEB-BACKTEST
 // ==========================================
 const app = express();
 app.use(express.json());
- 
-// IMPROVED: explicit API-key protection for the externally bound Express server.
-const EXPRESS_API_KEY = process.env.API_KEY || '';
-if (!EXPRESS_API_KEY) logger.warn('⚠️ API_KEY fehlt: Express-Endpunkte werden nicht öffentlich geschützt.');
-// FIX (2026-08-20): '/' und '/health' sind reine Status-Endpunkte ohne sensible
-// Daten und müssen für externe Uptime-Monitore (z.B. UptimeRobot) ungeschützt
-// erreichbar sein, sonst meldet der Monitor dauerhaft 401/503 obwohl der Bot läuft.
-const PUBLIC_PATHS = new Set(['/', '/health']);
-app.use((req, res, next) => {
-  if (PUBLIC_PATHS.has(req.path)) return next();
-  if (!EXPRESS_API_KEY) return res.status(503).json({ error: 'API key not configured' });
-  if (req.get('X-API-Key') !== EXPRESS_API_KEY) return res.status(401).json({ error: 'unauthorized' });
-  next();
-});
- 
+
 app.get('/', (req, res) => {
   res.send(`🤖 Trading Bot v21.7 ULTIMATE DQN | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
- 
-let lastHealthAlarm = new Map();
-async function checkDependencyHealth() {
-  const result = {
-    mongodb: { ok: !!isDbConnected },
-    kucoin: { ok: false },
-    mlModel: { ok: !!(isModelTrained && mlModel?.getStats?.()?.trained) },
-    telegram: { ok: !!configTelegram.botToken && !!configTelegram.chatId }
-  };
-  try {
-    const r = await axios.get('https://api-futures.kucoin.com/api/v1/ticker?symbol=XBTUSDTM', { timeout: 5000 });
-    result.kucoin.ok = r.data?.code === '200000';
-  } catch (e) { result.kucoin.reason = e.message; }
-  const failed = Object.entries(result).filter(([,v]) => !v.ok).map(([k]) => k);
-  if (failed.length) {
-    const key = failed.join(',');
-    const last = lastHealthAlarm.get(key) || 0;
-    if (Date.now() - last > 30 * 60 * 1000) {
-      lastHealthAlarm.set(key, Date.now());
-      await sendTelegramAlert(`🚨 <b>Health-Alarm</b>
-Fehlerhafte Abhängigkeiten: ${escapeHtml(failed.join(', '))}`);
-    }
-  }
-  return result;
-}
-app.get('/health', async (req, res) => {
+
+app.get('/health', (req, res) => {
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
   const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : '0';
-  const dependencies = await checkDependencyHealth();
-  const ok = Object.values(dependencies).every(x => x.ok);
-  res.status(ok ? 200 : 503).json({
-    status: ok ? 'ok' : 'degraded', version: '21.7', dependencies,
+  res.status(isDbConnected ? 200 : 503).json({
+    status: isDbConnected ? 'ok' : 'degraded', version: '21.7', dbConnected: isDbConnected,
     isPaused, activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, currentEquity, peakCapital, drawdownPercent
   });
 });
- 
+
 app.get('/metrics', (req, res) => {
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
   const metrics = [
@@ -3682,14 +3710,14 @@ app.get('/metrics', (req, res) => {
   res.setHeader('Content-Type', 'text/plain');
   res.send(metrics);
 });
- 
+
 app.get('/backtest', async (req, res) => {
   try {
     const symbol = req.query.symbol || 'BTC-USDT';
     const days = Number(req.query.days || 30);
     const cfg = buildBacktestConfig(process.env);
     const useML = req.query.noml !== 'true';
- 
+
     logger.info(`🚀 Starte Web-Backtest für ${symbol} (${days} Tage)...`);
     const result = await runBacktest({ symbol, days, cfg, useML, walkForward: true });
     res.json(result);
@@ -3698,7 +3726,7 @@ app.get('/backtest', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 app.get('/trades', (req, res) => {
   const trades = [...activeTrades.entries()].map(([symbol, trade]) => ({
     symbol, direction: trade.direction, entry: trade.entry, stopLoss: trade.stopLoss, tp1: trade.tp1, tp2: trade.tp2,
@@ -3706,27 +3734,27 @@ app.get('/trades', (req, res) => {
   }));
   res.json(trades);
 });
- 
+
 app.get('/api/performance/week', async (req, res) => {
   const stats = await getPeriodPerformanceStats(7);
   res.json(stats || { error: 'No DB' });
 });
- 
+
 app.get('/api/performance/month', async (req, res) => {
   const stats = await getPeriodPerformanceStats(30);
   res.json(stats || { error: 'No DB' });
 });
- 
+
 app.get('/api/performance/today', async (req, res) => {
   const stats = await getDailyPerformanceStats();
   res.json(stats || { dailyPnL: dailyNetPnL });
 });
- 
+
 app.get('/api/analysis', async (req, res) => {
   const analysis = await getTimeBasedAnalysis();
   res.json(analysis || { error: 'No DB' });
 });
- 
+
 app.get('/api/ml/status', (req, res) => {
   res.json({
     enabled: config.ML_ENABLED,
@@ -3735,32 +3763,27 @@ app.get('/api/ml/status', (req, res) => {
     dqn: dqnAgent.getStats()
   });
 });
- 
-const API_BIND_HOST = process.env.API_BIND_HOST || (EXPRESS_API_KEY ? '0.0.0.0' : '127.0.0.1');
-const server = app.listen(config.PORT, API_BIND_HOST, () => { 
+
+const server = app.listen(config.PORT, '0.0.0.0', () => { 
   logger.info(`🌐 Webserver bindet sich an Port ${config.PORT} für Render...`); 
 });
- 
+
 // ==========================================
 // 19. TIMERS & SHUTDOWN
 // ==========================================
 const cronJobs = [];
 const intervalTimers = [];
- 
+
 intervalTimers.push(setInterval(async () => {
   try { await checkActiveTrades(); }
   catch (e) { logger.error(`[TRACKER INTERVAL ERROR] ${e.message}\n${e.stack}`); }
 }, config.FAST_TRACK_INTERVAL_SECONDS * 1000));
- 
+
 intervalTimers.push(setInterval(() => {
   try { klinesCache.cleanup(config.CACHE_CLEANUP_MINUTES * 60 * 1000); }
   catch (e) { logger.error(`[CACHE CLEANUP ERROR] ${e.message}`); }
 }, config.CACHE_CLEANUP_MINUTES * 60 * 1000));
- 
-intervalTimers.push(setInterval(() => {
-  refreshMacroCalendar().catch(e => logger.warn(`[Macro] Refresh-Fehler: ${e.message}`));
-}, (parseInt(process.env.FRED_REFRESH_HOURS, 10) || 6) * 60 * 60 * 1000));
- 
+
 cronJobs.push(cron.schedule('59 23 * * *', async () => {
   try {
     dailyNetPnL = 0;
@@ -3770,7 +3793,7 @@ cronJobs.push(cron.schedule('59 23 * * *', async () => {
     logger.error(`[DAILY RESET CRON ERROR] ${e.message}\n${e.stack}`);
   }
 }, { timezone: 'UTC' }));
- 
+
 cronJobs.push(cron.schedule('0 */6 * * *', async () => {
   try {
     await loadFuturesContractSpecs();
@@ -3779,7 +3802,7 @@ cronJobs.push(cron.schedule('0 */6 * * *', async () => {
     logger.error(`[6H CRON ERROR] ${e.message}\n${e.stack}`);
   }
 }, { timezone: 'UTC' }));
- 
+
 async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
@@ -3794,7 +3817,7 @@ async function gracefulShutdown(signal) {
   try { await client.close(); } catch (e) {}
   process.exit(0);
 }
- 
+
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('uncaughtException', async (err) => {
@@ -3805,20 +3828,19 @@ process.on('unhandledRejection', async (reason) => {
   logger.error(`💥 Unhandled Rejection: ${reason}`);
   await gracefulShutdown('unhandledRejection');
 });
- 
+
 // ==========================================
 // 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
   logger.info('🚀 Starte Trading Bot v21.7 ULTIMATE DQN (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
-  logger.info(`🧩 Runtime: ${process.env.RENDER === 'true' ? 'Render' : 'local'} | Instance: ${process.env.RENDER_INSTANCE_ID || process.env.INSTANCE_ID || `pid-${process.pid}`}`);
   
   await initDatabase();
   await loadFuturesContractSpecs();
   await loadSignalMLModel();
   if (!isModelTrained) await trainSignalMLModel(true);
   pollTelegramUpdates();
- 
+
   const runScanCycle = async () => {
     try {
       if (isDbConnected) {
@@ -3830,12 +3852,11 @@ process.on('unhandledRejection', async (reason) => {
       logger.error(`Fehler im Scan-Zyklus: ${error.message}`);
     }
   };
- 
+
   await runScanCycle();
- 
+
   const SCAN_INTERVAL_MS = 5 * 60 * 1000; 
   setInterval(runScanCycle, SCAN_INTERVAL_MS);
   
   logger.info(`🔄 Bot-Dauerschleife aktiv. Nächster Scan in ${SCAN_INTERVAL_MS / 60000} Minuten.`);
 })();
- 
