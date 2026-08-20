@@ -1,0 +1,27 @@
+{
+  "name": "crypto-trading-bot-paper-dqn",
+  "version": "22.2.1",
+  "private": true,
+  "description": "Crypto Trading Bot v22.2.1 PRO - hardened paper-trading signal system with advanced features and fail-closed execution",
+  "main": "trading-bot-v22.2.1.js",
+  "engines": {
+    "node": ">=20 <23"
+  },
+  "scripts": {
+    "start": "node trading-bot-v22.2.1.js",
+    "check": "node --check trading-bot-v22.2.1.js && node --check ml-engine.js && node --check backtest-engine.js && node --check rl-engine.js && node --check risk-engine.js && node --check data-validator.js && node --check audit-log.js && node --check orderFlowAnalyzer.js && node --check volatilityRegimeManager.js && node --check feature-engine.js && node --check orderflow-stream.js && node --check execution-interface.js && node --check risk-controls.js && node --check attribution.js && node --check ml-ensemble.js && node --check explainability.js && node --check prioritized-replay.js && node --check drift-monitor.js && node --check execution-algos.js && node --check report-engine.js",
+    "test": "node tests/hardening.test.js && node tests/pro_features.test.js",
+    "backtest": "node backtest.js",
+    "backtest:no-ml": "node backtest.js --noMl"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs-node": "4.22.0",
+    "axios": "1.7.9",
+    "dotenv": "16.4.7",
+    "express": "4.21.2",
+    "mongodb": "6.12.0",
+    "node-cron": "3.0.3",
+    "winston": "3.17.0",
+    "@google/genai": "2.16.0"
+  }
+}

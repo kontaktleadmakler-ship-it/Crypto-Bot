@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: crypto-bot-v22-2-1
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node trading-bot-v22.2.1.js
+    healthCheckPath: /
+    autoDeploy: true
