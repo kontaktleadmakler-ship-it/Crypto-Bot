@@ -43,6 +43,22 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+function probabilityMetrics(probabilities, labels, bins = 10) {
+  if (!probabilities.length || probabilities.length !== labels.length) return { brierScore: 0, logLoss: 0, calibrationError: 0 };
+  let brier = 0, logLoss = 0;
+  const bucket = Array.from({ length: bins }, () => ({ n: 0, sumP: 0, sumY: 0 }));
+  for (let i=0;i<probabilities.length;i++) {
+    const p = clamp(Number(probabilities[i]), 1e-7, 1 - 1e-7);
+    const y = Number(labels[i]) ? 1 : 0;
+    brier += Math.pow(p-y, 2);
+    logLoss += -(y*Math.log(p) + (1-y)*Math.log(1-p));
+    const b = Math.min(bins-1, Math.floor(p*bins)); bucket[b].n++; bucket[b].sumP+=p; bucket[b].sumY+=y;
+  }
+  let ece = 0;
+  for (const b of bucket) if (b.n) ece += (b.n/probabilities.length) * Math.abs(b.sumP/b.n - b.sumY/b.n);
+  return { brierScore: brier/probabilities.length, logLoss: logLoss/probabilities.length, calibrationError: ece };
+}
+
 function trendValue(value) {
   if (value === 'BULLISH') return 1;
   if (value === 'BEARISH') return -1;
@@ -55,36 +71,6 @@ function marketPhaseValue(value) {
   return 0;
 }
 
-
-function fitIsotonic(probabilities, labels) {
-  const pairs = probabilities.map((p, i) => ({ p: clamp(Number(p), 0, 1), y: Number(labels[i]) ? 1 : 0 })).sort((a,b) => a.p - b.p);
-  const blocks = [];
-  for (const item of pairs) {
-    blocks.push({ sum: item.y, n: 1, minP: item.p, maxP: item.p });
-    while (blocks.length >= 2) {
-      const a = blocks[blocks.length - 2], b = blocks[blocks.length - 1];
-      if (a.sum / a.n <= b.sum / b.n) break;
-      const merged = { sum: a.sum + b.sum, n: a.n + b.n, minP: a.minP, maxP: b.maxP };
-      blocks.splice(blocks.length - 2, 2, merged);
-    }
-  }
-  return blocks.map(b => ({ minP: b.minP, maxP: b.maxP, value: b.sum / b.n }));
-}
-function applyIsotonic(probability, calibration) {
-  if (!Array.isArray(calibration) || !calibration.length) return probability;
-  let best = calibration[0];
-  for (const b of calibration) { if (probability >= b.minP) best = b; else break; }
-  return clamp(best.value, 0, 1);
-}
-function brierScore(probs, labels) { return probs.length ? probs.reduce((s,p,i) => s + Math.pow(p - labels[i], 2), 0) / probs.length : 0; }
-function logLoss(probs, labels) { const eps = 1e-7; return probs.length ? -probs.reduce((s,p,i) => s + labels[i]*Math.log(clamp(p,eps,1-eps)) + (1-labels[i])*Math.log(clamp(1-p,eps,1-eps)), 0) / probs.length : 0; }
-
-function disposeModelSafely(model) {
-  if (!model) return;
-  try { model.optimizer?.dispose?.(); } catch (_) {}
-  try { model.dispose(); } catch (_) {}
-}
-
 class TensorFlowSignalModel {
   constructor(options = {}) {
     this.modelDir = path.resolve(options.modelDir || './models/signal-model');
@@ -95,17 +81,12 @@ class TensorFlowSignalModel {
     this.epochs = Number(options.epochs || 80);
     this.batchSize = Number(options.batchSize || 32);
     this.logger = options.logger || console;
-    this.calibration = null;
 
     this.model = null;
     this.scaler = null;
     this.trained = false;
     this.training = false;
-// IMPROVED: tune only once per day or every Nth retrain instead of every retrain.
-this.retrainCount = 0;
-this.hyperparameterSearchEvery = Number(options.hyperparameterSearchEvery || process.env.ML_HYPERPARAM_SEARCH_EVERY || 5);
-this.lastHyperparameterSearchAt = null;
-this.stats = {
+    this.stats = {
       trained: false,
       samples: 0,
       trainingSamples: 0,
@@ -118,12 +99,7 @@ this.stats = {
       modelVersion: null,
       featureCount: FEATURE_NAMES.length,
       featureNames: FEATURE_NAMES,
-      bestHyperparameters: null,
-      validationBrier: 0,
-      validationLogLoss: 0,
-      calibrationMethod: 'isotonic',
-      hyperparameterSearchAt: null,
-      retrainCount: 0
+      bestHyperparameters: null
     };
   }
 
@@ -171,9 +147,10 @@ this.stats = {
     // werden, sonst lernt das Modell auf leicht verschobenen, zum
     // Entscheidungszeitpunkt nicht verfügbaren Werten. Fällt auf trade.entry
     // zurück, falls ältere Trade-Datensätze das Feld noch nicht besitzen.
-    const currentPrice = trade.signalPriceAtEntry != null
-      ? finite(trade.signalPriceAtEntry, 0)
-      : finite(trade.entry, 0);
+    if (!Number.isFinite(Number(trade.signalPriceAtEntry)) || Number(trade.signalPriceAtEntry) <= 0) {
+      return null;
+    }
+    const currentPrice = Number(trade.signalPriceAtEntry);
     const atrPct = trade.atrPctAtEntry != null
       ? finite(trade.atrPctAtEntry, 0)
       : (currentPrice > 0 && trade.atrAtEntry ? (finite(trade.atrAtEntry) / currentPrice) * 100 : 0);
@@ -242,10 +219,7 @@ this.stats = {
     this.training = true;
     try {
       const force = !!options.force;
-      const cutoffTime = options.cutoffTime != null ? Number(options.cutoffTime) : null;
-      const query = { isPartial: { $ne: true }, pnlUSD: { $exists: true } };
-      if (Number.isFinite(cutoffTime)) query.closeTime = { $lt: cutoffTime };
-      const trades = await collection.find(query)
+      const trades = await collection.find({ isPartial: { $ne: true }, pnlUSD: { $exists: true } })
         .sort({ closeTime: 1 })
         .limit(this.maxSamples)
         .toArray();
@@ -261,7 +235,7 @@ this.stats = {
           features: this.featuresFromTrade(trade),
           label: finite(trade.pnlUSD, 0) > 0 ? 1 : 0
         }))
-        .filter(item => item.features.every(Number.isFinite));
+        .filter(item => Array.isArray(item.features) && item.features.length === FEATURE_NAMES.length && item.features.every(Number.isFinite));
 
       if (dataset.length < this.minSamples) {
         return { trained: false, reason: 'not-enough-valid-data', samples: dataset.length };
@@ -284,20 +258,12 @@ this.stats = {
       const xVal = this.scaleMatrix(validationSet.map(x => x.features), scaler);
       const yVal = validationSet.map(x => x.label);
 
-      // IMPROVED: hyperparameter search is throttled to once daily or every Nth retrain.
-      this.retrainCount += 1;
-      const nowDay = new Date().toISOString().slice(0, 10);
-      const lastSearchDay = this.lastHyperparameterSearchAt ? String(this.lastHyperparameterSearchAt).slice(0, 10) : null;
-      const shouldTune = !!force || !this.stats.bestHyperparameters ||
-        this.retrainCount % this.hyperparameterSearchEvery === 0 || nowDay !== lastSearchDay;
-
-      const hyperparameterGrid = shouldTune
-        ? [
-            { learningRate: 0.001, dropoutRate: 0.15, batchSize: 32, units: 32 },
-            { learningRate: 0.0005, dropoutRate: 0.2, batchSize: 16, units: 64 },
-            { learningRate: 0.003, dropoutRate: 0.1, batchSize: 32, units: 32 }
-          ]
-        : [this.stats.bestHyperparameters];
+      // --- HYPERPARAMETER TUNING SCHLEIFE ---
+      const hyperparameterGrid = [
+        { learningRate: 0.001, dropoutRate: 0.15, batchSize: 32, units: 32 },
+        { learningRate: 0.0005, dropoutRate: 0.2, batchSize: 16, units: 64 },
+        { learningRate: 0.003, dropoutRate: 0.1, batchSize: 32, units: 32 }
+      ];
 
       let bestCandidate = null;
       let bestValAccuracy = -1;
@@ -305,12 +271,8 @@ this.stats = {
       let bestHistory = null;
       let bestBestConfig = null;
 
-      if (shouldTune) {
-        this.logger.star?.(`🧠 [TensorFlow.js] Starte Hyperparameter-Tuning (${hyperparameterGrid.length} Kombinationen)...`) ||
-        this.logger.info(`🧠 [TensorFlow.js] Starte Hyperparameter-Tuning (${hyperparameterGrid.length} Kombinationen)...`);
-      } else {
-        this.logger.info('🧠 [TensorFlow.js] Verwende gespeicherte Hyperparameter; Suche wird übersprungen.');
-      }
+      this.logger.star?.(`🧠 [TensorFlow.js] Starte automatisches Hyperparameter-Tuning (${hyperparameterGrid.length} Kombinationen)...`) || 
+      this.logger.info(`🧠 [TensorFlow.js] Starte automatisches Hyperparameter-Tuning (${hyperparameterGrid.length} Kombinationen)...`);
 
       const xs = tf.tensor2d(xTrain, [xTrain.length, FEATURE_NAMES.length]);
       const ys = tf.tensor2d(yTrain, [yTrain.length, 1]);
@@ -342,7 +304,7 @@ this.stats = {
               callbacks: tf.callbacks.earlyStopping({ monitor: 'val_loss', patience: 6, restoreBestWeight: true })
             });
           } catch (fitErr) {
-            disposeModelSafely(candidateModel);
+            candidateModel.dispose();
             continue;
           }
 
@@ -359,12 +321,12 @@ this.stats = {
           if (acc > bestValAccuracy || (acc === bestValAccuracy && loss < bestValLoss)) {
             bestValAccuracy = acc;
             bestValLoss = loss;
-            if (bestCandidate) disposeModelSafely(bestCandidate);
+            if (bestCandidate) bestCandidate.dispose();
             bestCandidate = candidateModel;
             bestHistory = history;
             bestBestConfig = config;
           } else {
-            disposeModelSafely(candidateModel);
+            candidateModel.dispose();
           }
         }
       } finally {
@@ -375,22 +337,21 @@ this.stats = {
         return { trained: false, reason: 'tuning-failed' };
       }
 
+      let probabilityStats = { brierScore: 0, logLoss: 0, calibrationError: 0 };
+      try {
+        const probs = tf.tidy(() => Array.from(bestCandidate.predict(tf.tensor2d(xVal, [xVal.length, FEATURE_NAMES.length])).dataSync()));
+        probabilityStats = probabilityMetrics(probs, yVal);
+      } catch (metricErr) {
+        this.logger.warn(`[TensorFlow.js] Probability-Metriken konnten nicht berechnet werden: ${metricErr.message}`);
+      }
+
       const validationAccuracy = bestValAccuracy;
       const validationLoss = bestValLoss;
-      const validationProbabilities = tf.tidy(() => {
-        const t = tf.tensor2d(xVal, [xVal.length, FEATURE_NAMES.length]);
-        const out = bestCandidate.predict(t);
-        return Array.from(out.dataSync());
-      });
-      const calibration = fitIsotonic(validationProbabilities, yVal);
-      const calibratedProbabilities = validationProbabilities.map(p => applyIsotonic(p, calibration));
-      const validationBrier = brierScore(calibratedProbabilities, yVal);
-      const validationLogLoss = logLoss(calibratedProbabilities, yVal);
 
       const oldAccuracy = finite(this.stats.validationAccuracy, 0);
       if (!force && this.trained && validationAccuracy + 0.02 < oldAccuracy) {
         this.logger.warn(`🧠 [TensorFlow.js] Neues getuntes Modell verworfen: Val-Accuracy ${(validationAccuracy * 100).toFixed(1)}% vs. aktuell ${(oldAccuracy * 100).toFixed(1)}%.`);
-        disposeModelSafely(bestCandidate);
+        bestCandidate.dispose();
         return { trained: false, reason: 'candidate-model-worse', validationAccuracy, oldAccuracy };
       }
 
@@ -400,16 +361,12 @@ this.stats = {
       // model is retrained repeatedly over the bot's lifetime, so the leak
       // was cumulative and eventually crashed the Node process.
       if (this.model && this.model !== bestCandidate) {
-        disposeModelSafely(this.model);
+        this.model.dispose();
         this.model = null;
       }
       this.model = bestCandidate;
       this.scaler = scaler;
-      this.calibration = calibration;
       this.trained = true;
-      if (shouldTune) {
-        this.lastHyperparameterSearchAt = new Date().toISOString();
-      }
       this.stats = {
         trained: true,
         samples: dataset.length,
@@ -418,28 +375,25 @@ this.stats = {
         positiveRate: positives / dataset.length,
         validationAccuracy,
         validationLoss,
-        validationBrier,
-        validationLogLoss,
-        calibrationMethod: 'isotonic',
+        brierScore: probabilityStats.brierScore,
+        logLoss: probabilityStats.logLoss,
+        calibrationError: probabilityStats.calibrationError,
         epochs: bestHistory?.epoch?.length || 0,
         trainedAt: new Date().toISOString(),
         modelVersion: `tfjs-${Date.now()}`,
         featureCount: FEATURE_NAMES.length,
         featureNames: [...FEATURE_NAMES],
-        bestHyperparameters: bestBestConfig || this.stats.bestHyperparameters || null,
-        hyperparameterSearchAt: this.lastHyperparameterSearchAt,
-        retrainCount: this.retrainCount
+        bestHyperparameters: bestBestConfig || null
       };
 
       await this.save();
-      this.logger.info(`🧠 [TensorFlow.js] Getuntes Modell erfolgreich trainiert: ${dataset.length} Trades | Val-Accuracy ${(validationAccuracy * 100).toFixed(1)}% | Val-Loss ${validationLoss.toFixed(4)}`);
+      this.logger.info(`🧠 [TensorFlow.js] Getuntes Modell erfolgreich trainiert: ${dataset.length} Trades | Val-Accuracy ${(validationAccuracy * 100).toFixed(1)}% | Val-Loss ${validationLoss.toFixed(4)} | Brier ${probabilityStats.brierScore.toFixed(4)} | ECE ${probabilityStats.calibrationError.toFixed(4)}`);
       return { trained: true, ...this.getStats() };
     } catch (e) {
       this.logger.error(`🧠 [TensorFlow.js] Training fehlgeschlagen: ${e.stack || e.message}`);
       return { trained: false, reason: e.message };
     } finally {
       this.training = false;
-      try { await tf.nextFrame(); } catch (_) {}
     }
   }
 
@@ -450,7 +404,6 @@ this.stats = {
     fs.writeFileSync(path.join(this.modelDir, 'metadata.json'), JSON.stringify({
       scaler: this.scaler,
       stats: this.stats,
-      calibration: this.calibration,
       thresholds: {
         minPredictionProbability: this.minPredictionProbability,
         strongSignalProbability: this.strongSignalProbability
@@ -474,9 +427,6 @@ this.stats = {
     this.model = await tf.loadLayersModel(`file://${modelPath}`);
     this.scaler = metadata.scaler;
     this.stats = metadata.stats;
-    this.retrainCount = Number(this.stats.retrainCount || 0);
-    this.lastHyperparameterSearchAt = this.stats.hyperparameterSearchAt || null;
-    this.calibration = metadata.calibration || null;
     this.trained = true;
     return true;
   }
@@ -503,8 +453,7 @@ this.stats = {
       const output = this.model.predict(input);
       return output.dataSync()[0];
     });
-    const raw = clamp(rawProbability, 0, 1);
-    const probability = applyIsotonic(raw, this.calibration);
+    const probability = clamp(rawProbability, 0, 1);
 
     const confidence = Math.abs(probability - 0.5) * 2;
     const className = probability >= this.strongSignalProbability
