@@ -346,6 +346,82 @@ function updateTelegramConfig(token, chatId) {
   configTelegram.chatId = chatId;
 }
 
+// Register the full v24.6 command menu in Telegram. The command handlers above
+// are available regardless of whether Telegram shows them in the UI; calling
+// setMyCommands makes the commands appear in Telegram's slash-command menu.
+const TELEGRAM_COMMANDS_V24_6 = [
+  { command: 'start', description: 'Bot-Hilfe und Status' },
+  { command: 'help', description: 'Vollständige Hilfe' },
+  { command: 'commands', description: 'AI-Agent Command Center' },
+  { command: 'aicommands', description: 'AI-Agent Commands' },
+  { command: 'agents', description: 'AI-Agent Status' },
+  { command: 'agents_status', description: 'AI-Agent Status' },
+  { command: 'agent', description: 'Agent-Details anzeigen' },
+  { command: 'agent_on', description: 'Agent aktivieren' },
+  { command: 'agent_off', description: 'Agent deaktivieren' },
+  { command: 'agents_on', description: 'Alle Agents aktivieren' },
+  { command: 'agents_off', description: 'Alle Agents deaktivieren' },
+  { command: 'agent_weights', description: 'Agent-Gewichtungen anzeigen' },
+  { command: 'llm', description: 'LLM Status' },
+  { command: 'llm_status', description: 'LLM Status anzeigen' },
+  { command: 'llm_on', description: 'LLM Reviewer aktivieren' },
+  { command: 'llm_off', description: 'LLM Reviewer deaktivieren' },
+  { command: 'llm_test', description: 'LLM Test ausführen' },
+  { command: 'signals', description: 'AI Signal Snapshot' },
+  { command: 'top_signals', description: 'Top Signale' },
+  { command: 'signal', description: 'Symbol analysieren' },
+  { command: 'explain', description: 'Signal erklären' },
+  { command: 'confluence', description: 'Confluence anzeigen' },
+  { command: 'anomalies', description: 'Anomalien anzeigen' },
+  { command: 'regime', description: 'Marktregime anzeigen' },
+  { command: 'risk', description: 'Risk Snapshot' },
+  { command: 'ai_hardening', description: 'AI Hardening Status' },
+  { command: 'ai_architecture', description: 'AI Architektur Status' },
+  { command: 'drift', description: 'Model Drift Status' },
+  { command: 'model_drift', description: 'Model Drift Status' },
+  { command: 'agent_attribution', description: 'Agent Attribution' },
+  { command: 'agent_stats', description: 'Agent Statistiken' },
+  { command: 'kill_status', description: 'Safety/Kill Status' },
+  { command: 'retrain', description: 'ML/DQN Training starten' },
+  { command: 'scan', description: 'Manuellen Market Scan starten' },
+  { command: 'scanstats', description: 'Scan Statistik' },
+  { command: 'status', description: 'Bot Status' },
+  { command: 'stats', description: 'Tagesperformance' },
+  { command: 'pause', description: 'Bot pausieren' },
+  { command: 'resume', description: 'Bot fortsetzen' }
+];
+
+async function registerTelegramCommands() {
+  const token = configTelegram.botToken || config.TELEGRAM_BOT_TOKEN;
+  if (!token) return false;
+  const endpoint = `https://api.telegram.org/bot${token}/setMyCommands`;
+  try {
+    // Global command list.
+    await axios.post(endpoint, { commands: TELEGRAM_COMMANDS_V24_6 }, { timeout: 10000 });
+
+    // Telegram supports a per-chat scope. Register it for every configured
+    // authorized chat so the command menu is guaranteed to appear there.
+    const chatIds = String(configTelegram.chatId || '')
+      .split(',').map(id => id.trim()).filter(Boolean);
+    for (const chatId of chatIds) {
+      if (!/^-?\d+$/.test(chatId)) continue;
+      try {
+        await axios.post(endpoint, {
+          commands: TELEGRAM_COMMANDS_V24_6,
+          scope: { type: 'chat', chat_id: Number(chatId) }
+        }, { timeout: 10000 });
+      } catch (chatErr) {
+        logger.warn(`⚠️ Telegram Command-Menü für Chat ${chatId} konnte nicht registriert werden: ${chatErr.message}`);
+      }
+    }
+    logger.info(`🤖 Telegram AI-Agent Command-Menü registriert (${TELEGRAM_COMMANDS_V24_6.length} Commands).`);
+    return true;
+  } catch (e) {
+    logger.error(`❌ Telegram Command-Menü Registrierung fehlgeschlagen: ${e.message}`);
+    return false;
+  }
+}
+
 // ==========================================
 // 6. KORRELATIONS-GRUPPEN
 // ==========================================
@@ -3184,6 +3260,15 @@ async function handleTelegramCommand(chatId, text) {
     return;
   }
 
+  if (command === '/signal') {
+    const symbol = args[0] ? (args[0].toUpperCase().endsWith('-USDT') ? args[0].toUpperCase() : `${args[0].toUpperCase()}-USDT`) : null;
+    if (!symbol) { await sendTelegramReply(chatId, '⚠️ Syntax: <code>/signal BTC-USDT</code>'); return; }
+    const agentRows = aiAgents.listAgents();
+    const active = agentRows.filter(x => x.enabled).length;
+    await sendTelegramReply(chatId, `🤖 <b>AI SIGNAL SNAPSHOT — ${escapeHtml(symbol)}</b>\nAgents: ${active}/${agentRows.length} aktiv\nMarket Phase: <b>${escapeHtml(currentMarketPhase || 'UNKNOWN')}</b>\n\nDas nächste echte Signal für dieses Symbol wird weiterhin durch ML/DQN, Agent-Orchestrator und die unveränderten Risk-/Safety-Gates bewertet.`);
+    return;
+  }
+
   if (command === '/explain') {
     const symbol = args[0] ? (args[0].toUpperCase().endsWith('-USDT') ? args[0].toUpperCase() : `${args[0].toUpperCase()}-USDT`) : null;
     if (!symbol) { await sendTelegramReply(chatId, '⚠️ Syntax: <code>/explain BTC-USDT</code>'); return; }
@@ -4169,6 +4254,7 @@ process.on('unhandledRejection', async (reason) => {
   await loadFuturesContractSpecs();
   await loadSignalMLModel();
   if (!isModelTrained) await trainSignalMLModel(true);
+  await registerTelegramCommands();
   pollTelegramUpdates();
 
   const runScanCycle = async () => {

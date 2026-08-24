@@ -19,3 +19,9 @@ Execution remains fail-closed:
 - `EXECUTION_ENABLED=false`
 - `DRY_RUN=true`
 - `KILL_SWITCH_ENABLED=true`
+
+## v24.6 AI/TFJS compatibility hotfix (2026-08-24)
+- Runtime is pinned to Node.js 22.x because `@tensorflow/tfjs-node` versions using the affected backend are not compatible with Node.js 23+ where `util.isNullOrUndefined` was removed.
+- `.nvmrc` is pinned to Node 22.14.0.
+- `package.json` uses `engines.node = 22.x` and pins `@tensorflow/tfjs-node` to 4.22.0.
+- Telegram AI commands are registered automatically via the Telegram `setMyCommands` API at startup, including a per-chat command menu for configured `TELEGRAM_CHAT_ID` values.
