@@ -1,6 +1,6 @@
 {
   "name": "trading-bot-v24.6-institutional-edition",
-  "version": "24.7.0-agent-suite",
+  "version": "24.6.0-ai-fixed",
   "private": true,
   "description": "Signal/Paper/Shadow institutional trading platform - B13-B16",
   "scripts": {
@@ -14,6 +14,16 @@
     "test:dqn-hotfix": "node tests/dqn-hotfix-source.test.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": "22.x"
+  },
+  "dependencies": {
+    "@google/genai": "^1.10.0",
+    "@tensorflow/tfjs-node": "4.22.0",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "mongodb": "^6.12.0",
+    "node-cron": "^3.0.3",
+    "winston": "^3.17.0"
   }
 }

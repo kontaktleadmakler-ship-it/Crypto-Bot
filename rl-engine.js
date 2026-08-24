@@ -68,15 +68,6 @@ class DeepQTheTradingAgent {
     meanLayer.setWeights([meanKernel]);
     meanKernel.dispose();
 
-    const meanRepLayer = tf.layers.dense({
-      units: this.actionSize, useBias: false, trainable: false, kernelInitializer: 'zeros'
-    });
-    const meanRep = meanRepLayer.apply(meanAdv);
-    const onesKernel = tf.tensor2d(
-      Array.from({ length: this.actionSize }, () => 1), [1, this.actionSize]
-    );
-    meanRepLayer.setWeights([onesKernel]);
-    onesKernel.dispose();
     // TensorFlow.js has no subtract layer; use add with a negated mean instead.
     // meanRep contains +mean(A) for every action, so negate it with a
     // fixed non-trainable Dense layer and use the supported add layer:
