@@ -4,6 +4,6 @@ services:
     runtime: node
     plan: starter
     buildCommand: npm install
-    startCommand: node trading-bot-v22.2.1.js
-    healthCheckPath: /
+    startCommand: node trading-bot-v25.js
+    healthCheckPath: /health
     autoDeploy: true

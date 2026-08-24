@@ -35,7 +35,12 @@ class HedgeManager {
     if (btcChangePct <= this.thresholdDropPct && !this.hedgeActive) {
       this.logger.warn(`⚠️ [HedgeManager] Starker BTC-Abfall erkannt (${btcChangePct.toFixed(2)}%). Aktiviere Notfall-Absicherung!`);
       this.hedgeActive = true;
-      
+
+      // Bugfix: lastBtcPrice muss auch beim Trigger-Tick aktualisiert werden.
+      // Vorher führte der frühe return dazu, dass die Recovery-Prüfung (unten)
+      // fälschlich gegen den alten Vor-Crash-Preis statt gegen den Crash-Preis lief.
+      this.lastBtcPrice = btcCurrentPrice;
+
       return {
         shouldHedge: true,
         reason: 'BTC_FLASH_CRASH',
