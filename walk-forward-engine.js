@@ -1,12 +1,4 @@
 'use strict';
-class WalkForwardEngine {
-  constructor({ trainBars=500, testBars=150, stepBars=150 }={}) { this.trainBars=trainBars; this.testBars=testBars; this.stepBars=stepBars; }
-  windows(totalBars) {
-    const out=[]; for(let start=0; start+this.trainBars+this.testBars<=totalBars; start+=this.stepBars) out.push({train:[start,start+this.trainBars],test:[start+this.trainBars,start+this.trainBars+this.testBars]}); return out;
-  }
-  summarize(results=[]) {
-    const valid=results.filter(r=>Number.isFinite(Number(r.profitFactor)));
-    return { windows:valid.length, avgProfitFactor:valid.length?valid.reduce((s,r)=>s+Number(r.profitFactor),0)/valid.length:0, passRate:valid.length?valid.filter(r=>Number(r.profitFactor)>=1.5 && Number(r.maxDrawdown||100)<10).length/valid.length:0, passed:valid.length>0 && valid.every(r=>Number(r.profitFactor)>=1.5 && Number(r.maxDrawdown||100)<10) };
-  }
-}
+class WalkForwardEngine{constructor({trainSize=500,testSize=100,step=100}={}){this.trainSize=trainSize;this.testSize=testSize;this.step=step}
+ run(data,{trainFn,testFn,scoreFn=(x)=>x.metrics?.totalPnl??0}={}){const windows=[];for(let start=0;start+this.trainSize+this.testSize<=data.length;start+=this.step){const train=data.slice(start,start+this.trainSize),test=data.slice(start+this.trainSize,start+this.trainSize+this.testSize);const model=trainFn?trainFn(train,{start}):null;const result=testFn?testFn(test,model,{start}):model;windows.push({start,trainStart:start,trainEnd:start+this.trainSize,testStart:start+this.trainSize,testEnd:start+this.trainSize+this.testSize,score:scoreFn(result),result})}return {windows,aggregate:windows.reduce((a,w)=>a+w.score,0),count:windows.length}}}
 module.exports={WalkForwardEngine};

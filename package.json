@@ -1,28 +1,16 @@
 {
-  "name": "crypto-trading-bot-paper-dqn",
-  "version": "22.2.1",
+  "name": "trading-bot-v24.6-institutional-edition",
+  "version": "24.6.0",
   "private": true,
-  "description": "Crypto Trading Bot v22.2.1 PRO - hardened paper-trading signal system with advanced features and fail-closed execution",
-  "main": "trading-bot-v22.2.1.js",
-  "engines": {
-    "node": ">=20 <23"
-  },
+  "description": "Signal/Paper/Shadow institutional trading platform - B13-B16",
   "scripts": {
-    "start": "node trading-bot-v22.2.1.js",
-    "check": "node --check trading-bot-v22.2.1.js && node --check ml-engine.js && node --check backtest-engine.js && node --check rl-engine.js && node --check risk-engine.js && node --check data-validator.js && node --check audit-log.js && node --check orderFlowAnalyzer.js && node --check volatilityRegimeManager.js && node --check feature-engine.js && node --check orderflow-stream.js && node --check execution-interface.js && node --check risk-controls.js && node --check attribution.js && node --check ml-ensemble.js && node --check explainability.js && node --check prioritized-replay.js && node --check drift-monitor.js && node --check execution-algos.js && node --check report-engine.js && node --check ai-agents.js && node --check llm-engine.js && node --check data-fusion.js && node --check signal-arbitration.js && node --check portfolio-risk-agent.js && node --check walk-forward-engine.js && node --check model-drift-monitor.js && node --check agent-attribution.js && node --check data-recovery.js && node --check market-microstructure.js && node --check model-registry.js && node --check rl-engine.js && node --check tests/rl2.test.js",
-    "test": "node tests/hardening.test.js && node tests/pro_features.test.js && node ai-agents.test.js && node tests/ai_hardening.test.js && node tests/next_phase.test.js && node tests/rl2.test.js",
-    "backtest": "node backtest.js",
-    "backtest:no-ml": "node backtest.js --noMl",
-    "test:validation-execution": "node validation-execution.test.js"
+    "test:b13": "node tests/b13.test.js",
+    "test": "node tests/b13.test.js && node tests/b10.test.js && node tests/b11.test.js && node institutional-self-test.js",
+    "test:b10": "node tests/b10.test.js",
+    "test:b11": "node tests/b11.test.js",
+    "test:v24": "node institutional-self-test.js"
   },
-  "dependencies": {
-    "@tensorflow/tfjs-node": "4.22.0",
-    "axios": "1.7.9",
-    "dotenv": "16.4.7",
-    "express": "4.21.2",
-    "mongodb": "6.12.0",
-    "node-cron": "3.0.3",
-    "winston": "3.17.0",
-    "@google/genai": "2.16.0"
+  "engines": {
+    "node": ">=18"
   }
 }

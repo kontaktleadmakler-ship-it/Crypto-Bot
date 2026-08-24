@@ -3,7 +3,6 @@
 const axios = require('axios');
 const tf = require('@tensorflow/tfjs-node');
 const { TensorFlowSignalModel, FEATURE_NAMES } = require('./ml-engine');
-const { buildFeatureSnapshot } = require('./feature-engine');
 
 const FUTURES_GRANULARITY_MINUTES = { '1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440 };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -130,7 +129,7 @@ function findSwingStop(candles, direction, lookback=10){
 function trend(candles, fast, slow){if(!candles||candles.length<slow)return 'NEUTRAL';return calculateEMA(candles.map(c=>c.close),fast)>calculateEMA(candles.map(c=>c.close),slow)?'BULLISH':'BEARISH';}
 function detectMarketPhase(btcTrend, btcADX, btcVolatility){if(btcADX>=25&&btcVolatility<0.03)return 'TRENDING';if(btcVolatility>=0.03)return 'VOLATILE';return btcTrend==='BULLISH'||btcTrend==='BEARISH'?'TRENDING':'RANGING';}
 function adaptiveConfig(phase, base){const m=phase==='VOLATILE'?{adx:1.15,atr:0.3,tp1:-0.1,vol:1.15}:phase==='TRENDING'?{adx:0.9,atr:0,tp1:0,vol:0.95}:{adx:1.05,atr:0.15,tp1:-0.05,vol:1.05};return {adx:base.ADX_MIN*m.adx,atr:base.ATR_STOP_MULT+m.atr,tp1:base.TP1_MULT+m.tp1,vol:base.MIN_RELATIVE_VOLUME*m.vol};}
-function signalScore(p){let s=Math.min(p.adx/50,1)*30;const opt=p.direction==='LONG'?55:45;s+=Math.max(0,1-Math.abs(p.rsi-opt)/30)*20;s+=Math.min(p.relativeVolume/2,1)*20;if(p.trend1h===(p.direction==='LONG'?'BULLISH':'BEARISH'))s+=15;if(p.trend4h===(p.direction==='LONG'?'BULLISH':'BEARISH'))s+=15;const adv=p.direction==='LONG'?p.advancedLong:p.advancedShort;if(adv){const advanced=(adv.confluence.score+adv.ichimokuScore+adv.volumeMACDScore+adv.cvdScore)/4;s=s*0.70+advanced*0.30;}return Math.round(Math.min(s,100));}
+function signalScore(p){let s=Math.min(p.adx/50,1)*30;const opt=p.direction==='LONG'?55:45;s+=Math.max(0,1-Math.abs(p.rsi-opt)/30)*20;s+=Math.min(p.relativeVolume/2,1)*20;if(p.trend1h===(p.direction==='LONG'?'BULLISH':'BEARISH'))s+=15;if(p.trend4h===(p.direction==='LONG'?'BULLISH':'BEARISH'))s+=15;return Math.round(Math.min(s,100));}
 // --- Hard gates: structural preconditions that must never be traded around.
 // Without directional trend alignment and a break of structure the setup is
 // not the strategy this bot claims to trade, so these stay boolean.
@@ -211,11 +210,11 @@ async function fetchHistoricalFunding(symbol, startTime, endTime) {
     .sort((a, b) => a.time - b.time);
 }
 
-function applySlippage(price,direction,pct,side='entry'){const f=side==='entry'?(direction==='LONG'?1+pct/100:1-pct/100):(direction==='LONG'?1-pct/100:1+pct/100);return price*f;}
-function fee(notional,pct){return notional*pct/100;}
-function buildConfig(env={}){const n=(k,d)=>env[k]!==undefined?Number(env[k]):d;const b=(k,d)=>env[k]!==undefined?env[k]!=='false':d;return {CAPITAL_USD:n('CAPITAL_USD',10000),RISK_PERCENT:n('RISK_PERCENT',0.75),MAX_CONCURRENT_TRADES:n('MAX_CONCURRENT_TRADES',3),MAX_SAME_DIRECTION:n('MAX_SAME_DIRECTION',2),MAX_DAILY_LOSS_USD:n('MAX_DAILY_LOSS_USD',250),MAX_EXPOSURE_RATIO:n('MAX_EXPOSURE_RATIO',0.6),LEVERAGE:n('LEVERAGE',3),ATR_STOP_MULT:n('ATR_STOP_MULT',2.3),TP1_MULT:n('TP1_MULT',1.3),TP2_MULT:n('TP2_MULT',2.5),MAX_HOLD_HOURS:n('MAX_HOLD_HOURS',4),ABSOLUTE_MAX_HOLD_HOURS:n('ABSOLUTE_MAX_HOLD_HOURS',24),TRAILING_STOP_ENABLED:b('TRAILING_STOP_ENABLED',true),TRAILING_ATR_MULT:n('TRAILING_ATR_MULT',2.2),TP1_CLOSE_PERCENT:n('TP1_CLOSE_PERCENT',60),SLIPPAGE_PERCENT:n('SLIPPAGE_PERCENT',0.10),FEE_PERCENT:n('FEE_PERCENT',0.1),MAX_CHOP_INDEX:n('MAX_CHOP_INDEX',61.8),MIN_HURST_EXPONENT:n('MIN_HURST_EXPONENT',0.52),ADX_MIN:n('ADX_MIN',20),RSI_LONG_MIN:n('RSI_LONG_MIN',48),RSI_LONG_MAX:n('RSI_LONG_MAX',68),RSI_SHORT_MIN:n('RSI_SHORT_MIN',32),RSI_SHORT_MAX:n('RSI_SHORT_MAX',52),MIN_RELATIVE_VOLUME:n('MIN_RELATIVE_VOLUME',1.2),MIN_GATE_SCORE:n('MIN_GATE_SCORE',55),MIN_RRR:n('MIN_RRR',1.5),SWING_LOOKBACK:n('SWING_LOOKBACK',10),BOS_LOOKBACK:n('BOS_LOOKBACK',10),TREND_EMA_FAST_15M:n('TREND_EMA_FAST_15M',20),TREND_EMA_SLOW_15M:n('TREND_EMA_SLOW_15M',50),REQUIRE_4H_TREND:b('REQUIRE_4H_TREND',true),ALLOW_COUNTER_BTC_TREND:b('ALLOW_COUNTER_BTC_TREND',false),ENABLE_SHORT_SIGNALS:b('ENABLE_SHORT_SIGNALS',true),ML_MIN_PREDICTION_PROBABILITY:n('ML_MIN_PREDICTION_PROBABILITY',0.55),ML_ENABLED:b('ML_ENABLED',true),ML_MIN_TRAINING_SAMPLES:n('ML_MIN_TRAINING_SAMPLES',40),ML_EPOCHS:n('ML_EPOCHS',50),ML_BATCH_SIZE:n('ML_BATCH_SIZE',32),BACKTEST_STARTING_CAPITAL:n('BACKTEST_STARTING_CAPITAL',n('CAPITAL_USD',10000)),BACKTEST_MAX_TRAIN_TRADES:n('BACKTEST_MAX_TRAIN_TRADES',1000),BACKTEST_RETRAIN_EVERY_SIGNALS:n('BACKTEST_RETRAIN_EVERY_SIGNALS',25),BACKTEST_TRAIN_DAYS:n('BACKTEST_TRAIN_DAYS',30),BACKTEST_TEST_DAYS:n('BACKTEST_TEST_DAYS',7),BACKTEST_WARMUP_BARS:n('BACKTEST_WARMUP_BARS',300),BACKTEST_USE_ML:b('BACKTEST_USE_ML',true),REQUIRE_FUNDING_HISTORY:b('REQUIRE_FUNDING_HISTORY',true),HYPERPARAM_SEARCH_SAMPLES:n('HYPERPARAM_SEARCH_SAMPLES',60),MONTE_CARLO_SAMPLES:n('MONTE_CARLO_SAMPLES',1000),BACKTEST_OOS_DAYS:n('BACKTEST_OOS_DAYS',7)};}
+function applySlippage(price,direction,pct,side='entry',cfg={}){const spread=Number(cfg.BACKTEST_SPREAD_PERCENT||0);const slip=Number(pct||0);const total=(spread/2)+slip;const f=side==='entry'?(direction==='LONG'?1+total/100:1-total/100):(direction==='LONG'?1-total/100:1+total/100);return price*f;}
+function fee(notional,pct,cfg={}){const taker=Number(cfg.BACKTEST_TAKER_FEE_PERCENT ?? pct ?? 0);return Math.abs(notional)*taker/100;}
+function buildConfig(env={}){const n=(k,d)=>env[k]!==undefined?Number(env[k]):d;const b=(k,d)=>env[k]!==undefined?env[k]!=='false':d;return {CAPITAL_USD:n('CAPITAL_USD',10000),RISK_PERCENT:n('RISK_PERCENT',0.75),MAX_CONCURRENT_TRADES:n('MAX_CONCURRENT_TRADES',3),MAX_SAME_DIRECTION:n('MAX_SAME_DIRECTION',2),MAX_DAILY_LOSS_USD:n('MAX_DAILY_LOSS_USD',250),MAX_EXPOSURE_RATIO:n('MAX_EXPOSURE_RATIO',0.6),LEVERAGE:n('LEVERAGE',3),ATR_STOP_MULT:n('ATR_STOP_MULT',2.3),TP1_MULT:n('TP1_MULT',1.3),TP2_MULT:n('TP2_MULT',2.5),MAX_HOLD_HOURS:n('MAX_HOLD_HOURS',4),ABSOLUTE_MAX_HOLD_HOURS:n('ABSOLUTE_MAX_HOLD_HOURS',24),TRAILING_STOP_ENABLED:b('TRAILING_STOP_ENABLED',true),TRAILING_ATR_MULT:n('TRAILING_ATR_MULT',2.2),TP1_CLOSE_PERCENT:n('TP1_CLOSE_PERCENT',60),SLIPPAGE_PERCENT:n('SLIPPAGE_PERCENT',0.10),FEE_PERCENT:n('FEE_PERCENT',0.1),BACKTEST_SPREAD_PERCENT:n('BACKTEST_SPREAD_PERCENT',0.0),BACKTEST_TAKER_FEE_PERCENT:n('BACKTEST_TAKER_FEE_PERCENT',n('FEE_PERCENT',0.1)),BACKTEST_MAKER_FEE_PERCENT:n('BACKTEST_MAKER_FEE_PERCENT',n('FEE_PERCENT',0.1)),MAX_CHOP_INDEX:n('MAX_CHOP_INDEX',61.8),MIN_HURST_EXPONENT:n('MIN_HURST_EXPONENT',0.52),ADX_MIN:n('ADX_MIN',20),RSI_LONG_MIN:n('RSI_LONG_MIN',48),RSI_LONG_MAX:n('RSI_LONG_MAX',68),RSI_SHORT_MIN:n('RSI_SHORT_MIN',32),RSI_SHORT_MAX:n('RSI_SHORT_MAX',52),MIN_RELATIVE_VOLUME:n('MIN_RELATIVE_VOLUME',1.2),MIN_GATE_SCORE:n('MIN_GATE_SCORE',55),MIN_RRR:n('MIN_RRR',1.5),SWING_LOOKBACK:n('SWING_LOOKBACK',10),BOS_LOOKBACK:n('BOS_LOOKBACK',10),TREND_EMA_FAST_15M:n('TREND_EMA_FAST_15M',20),TREND_EMA_SLOW_15M:n('TREND_EMA_SLOW_15M',50),REQUIRE_4H_TREND:b('REQUIRE_4H_TREND',true),ALLOW_COUNTER_BTC_TREND:b('ALLOW_COUNTER_BTC_TREND',false),ENABLE_SHORT_SIGNALS:b('ENABLE_SHORT_SIGNALS',true),ML_MIN_PREDICTION_PROBABILITY:n('ML_MIN_PREDICTION_PROBABILITY',0.55),ML_ENABLED:b('ML_ENABLED',true),ML_MIN_TRAINING_SAMPLES:n('ML_MIN_TRAINING_SAMPLES',40),ML_EPOCHS:n('ML_EPOCHS',50),ML_BATCH_SIZE:n('ML_BATCH_SIZE',32),BACKTEST_STARTING_CAPITAL:n('BACKTEST_STARTING_CAPITAL',n('CAPITAL_USD',10000)),BACKTEST_MAX_TRAIN_TRADES:n('BACKTEST_MAX_TRAIN_TRADES',1000),BACKTEST_RETRAIN_EVERY_SIGNALS:n('BACKTEST_RETRAIN_EVERY_SIGNALS',25),BACKTEST_TRAIN_DAYS:n('BACKTEST_TRAIN_DAYS',30),BACKTEST_TEST_DAYS:n('BACKTEST_TEST_DAYS',7),BACKTEST_PURGE_DAYS:n('BACKTEST_PURGE_DAYS',1),BACKTEST_EMBARGO_DAYS:n('BACKTEST_EMBARGO_DAYS',1),BACKTEST_WARMUP_BARS:n('BACKTEST_WARMUP_BARS',300),BACKTEST_USE_ML:b('BACKTEST_USE_ML',true),REQUIRE_FUNDING_HISTORY:b('REQUIRE_FUNDING_HISTORY',true),HYPERPARAM_SEARCH_SAMPLES:n('HYPERPARAM_SEARCH_SAMPLES',60)};}
 
-function buildSnapshot(candles15, candles1h, candles4h, btcCandles, cfg){const closes15=candles15.map(c=>c.close),price=closes15.at(-1),t4=trend(candles4h,20,50),t1=trend(candles1h,20,50),t15=trend(candles15,cfg.TREND_EMA_FAST_15M,cfg.TREND_EMA_SLOW_15M),btc=trend(btcCandles,20,50),adx=calculateADX(candles15,14),hurst=calculateHurstExponent(closes15),rsi=calculateRSI(closes15,14),atr=calculateATR(candles15,14),poc=calculatePOC(candles15,30),vwap=calculateVWAP(candles15),macd=calculateMACD(closes15),b=bos(candles15,cfg.BOS_LOOKBACK),rv=relativeVolume(candles15,20),chop=choppiness(candles15,14),phase=detectMarketPhase(btc,calculateADX(btcCandles,14),btcCandles.at(-1)?.close?atr/candles15.at(-1).close:0),adaptive=adaptiveConfig(phase,cfg);const advancedLong=buildFeatureSnapshot({candlesByTf:{'1m':[],'5m':[],'15m':candles15,'1h':candles1h,'4h':candles4h||[]},phase,direction:'LONG',config:cfg});const advancedShort=buildFeatureSnapshot({candlesByTf:{'1m':[],'5m':[],'15m':candles15,'1h':candles1h,'4h':candles4h||[]},phase,direction:'SHORT',config:cfg});return {price,trend4h:t4,trend1h:t1,trend15m:t15,btcTrend:btc,adx,hurst,rsi,atr,poc,vwap,macd,bosBullish:b.bosBullish,bosBearish:b.bosBearish,relativeVolume:rv,chop,marketPhase:phase,adaptive,advancedLong,advancedShort};}
+function buildSnapshot(candles15, candles1h, candles4h, btcCandles, cfg){const closes15=candles15.map(c=>c.close),price=closes15.at(-1),t4=trend(candles4h,20,50),t1=trend(candles1h,20,50),t15=trend(candles15,cfg.TREND_EMA_FAST_15M,cfg.TREND_EMA_SLOW_15M),btc=trend(btcCandles,20,50),adx=calculateADX(candles15,14),hurst=calculateHurstExponent(closes15),rsi=calculateRSI(closes15,14),atr=calculateATR(candles15,14),poc=calculatePOC(candles15,30),vwap=calculateVWAP(candles15),macd=calculateMACD(closes15),b=bos(candles15,cfg.BOS_LOOKBACK),rv=relativeVolume(candles15,20),chop=choppiness(candles15,14),phase=detectMarketPhase(btc,calculateADX(btcCandles,14),btcCandles.at(-1)?.close?atr/candles15.at(-1).close:0),adaptive=adaptiveConfig(phase,cfg);return {price,trend4h:t4,trend1h:t1,trend15m:t15,btcTrend:btc,adx,hurst,rsi,atr,poc,vwap,macd,bosBullish:b.bosBullish,bosBearish:b.bosBearish,relativeVolume:rv,chop,marketPhase:phase,adaptive};}
 
 function candidate(snapshot,cfg){const primary=snapshot.trend1h==='BULLISH'?'LONG':'SHORT';let dir=evaluateGates(primary,snapshotForDir(snapshot,primary),cfg)?primary:null;if(!dir&&cfg.ENABLE_SHORT_SIGNALS){const other=primary==='LONG'?'SHORT':'LONG';if(evaluateGates(other,snapshotForDir(snapshot,other),cfg))dir=other;}if(!dir)return null;const p=snapshotForDir(snapshot,dir),score=signalScore(p);return {...p,direction:dir,signalScore:score};}
 function snapshotForDir(s,d){return {...s,direction:d};}
@@ -331,7 +330,7 @@ function simulateSignal(signal, bars, startIndex, cfg, fundingHistory=[]){
   const tp2Dist=Math.max(stopDist*cfg.TP2_MULT, tp1Dist*1.3);
   const tp1=signal.direction==='LONG'?entry+tp1Dist:entry-tp1Dist;
   const tp2=signal.direction==='LONG'?entry+tp2Dist:entry-tp2Dist;
-  const riskPerUnit=Math.abs(entry-stop);const riskUSD=cfg.BACKTEST_STARTING_CAPITAL*(cfg.RISK_PERCENT/100);const units=riskPerUnit>0?riskUSD/riskPerUnit:0;let remaining=units,realized=0,tp1Hit=false,highest=entry,lowest=entry;const entryFee=fee(units*entry,cfg.FEE_PERCENT);let exitPrice=bars[startIndex].open,reason='end';let lastIndex=startIndex;
+  const riskPerUnit=Math.abs(entry-stop);const riskUSD=cfg.BACKTEST_STARTING_CAPITAL*(cfg.RISK_PERCENT/100);const units=riskPerUnit>0?riskUSD/riskPerUnit:0;let remaining=units,realized=0,tp1Hit=false,highest=entry,lowest=entry;const entryFee=fee(units*entry,cfg.FEE_PERCENT,cfg);let exitPrice=bars[startIndex].open,reason='end';let lastIndex=startIndex;
   // Punkt 9: Zeiger auf die erste Funding-Periode NACH Trade-Eröffnung; jede
   // Periode, die während der Haltedauer fällig wird, wird unten pro Bar
   // verrechnet, sobald deren Zeitstempel erreicht ist.
@@ -345,44 +344,26 @@ function simulateSignal(signal, bars, startIndex, cfg, fundingHistory=[]){
       const cost=signal.direction==='LONG'?f.fundingRate*notional:-f.fundingRate*notional;
       realized-=cost;fundingCostTotal+=cost;fundingIdx++;
     }
-    if(!tp1Hit&&hours>=cfg.MAX_HOLD_HOURS){exitPrice=applySlippage(b.close,signal.direction,cfg.SLIPPAGE_PERCENT,'exit');realized+=(signal.direction==='LONG'?exitPrice-entry:entry-exitPrice)*remaining-fee(remaining*entry,cfg.FEE_PERCENT)-entryFee*(remaining/units);reason='time-stop';break;}
-    if(tp1Hit&&hours>=cfg.ABSOLUTE_MAX_HOLD_HOURS){exitPrice=applySlippage(b.close,signal.direction,cfg.SLIPPAGE_PERCENT,'exit');realized+=(signal.direction==='LONG'?exitPrice-entry:entry-exitPrice)*remaining-fee(remaining*entry,cfg.FEE_PERCENT)-entryFee*(remaining/units);reason='absolute-time-limit';break;}
+    if(!tp1Hit&&hours>=cfg.MAX_HOLD_HOURS){exitPrice=applySlippage(b.close,signal.direction,cfg.SLIPPAGE_PERCENT,'exit',cfg);realized+=(signal.direction==='LONG'?exitPrice-entry:entry-exitPrice)*remaining-fee(remaining*entry,cfg.FEE_PERCENT,cfg)-entryFee*(remaining/units);reason='time-stop';break;}
+    if(tp1Hit&&hours>=cfg.ABSOLUTE_MAX_HOLD_HOURS){exitPrice=applySlippage(b.close,signal.direction,cfg.SLIPPAGE_PERCENT,'exit',cfg);realized+=(signal.direction==='LONG'?exitPrice-entry:entry-exitPrice)*remaining-fee(remaining*entry,cfg.FEE_PERCENT,cfg)-entryFee*(remaining/units);reason='absolute-time-limit';break;}
     if(tp1Hit){if(signal.direction==='LONG')highest=Math.max(highest,b.high);else lowest=Math.min(lowest,b.low);if(cfg.TRAILING_STOP_ENABLED){const atr=calculateATR(bars.slice(Math.max(0,i-20),i+1),14)||signal.atr;const cand=signal.direction==='LONG'?highest-atr*cfg.TRAILING_ATR_MULT:lowest+atr*cfg.TRAILING_ATR_MULT;if(signal.direction==='LONG')stop=Math.max(stop,cand);else stop=Math.min(stop,cand);}}
     // Conservative intrabar ordering: if both target and stop are touched, stop is assumed first.
     if(signal.direction==='LONG'){
-      if(b.low<=stop){exitPrice=applySlippage(stop,'LONG',cfg.SLIPPAGE_PERCENT,'exit');realized+=(exitPrice-entry)*remaining-fee(remaining*entry,cfg.FEE_PERCENT)-entryFee*(remaining/units);reason=tp1Hit?'trailing-stop':'stop-loss';break;}
-      if(!tp1Hit&&b.high>=tp1){const part=remaining*(cfg.TP1_CLOSE_PERCENT/100);const px=applySlippage(tp1,'LONG',cfg.SLIPPAGE_PERCENT,'exit');realized+=(px-entry)*part-fee(part*entry,cfg.FEE_PERCENT)-entryFee*(part/units);remaining-=part;tp1Hit=true;stop=entry;highest=px;}
-      if(tp1Hit&&b.high>=tp2){exitPrice=applySlippage(tp2,'LONG',cfg.SLIPPAGE_PERCENT,'exit');realized+=(exitPrice-entry)*remaining-fee(remaining*entry,cfg.FEE_PERCENT)-entryFee*(remaining/units);reason='tp2';break;}
+      if(b.low<=stop){exitPrice=applySlippage(stop,'LONG',cfg.SLIPPAGE_PERCENT,'exit',cfg);realized+=(exitPrice-entry)*remaining-fee(remaining*entry,cfg.FEE_PERCENT,cfg)-entryFee*(remaining/units);reason=tp1Hit?'trailing-stop':'stop-loss';break;}
+      if(!tp1Hit&&b.high>=tp1){const part=remaining*(cfg.TP1_CLOSE_PERCENT/100);const px=applySlippage(tp1,'LONG',cfg.SLIPPAGE_PERCENT,'exit',cfg);realized+=(px-entry)*part-fee(part*entry,cfg.FEE_PERCENT,cfg)-entryFee*(part/units);remaining-=part;tp1Hit=true;stop=entry;highest=px;}
+      if(tp1Hit&&b.high>=tp2){exitPrice=applySlippage(tp2,'LONG',cfg.SLIPPAGE_PERCENT,'exit',cfg);realized+=(exitPrice-entry)*remaining-fee(remaining*entry,cfg.FEE_PERCENT,cfg)-entryFee*(remaining/units);reason='tp2';break;}
     } else {
-      if(b.high>=stop){exitPrice=applySlippage(stop,'SHORT',cfg.SLIPPAGE_PERCENT,'exit');realized+=(entry-exitPrice)*remaining-fee(remaining*entry,cfg.FEE_PERCENT)-entryFee*(remaining/units);reason=tp1Hit?'trailing-stop':'stop-loss';break;}
-      if(!tp1Hit&&b.low<=tp1){const part=remaining*(cfg.TP1_CLOSE_PERCENT/100);const px=applySlippage(tp1,'SHORT',cfg.SLIPPAGE_PERCENT,'exit');realized+=(entry-px)*part-fee(part*entry,cfg.FEE_PERCENT)-entryFee*(part/units);remaining-=part;tp1Hit=true;stop=entry;lowest=px;}
-      if(tp1Hit&&b.low<=tp2){exitPrice=applySlippage(tp2,'SHORT',cfg.SLIPPAGE_PERCENT,'exit');realized+=(entry-exitPrice)*remaining-fee(remaining*entry,cfg.FEE_PERCENT)-entryFee*(remaining/units);reason='tp2';break;}
+      if(b.high>=stop){exitPrice=applySlippage(stop,'SHORT',cfg.SLIPPAGE_PERCENT,'exit',cfg);realized+=(entry-exitPrice)*remaining-fee(remaining*entry,cfg.FEE_PERCENT,cfg)-entryFee*(remaining/units);reason=tp1Hit?'trailing-stop':'stop-loss';break;}
+      if(!tp1Hit&&b.low<=tp1){const part=remaining*(cfg.TP1_CLOSE_PERCENT/100);const px=applySlippage(tp1,'SHORT',cfg.SLIPPAGE_PERCENT,'exit',cfg);realized+=(entry-px)*part-fee(part*entry,cfg.FEE_PERCENT,cfg)-entryFee*(part/units);remaining-=part;tp1Hit=true;stop=entry;lowest=px;}
+      if(tp1Hit&&b.low<=tp2){exitPrice=applySlippage(tp2,'SHORT',cfg.SLIPPAGE_PERCENT,'exit',cfg);realized+=(entry-exitPrice)*remaining-fee(remaining*entry,cfg.FEE_PERCENT,cfg)-entryFee*(remaining/units);reason='tp2';break;}
     }
   }
-  if(lastIndex===bars.length-1&&reason==='end'){const b=bars.at(-1);exitPrice=applySlippage(b.close,signal.direction,cfg.SLIPPAGE_PERCENT,'exit');realized+=(signal.direction==='LONG'?exitPrice-entry:entry-exitPrice)*remaining-fee(remaining*entry,cfg.FEE_PERCENT)-entryFee*(remaining/units);}
+  if(lastIndex===bars.length-1&&reason==='end'){const b=bars.at(-1);exitPrice=applySlippage(b.close,signal.direction,cfg.SLIPPAGE_PERCENT,'exit',cfg);realized+=(signal.direction==='LONG'?exitPrice-entry:entry-exitPrice)*remaining-fee(remaining*entry,cfg.FEE_PERCENT,cfg)-entryFee*(remaining/units);}
   return {pnlUSD:realized,entry,exitPrice,reason,closeTime:bars[lastIndex].time,closeIndex:lastIndex,barsHeld:lastIndex-startIndex+1,tp1Hit,fundingCostUSD:fundingCostTotal,signal};}
 
 function metrics(trades,startingCapital){const pnls=trades.map(t=>t.pnlUSD),wins=pnls.filter(x=>x>0),losses=pnls.filter(x=>x<0),net=pnls.reduce((a,b)=>a+b,0);let equity=startingCapital,peak=equity,maxDD=0;for(const p of pnls){equity+=p;peak=Math.max(peak,equity);maxDD=Math.max(maxDD,(peak-equity)/peak*100);}const grossWin=wins.reduce((a,b)=>a+b,0),grossLoss=Math.abs(losses.reduce((a,b)=>a+b,0));const returns=pnls.map(p=>p/startingCapital);const avg=returns.length?returns.reduce((a,b)=>a+b,0)/returns.length:0;const sd=returns.length?Math.sqrt(returns.reduce((a,r)=>a+Math.pow(r-avg,2),0)/returns.length):0;return {trades:trades.length,wins:wins.length,losses:losses.length,winRate:trades.length?wins.length/trades.length*100:0,netProfit:net,endingCapital:startingCapital+net,returnPct:net/startingCapital*100,maxDrawdownPct:maxDD,profitFactor:grossLoss?grossWin/grossLoss:Infinity,avgWin:wins.length?grossWin/wins.length:0,avgLoss:losses.length?losses.reduce((a,b)=>a+b,0)/losses.length:0,expectancy:trades.length?net/trades.length:0,sharpe:sd?avg/sd*Math.sqrt(96*365):0,bestTrade:pnls.length?Math.max(...pnls):0,worstTrade:pnls.length?Math.min(...pnls):0};}
 
 const ONE_HOUR_MS=3600000, FOUR_HOUR_MS=14400000;
-
-function monteCarlo(pnls, startingCapital, samples=1000) {
-  const clean = pnls.map(Number).filter(Number.isFinite);
-  if (!clean.length || !(startingCapital > 0)) return { samples: 0, finalReturnP05: 0, finalReturnP50: 0, finalReturnP95: 0, maxDrawdownP50: 0 };
-  let seed = 0x12345678;
-  const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
-  const returns = [], dds = [];
-  const n = Math.max(100, Math.min(10000, Number(samples) || 1000));
-  for (let k=0;k<n;k++) {
-    let eq=startingCapital, peak=eq, maxDD=0;
-    for (let i=0;i<clean.length;i++) {
-      const pnl=clean[Math.floor(rand()*clean.length)]; eq += pnl; peak=Math.max(peak,eq); if(peak>0) maxDD=Math.max(maxDD,(peak-eq)/peak*100);
-    }
-    returns.push((eq-startingCapital)/startingCapital*100); dds.push(maxDD);
-  }
-  const q=(a,p)=>{const x=[...a].sort((a,b)=>a-b);return x[Math.min(x.length-1,Math.max(0,Math.floor((x.length-1)*p)))];};
-  return { samples:n, finalReturnP05:q(returns,.05), finalReturnP50:q(returns,.50), finalReturnP95:q(returns,.95), maxDrawdownP50:q(dds,.50), maxDrawdownP95:q(dds,.95) };
-}
 
 async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.env),useML=cfg.BACKTEST_USE_ML,walkForward=true,logger=console}={}){
   logger.log(`📥 Lade ${symbol} 15m-Daten für ${days} Tage...`);
@@ -397,8 +378,9 @@ async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.en
   }
   if(!bars||bars.length<cfg.BACKTEST_WARMUP_BARS+100)throw new Error(`Zu wenige 15m-Kerzen: ${bars?.length||0}`);
   const btcBars=btc&&btc.length?btc:bars;
-  // Phase A: Funding ist für einen validen Quant-Backtest Pflicht.
-  // Ein stiller 0-Fallback würde die Backtest-Ergebnisse verfälschen.
+  // Punkt 9: historische Funding-Raten für den gesamten Backtest-Zeitraum
+  // einmalig laden. Schlägt der Abruf fehl, fällt der Backtest auf 0
+  // (bisheriges Verhalten) zurück statt komplett abzubrechen.
   let fundingHistory=[];
   try{
     fundingHistory=await fetchHistoricalFunding(symbol,bars[0].time,bars.at(-1).time+ONE_HOUR_MS);
@@ -411,7 +393,6 @@ async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.en
   let lastWalkForwardTestBucket=null;
   const tf1h=aggregate(bars,4),tf4h=aggregate(bars,16),btc1h=aggregate(btcBars,4),btc4h=aggregate(btcBars,16);
   const warm=cfg.BACKTEST_WARMUP_BARS;
-  const oosStartTime = bars.at(-1).time - cfg.BACKTEST_OOS_DAYS * 86400000;
   for(let i=warm;i<bars.length-1;i++){
     const bar=bars[i];const day=new Date(bar.time).toISOString().slice(0,10);if(day!==lastDay){lastDay=day;dailyPnL=0;}
     const c15=bars.slice(0,i+1);
@@ -428,28 +409,25 @@ async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.en
     let accepted=true,prob=.5;
     if(useML&&walkForward){
       try{
-        // Final OOS window is strictly held out from all retraining.
-        if (bar.time < oosStartTime) {
-          const testBucket=Math.floor(bar.time/(cfg.BACKTEST_TEST_DAYS*86400000));
-          if(lastWalkForwardTestBucket===null || testBucket!==lastWalkForwardTestBucket){
-            lastWalkForwardTestBucket=testBucket;
-            const trainCutoff=bar.time;
-            const trainStart=trainCutoff-cfg.BACKTEST_TRAIN_DAYS*86400000;
-            const rollingTrainingRecords=trainingRecords.filter(r=>r.closeTime<trainCutoff && r.closeTime>=trainStart);
-            if(rollingTrainingRecords.length>=cfg.ML_MIN_TRAINING_SAMPLES){
-              if(await trainModelFromRecords(model,rollingTrainingRecords,cfg))mlRetrains++;
-            }
+        const testBucket=Math.floor(bar.time/(cfg.BACKTEST_TEST_DAYS*86400000));
+        if(lastWalkForwardTestBucket===null || testBucket!==lastWalkForwardTestBucket){
+          lastWalkForwardTestBucket=testBucket;
+          const trainCutoff=bar.time;
+          const purgeCutoff=trainCutoff-cfg.BACKTEST_PURGE_DAYS*86400000;
+          const trainStart=trainCutoff-cfg.BACKTEST_TRAIN_DAYS*86400000;
+          const rollingTrainingRecords=trainingRecords.filter(r=>r.closeTime<purgeCutoff && r.closeTime>=trainStart);
+          if(rollingTrainingRecords.length>=cfg.ML_MIN_TRAINING_SAMPLES){
+            if(await trainModelFromRecords(model,rollingTrainingRecords,cfg))mlRetrains++;
           }
         }
-        // During OOS the already-trained model is frozen; only inference is allowed.
         if(model.trained){
           const f=tradeFeatures(model,sig),pred=predictWith(model,f);
           prob=pred.probability;
           if(prob<cfg.ML_MIN_PREDICTION_PROBABILITY){accepted=false;mlBlocked++;}else mlAccepted++;
         }
       }catch(e){
-        logger.error?.(`[Backtest] ML-Schritt fehlgeschlagen bei Bar ${i}, fahre ohne ML-Filter fort: ${e.message}`);
-        prob=.5;
+        logger.error?.(`[Backtest] ML-Schritt fehlgeschlagen bei Bar ${i}: ${e.message}`);
+        accepted=false; mlBlocked++; prob=.5;
       }
     }
     if(!accepted)continue;
@@ -457,7 +435,7 @@ async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.en
     if(dailyPnL<=-cfg.MAX_DAILY_LOSS_USD)continue;
     const result=simulateSignal(sig,bars,nextIndex,cfg,fundingHistory);result.signal.mlProbability=prob;trades.push(result);dailyPnL+=result.pnlUSD;equity+=result.pnlUSD;trainingRecords.push(makeModelRecord(result.signal,result.pnlUSD,result.closeTime));i=result.closeIndex;
   }
-  const m=metrics(trades,cfg.BACKTEST_STARTING_CAPITAL);return {symbol,days,dataBars:bars.length,dataLimitations:['Historical KuCoin OHLCV only',`Historical funding rates applied (${fundingHistory.length} periods)`,'Historical orderbook imbalance is unavailable and assumed neutral','Intrabar ordering uses conservative stop-first when SL and TP occur in the same candle'],signals,rawCandidates,tradeCount:trades.length,mlAccepted,mlBlocked,mlRetrains,mlEnabled:useML,metrics:m,trades:trades.map(t=>({time:new Date(t.signal.entryTime||t.closeTime).toISOString(),direction:t.signal.direction,entry:t.entry,exit:t.exitPrice,pnlUSD:t.pnlUSD,reason:t.reason,mlProbability:t.signal.mlProbability||.5,signalScore:t.signal.signalScore}))};
+  const m=metrics(trades,cfg.BACKTEST_STARTING_CAPITAL);return {symbol,days,dataBars:bars.length,dataLimitations:['Historical KuCoin OHLCV only',fundingHistory.length?`Historical funding rates applied (${fundingHistory.length} periods)`:'Funding rate history unavailable, assumed 0','Historical orderbook imbalance is unavailable and assumed neutral','Intrabar ordering uses conservative stop-first when SL and TP occur in the same candle'],signals,rawCandidates,tradeCount:trades.length,mlAccepted,mlBlocked,mlRetrains,mlEnabled:useML,metrics:m,trades:trades.map(t=>({time:new Date(t.signal.entryTime||t.closeTime).toISOString(),direction:t.signal.direction,entry:t.entry,exit:t.exitPrice,pnlUSD:t.pnlUSD,reason:t.reason,mlProbability:t.signal.mlProbability||.5,signalScore:t.signal.signalScore}))};
 }
 
 async function optimizeHyperparameters(symbol, days, baseConfig) {

@@ -26,7 +26,7 @@ class DeepQTheTradingAgent {
     this.maxMemorySize = options.maxMemorySize || 10000;
     this.targetUpdateEvery = options.targetUpdateEvery || 100;
     this.trainingSteps = 0;
-    this.modelVersion = options.modelVersion || process.env.DQN_MODEL_VERSION || 'dqn-v22.3-rl2';
+    this.modelVersion = options.modelVersion || process.env.DQN_MODEL_VERSION || 'dqn-v22.3.1-rl2-dueling-fixed';
     this.model = null;
     this.targetModel = null;
     this.isInitialized = false;
@@ -47,8 +47,51 @@ class DeepQTheTradingAgent {
     const advantage = tf.layers.dense({ units: 32, activation: 'relu' }).apply(h2);
     const valueOut = tf.layers.dense({ units: 1, activation: 'linear' }).apply(value);
     const advOut = tf.layers.dense({ units: this.actionSize, activation: 'linear' }).apply(advantage);
-    const meanAdv = tf.layers.lambda({ function: x => tf.mean(x, 1, true) }).apply(advOut);
-    const q = tf.layers.add().apply([valueOut, tf.layers.subtract().apply([advOut, meanAdv])]);
+
+    // TensorFlow.js does not provide tf.layers.lambda().
+    // Center the advantage stream with fixed, non-trainable Dense layers:
+    // mean(A) = A * (1/actionSize)
+    // A_centered = A - mean(A)
+    // V is replicated across all actions and added to A_centered.
+    const meanKernel = tf.tensor2d(
+      Array.from({ length: this.actionSize }, () => 1 / this.actionSize),
+      [this.actionSize, 1]
+    );
+    const meanLayer = tf.layers.dense({
+      units: 1,
+      useBias: false,
+      trainable: false,
+      kernelInitializer: 'zeros'
+    }).apply(advOut);
+
+    // Set the fixed averaging kernel after layer creation.
+    meanLayer.setWeights([meanKernel]);
+    meanKernel.dispose();
+
+    const centeredAdv = tf.layers.subtract().apply([
+      advOut,
+      tf.layers.dense({
+        units: this.actionSize,
+        useBias: false,
+        trainable: false,
+        kernelInitializer: 'ones'
+      }).apply(meanLayer)
+    ]);
+
+    const valueKernel = tf.tensor2d(
+      Array.from({ length: this.actionSize }, () => 1),
+      [1, this.actionSize]
+    );
+    const valueRep = tf.layers.dense({
+      units: this.actionSize,
+      useBias: false,
+      trainable: false,
+      kernelInitializer: 'zeros'
+    }).apply(valueOut);
+    valueRep.setWeights([valueKernel]);
+    valueKernel.dispose();
+
+    const q = tf.layers.add().apply([valueRep, centeredAdv]);
     const model = tf.model({ inputs: input, outputs: q });
     model.compile({ optimizer: tf.train.adam(this.learningRate), loss: 'meanSquaredError' });
     return model;
@@ -60,10 +103,29 @@ class DeepQTheTradingAgent {
     try {
       const modelPath = path.join(this.modelDir, 'model.json');
       if (fs.existsSync(modelPath)) {
-        this.model = await tf.loadLayersModel(`file://${path.resolve(modelPath)}`);
-        this.model.compile({ optimizer: tf.train.adam(this.learningRate), loss: 'meanSquaredError' });
-        this.targetModel = this._createModel();
-        this.updateTargetModel();
+        try {
+          this.model = await tf.loadLayersModel(`file://${path.resolve(modelPath)}`);
+          this.model.compile({ optimizer: tf.train.adam(this.learningRate), loss: 'meanSquaredError' });
+          this.targetModel = this._createModel();
+          this.updateTargetModel();
+        } catch (loadError) {
+          // Models created with the old tf.layers.lambda implementation are
+          // incompatible with this TensorFlow.js runtime. Never crash the bot.
+          // Preserve the legacy model on disk and start a clean compatible model.
+          const legacyDir = `${this.modelDir}-legacy-${Date.now()}`;
+          try {
+            fs.renameSync(this.modelDir, legacyDir);
+            fs.mkdirSync(this.modelDir, { recursive: true });
+            this.logger.warn(`[RL-Engine] Altes/incompatibles DQN-Modell archiviert: ${legacyDir}`);
+          } catch (archiveError) {
+            this.logger.warn(`[RL-Engine] Legacy-Modell konnte nicht archiviert werden: ${archiveError.message}`);
+          }
+
+          this.logger.warn(`[RL-Engine] Gespeichertes Modell nicht kompatibel (${loadError.message}); starte neues kompatibles Dueling-DQN.`);
+          this.model = this._createModel();
+          this.targetModel = this._createModel();
+          this.updateTargetModel();
+        }
       } else {
         this.model = this._createModel();
         this.targetModel = this._createModel();
