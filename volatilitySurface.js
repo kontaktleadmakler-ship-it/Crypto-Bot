@@ -16,7 +16,15 @@ class VolatilitySurfaceManager {
    */
   async evaluateVolatilityMultiplier(symbol, currentAtr, currentPrice) {
     try {
-      if (!currentPrice || currentPrice === 0 || !currentAtr) return 1.0;
+      // Bugfix: previously returned a bare number here while every other
+      // branch returns { volFactor, atrPercent, marketStress }. Callers do
+      // `volEvaluation.volFactor` unconditionally (e.g. atrStopDistance =
+      // atr * adaptiveATR * volEvaluation.volFactor), so the bare-number
+      // shape silently produced NaN stop distances whenever price/ATR data
+      // was momentarily missing. Always return the full object shape.
+      if (!currentPrice || currentPrice === 0 || !currentAtr) {
+        return { volFactor: 1.0, atrPercent: 0, marketStress: 'UNKNOWN' };
+      }
 
       const atrPercent = (currentAtr / currentPrice) * 100;
 
