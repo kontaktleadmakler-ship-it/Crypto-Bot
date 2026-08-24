@@ -28,3 +28,11 @@
 
 ## Sicherheit
 Live-Order-Ausführung ist standardmäßig deaktiviert.
+
+
+## 22.2.1 Next Hardening
+- Added DataRecovery for stale/insufficient candle recovery.
+- Added market microstructure scoring and CVD alignment gate.
+- Added ModelRegistry and production metadata.
+- Added automatic drift baseline initialization.
+- Added Telegram data/model health commands.

@@ -153,3 +153,16 @@ npm test
 ```
 
 Vor dem produktiven Einsatz sollte zusätzlich ein vollständiger Backtest-Vergleich mit identischem Datensatz erfolgen, weil die Extraktion der Indikatoren absichtlich die bestehende Live-Berechnung als gemeinsame Referenz verwendet.
+
+
+## AI Agents + LLM
+The PRO build now includes four deterministic AI agents: market-regime, signal-critic, risk-sentinel and confluence. They form a gated ensemble before RiskEngine. An optional Gemini LLM review is available for high-score candidates; it is analysis-only and cannot bypass RiskEngine, Dry-Run or Kill-Switch. Configure via `AI_AGENTS_ENABLED`, `AI_AGENT_MIN_SCORE`, `AI_LLM_ENABLED`, `GEMINI_API_KEY`, `GEMINI_MODEL` and `AI_LLM_COOLDOWN_MS`.
+
+
+## Next Hardening Layer
+- Data recovery with retry/backoff and larger candle windows
+- Live CVD + market microstructure gate
+- Model registry with candidate/production metadata
+- Feature drift baseline/monitoring
+- Telegram: `/data_health`, `/model_registry`
+- Existing OOS, funding, fee and slippage-aware backtest remains the validation gate

@@ -44,3 +44,6 @@ Aktuelle Dokumentation (Stand 20.08.2026) wurde zur Implementierung geprüft. Di
 
 ## Tests
 `npm test` enthält die bestehenden Hardening-Tests und zusätzliche Pro-Feature-Tests. `npm run check` prüft die Syntax aller neuen und zentralen Module.
+
+## Validation + Execution Engine
+Validation gates model promotion using Profit Factor, Sharpe, Drawdown, OOS pass rate and robustness thresholds. Execution is fail-closed: DRY_RUN=true, EXECUTION_ENABLED=false and kill switch active by default. Orders require idempotent clientOrderId. Exchange adapters remain isolated behind the existing execution interface.

@@ -1,0 +1,10 @@
+'use strict';
+const assert = require('assert');
+const fs = require('fs');
+const source = fs.readFileSync(require.resolve('../rl-engine'), 'utf8');
+assert(source.includes('PrioritizedReplayBuffer'));
+assert(source.includes('Double-Dueling-DQN'));
+assert(source.includes("['HOLD','LONG','SHORT','REDUCE','EXIT']"));
+assert(source.includes('riskAdjustedReward'));
+assert(source.includes('shouldVetoCandidate'));
+console.log('RL2 static tests passed');

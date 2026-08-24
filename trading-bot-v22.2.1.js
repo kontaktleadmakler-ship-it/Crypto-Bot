@@ -26,6 +26,17 @@ const { buildFeatureSnapshot } = require('./feature-engine');
 const { KuCoinTradeStream } = require('./orderflow-stream');
 const { KuCoinFuturesExecution } = require('./execution-interface');
 const { KillSwitch } = require('./risk-controls');
+const { AIAgentOrchestrator } = require('./ai-agents');
+const { GeminiLLMEngine } = require('./llm-engine');
+const { DataFusion } = require('./data-fusion');
+const { SignalArbitrator } = require('./signal-arbitration');
+const { PortfolioRiskAgent } = require('./portfolio-risk-agent');
+const { WalkForwardEngine } = require('./walk-forward-engine');
+const { ModelDriftMonitor } = require('./model-drift-monitor');
+const { AgentAttribution } = require('./agent-attribution');
+const { DataRecovery } = require('./data-recovery');
+const { evaluateMicrostructure } = require('./market-microstructure');
+const { ModelRegistry } = require('./model-registry');
 
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
@@ -509,6 +520,12 @@ const config = {
   
   // DQN spezifische Config
   DQN_ENABLED: process.env.DQN_ENABLED !== 'false',
+  AI_AGENTS_ENABLED: process.env.AI_AGENTS_ENABLED !== 'false',
+  AI_AGENT_MIN_SCORE: parseFloat(process.env.AI_AGENT_MIN_SCORE) || 0.58,
+  AI_LLM_ENABLED: process.env.AI_LLM_ENABLED === 'true',
+  GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
+  GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-3.7-flash',
+  AI_LLM_COOLDOWN_MS: parseInt(process.env.AI_LLM_COOLDOWN_MS, 10) || 60000,
   BACKTEST_OOS_DAYS: parseInt(process.env.BACKTEST_OOS_DAYS, 10) || 7,
   MONTE_CARLO_SAMPLES: parseInt(process.env.MONTE_CARLO_SAMPLES, 10) || 1000,
   DATA_MAX_AGE_15M_MS: parseInt(process.env.DATA_MAX_AGE_15M_MS, 10) || 1200000,
@@ -553,7 +570,7 @@ function validateConfig() {
     'MONGODB_POOL_SIZE', 'DB_BULK_INTERVAL_MS', 'MAX_SPREAD_PERCENT', 'MAX_CHOP_INDEX',
     'MIN_HURST_EXPONENT', 'ML_MIN_TRAINING_SAMPLES', 'ML_MAX_TRAINING_SAMPLES',
     'ML_MIN_PREDICTION_PROBABILITY', 'ML_STRONG_SIGNAL_PROBABILITY', 'ML_RETRAIN_HOURS',
-    'ML_EPOCHS', 'ML_BATCH_SIZE', 'BACKTEST_OOS_DAYS', 'MONTE_CARLO_SAMPLES', 'DATA_MAX_AGE_15M_MS'
+    'ML_EPOCHS', 'ML_BATCH_SIZE', 'BACKTEST_OOS_DAYS', 'MONTE_CARLO_SAMPLES', 'DATA_MAX_AGE_15M_MS', 'AI_AGENT_MIN_SCORE', 'AI_LLM_COOLDOWN_MS'
   ];
   for (const key of numericFields) {
     if (typeof config[key] !== 'number' || Number.isNaN(config[key])) {
@@ -625,9 +642,10 @@ const mlModel = new TensorFlowSignalModel({
 });
 
 const dqnAgent = new DeepQTheTradingAgent({
-  modelDir: process.env.DQN_MODEL_DIR || './models/rl-dqn-model',
+  modelDir: process.env.DQN_MODEL_DIR || './models/rl-dqn-v2',
+  modelVersion: process.env.DQN_MODEL_VERSION || 'dqn-v22.3-rl2',
   stateSize: 16,
-  actionSize: 3,
+  actionSize: 5,
   logger
 });
 
@@ -641,9 +659,27 @@ const macroEngine = new MacroFilterEngine({ logger });
 const dataValidator = new DataValidator({ logger, maxAgeMs: config.DATA_MAX_AGE_15M_MS });
 const riskEngine = new RiskEngine(config, logger);
 const auditLogger = new AuditLogger({ logger });
+const aiAgents = new AIAgentOrchestrator({ logger });
+const dataFusion = new DataFusion({ logger, maxAgeMs: config.DATA_MAX_AGE_15M_MS });
+const signalArbitrator = new SignalArbitrator({ logger, minScore: config.AI_AGENT_MIN_SCORE });
+const portfolioRiskAgent = new PortfolioRiskAgent({ maxExposureRatio: config.MAX_EXPOSURE_RATIO, maxCorrelation: 0.85 });
+const walkForwardEngine = new WalkForwardEngine({ trainBars: Number(process.env.AI_WALK_FORWARD_TRAIN_BARS || 500), testBars: Number(process.env.AI_WALK_FORWARD_TEST_BARS || 150), stepBars: Number(process.env.AI_WALK_FORWARD_STEP_BARS || 150) });
+const modelDriftMonitor = new ModelDriftMonitor({ windowSize: Number(process.env.AI_DRIFT_WINDOW || 200), threshold: Number(process.env.AI_DRIFT_THRESHOLD || 0.35) });
+const agentAttribution = new AgentAttribution({ maxRecords: Number(process.env.AI_ATTRIBUTION_MAX_RECORDS || 5000) });
+const dataRecovery = new DataRecovery({ fetcher: fetchKucoinKlinesCached, logger, retries: Number(process.env.DATA_RECOVERY_RETRIES || 3), backoffMs: Number(process.env.DATA_RECOVERY_BACKOFF_MS || 500), limits: String(process.env.DATA_RECOVERY_LIMITS || '100,200,300').split(',').map(Number).filter(Number.isFinite) });
+const modelRegistry = new ModelRegistry({ dir: process.env.MODEL_REGISTRY_DIR || './models/registry', logger });
+let latestDataHealth = { valid: false, reason: 'not-scanned' };
+const llmEngine = new GeminiLLMEngine({
+  apiKey: config.GEMINI_API_KEY,
+  model: config.GEMINI_MODEL,
+  enabled: config.AI_LLM_ENABLED,
+  cooldownMs: config.AI_LLM_COOLDOWN_MS,
+  logger
+});
 
 let isModelTrained = false;
 let lastMLTrainingStats = null;
+try { if (!modelRegistry.latest()) modelRegistry.register({ modelId: 'v22.2.1-baseline', modelType: 'tfjs-dqn', status: 'candidate' }); } catch (e) { logger.warn(`[MODEL-REGISTRY] init failed: ${e.message}`); }
 
 function buildMLFeatures(data) {
   return mlModel.buildFeatures(data);
@@ -2429,10 +2465,13 @@ async function scanMarket() {
     }
 
     const btcTrend = await getBitcoinTrend();
-    const btcKlines = await fetchKucoinKlinesCached('BTC-USDT', '15m', 100);
-    const btcDataCheck = dataValidator.candles(btcKlines, { timeframeMs: 15 * 60 * 1000, minLength: 20 });
+    const btcRecovered = await dataRecovery.get('BTC-USDT', '15m', Math.max(100, config.KLINES_SCAN_LIMIT));
+    const btcKlines = btcRecovered.rows;
+    const btcDataCheck = btcKlines ? dataValidator.candles(btcKlines, { timeframeMs: 15 * 60 * 1000, minLength: 20, maxAgeMs: config.DATA_MAX_AGE_15M_MS, allowGaps: true, maxGapFactor: config.DATA_MAX_GAP_FACTOR_15M, maxGapRatio: config.DATA_MAX_GAP_RATIO_15M }) : { valid: false, reason: btcRecovered.reason || 'missing-data' };
+    latestDataHealth = { symbol: 'BTC-USDT', timeframe: '15m', valid: btcDataCheck.valid, reason: btcDataCheck.reason || null, candles: btcKlines?.length || 0, recovered: !!btcRecovered.recovered, attempts: btcRecovered.attempts || 1, latestAgeMs: btcDataCheck.latestAgeMs || null, gapCount: btcDataCheck.warnings?.[0]?.gapCount || 0 };
     if (!btcDataCheck.valid) {
-      throw new Error(`[DATA-QUALITY] BTC-USDT/15m ungültig: ${btcDataCheck.reason}`);
+      logger.warn(`[DATA-QUALITY] BTC-USDT/15m Scan übersprungen: ${btcDataCheck.reason} | recovery attempts=${btcRecovered.attempts || 1}`);
+      return;
     }
     const btcADX = calculateADX(btcKlines, 14);
     const btcATR = calculateATR(btcKlines, 14);
@@ -2533,7 +2572,8 @@ async function scanMarket() {
       }
 
       try {
-        const raw15m = await fetchKucoinKlinesCached(symbol, '15m', 100);
+        const recovered15m = await dataRecovery.get(symbol, '15m', Math.max(100, config.KLINES_SCAN_LIMIT));
+        const raw15m = recovered15m.rows;
         const dataCheck = raw15m ? dataValidator.candles(raw15m, {
           timeframeMs: 15 * 60 * 1000,
           minLength: 20,
@@ -2541,7 +2581,7 @@ async function scanMarket() {
           allowGaps: true,
           maxGapFactor: config.DATA_MAX_GAP_FACTOR_15M,
           maxGapRatio: config.DATA_MAX_GAP_RATIO_15M
-        }) : { valid: false, reason: 'missing-data' };
+        }) : { valid: false, reason: recovered15m.reason || 'missing-data' };
         if (!dataCheck.valid) {
           scanStats.missingKlines++;
           logger.warn(`⚠️ [DATA-QUALITY] ${symbol}/15m verworfen: ${dataCheck.reason}`);
@@ -2598,6 +2638,7 @@ async function scanMarket() {
         }
         if (config.CVD_ENABLED && cvdStreams.has(symbol)) cvdTrades = cvdStreams.get(symbol).drainTrades();
 
+        const microstructureNeutral = evaluateMicrostructure({ orderBook: orderBookMetrics, trades: cvdTrades, direction: null, spreadLimitPct: config.MAX_SPREAD_PERCENT });
         const closes4h = raw4h ? raw4h.map(c => c.close) : [];
         const closes1h = raw1h.map(c => c.close);
         const closes15m = raw15m.map(c => c.close);
@@ -2707,8 +2748,13 @@ async function scanMarket() {
             marketPhase: currentMarketPhase,
             orderBookImbalance: orderBookMetrics.bidAskRatio,
             spreadPct: orderBookMetrics.spreadPct,
-            volatilityRatio: btcATR > 0 ? atr / btcATR : 1
+            volatilityRatio: btcATR > 0 ? atr / btcATR : 1,
+            cvdDelta: microstructureNeutral.cvd.delta,
+            cvdImbalance: microstructureNeutral.cvd.imbalance,
+            microstructureScore: microstructureNeutral.score
           });
+          const driftStatus = modelDriftMonitor.observe(mlFeatures);
+          if (driftStatus.drift) logger.warn(`[MODEL-DRIFT] ${symbol}: score=${driftStatus.score.toFixed(3)} reason=${driftStatus.reason}`);
 
           const mlPrediction = predictSignalSuccess(mlFeatures);
           if (mlPrediction.trained && mlPrediction.probability < config.ML_MIN_PREDICTION_PROBABILITY) {
@@ -2719,6 +2765,7 @@ async function scanMarket() {
           // ==========================================
           // 🧠 DQN AGENT VETO-GATE (AKTIVIERT)
           // ==========================================
+          let dqnActionForAI = null;
           if (config.DQN_ENABLED && dqnAgent.isInitialized) {
             const dqnState = buildDQNStateVector({
               adx, rsi, hurst, relativeVolume, signalScore, direction,
@@ -2728,14 +2775,61 @@ async function scanMarket() {
               mlProbability: mlPrediction.probability,
               confluenceScore: signalScore
             });
-            const dqnAction = dqnAgent.act(dqnState);
+            dqnActionForAI = dqnAgent.act(dqnState);
 
             // Wenn Action = 0 (Veto/Ablehnen) und außerhalb der Exploration (Epsilon)
-            if (dqnAction === 0 && Math.random() >= dqnAgent.epsilon) {
+            if (dqnAgent.shouldVetoCandidate(dqnActionForAI, direction) && Math.random() >= dqnAgent.epsilon) {
               scanStats.dqnBlocked++;
               logger.info(`[DQN-VETO] Trade für ${symbol} (${direction}) vom DQN-Agenten blockiert.`);
               return;
             }
+          }
+
+          // ==========================================
+          // 🤖 AI AGENT ENSEMBLE + LLM REVIEW
+          // ==========================================
+          if (config.AI_AGENTS_ENABLED) {
+            const directionMicrostructure = evaluateMicrostructure({ orderBook: orderBookMetrics, trades: cvdTrades, direction, spreadLimitPct: config.MAX_SPREAD_PERCENT });
+          if (directionMicrostructure.veto) {
+            scanStats.orderBookBlocked++;
+            await auditLogger.write('SIGNAL_BLOCKED_MICROSTRUCTURE', { symbol, direction, spreadPct: directionMicrostructure.spreadPct, cvdImbalance: directionMicrostructure.cvd.imbalance });
+            return;
+          }
+          const aiDecision = aiAgents.evaluate({
+              symbol, direction, marketPhase: currentMarketPhase, signalScore,
+              mlProbability: mlPrediction.probability, confluenceScore: advancedFeatures.confluence.score,
+              ichimokuScore: advancedFeatures.ichimokuScore, volumeMACDScore: advancedFeatures.volumeMACDScore,
+              cvdScore: advancedFeatures.cvdScore, trend1h, trend4h, adx, atrPct, rsi, spreadPct: orderBookMetrics.spreadPct,
+              microstructureScore: directionMicrostructure.score, cvdImbalance: directionMicrostructure.cvd.imbalance,
+              dailyPnL: dailyNetPnL, maxDailyLossUSD: config.MAX_DAILY_LOSS_USD, exposureRatio: config.MAX_EXPOSURE_RATIO
+            });
+            const portfolioDecision = portfolioRiskAgent.evaluate({ exposureRatio: config.MAX_EXPOSURE_RATIO, correlationRisk: 0, sameDirection: 0, maxSameDirection: config.MAX_SAME_DIRECTION });
+            const arbitrationPre = signalArbitrator.decide({ agentDecision: aiDecision, dqnAction: dqnActionForAI, riskApproved: portfolioDecision.approved, dataQuality: 1 });
+            if (!arbitrationPre.approved) {
+              scanStats.aiAgentBlocked = (scanStats.aiAgentBlocked || 0) + 1;
+              await auditLogger.write('SIGNAL_BLOCKED_AI_ARBITRATION', { symbol, direction, score: aiDecision.score, confidence: aiDecision.confidence, reasons: arbitrationPre.reasons });
+              agentAttribution.record({ symbol, decision: aiDecision });
+              return;
+            }
+
+            if (llmEngine.isAvailable() && signalScore >= 75) {
+              const llmDecision = await llmEngine.analyzeSignal({
+                symbol, direction, marketPhase: currentMarketPhase, signalScore,
+                mlProbability: mlPrediction.probability, dqnAction: dqnActionForAI,
+                confluenceScore: advancedFeatures.confluence.score, ichimokuScore: advancedFeatures.ichimokuScore,
+                volumeMACDScore: advancedFeatures.volumeMACDScore, cvdScore: advancedFeatures.cvdScore,
+                trend1h, trend4h, adx, rsi, atrPct, spreadPct: orderBookMetrics.spreadPct, fundingRate
+              });
+              const arbitrationFinal = signalArbitrator.decide({ agentDecision: aiDecision, dqnAction: dqnActionForAI, riskApproved: portfolioDecision.approved, dataQuality: 1, llmDecision });
+              if (!arbitrationFinal.approved) {
+                scanStats.llmBlocked = (scanStats.llmBlocked || 0) + 1;
+                await auditLogger.write('SIGNAL_BLOCKED_LLM', { symbol, direction, risk: llmDecision.risk, confidence: llmDecision.confidence, reasons: arbitrationFinal.reasons });
+                agentAttribution.record({ symbol, decision: aiDecision });
+                return;
+              }
+            }
+
+            logger.info(`[AI-AGENTS] ${symbol} ${direction} approved score=${aiDecision.score.toFixed(2)} confidence=${aiDecision.confidence.toFixed(2)}`);
           }
 
           if (shouldSkipSignal(symbol, direction, signalScore)) {
@@ -2955,6 +3049,148 @@ async function handleTelegramCommand(chatId, text) {
   const parts = text.trim().split(/\s+/);
   const command = parts[0].toLowerCase();
   const args = parts.slice(1);
+
+  // ==========================================
+  // 🤖 AI / AGENT CONTROL CENTER
+  // ==========================================
+  const agentAlias = (name) => {
+    const raw = String(name || '').toLowerCase().replace(/_/g, '-');
+    const aliases = {
+      regime:'market-regime-agent', market:'market-regime-agent',
+      critic:'signal-critic-agent', signal:'signal-critic-agent',
+      risk:'risk-sentinel-agent', sentinel:'risk-sentinel-agent',
+      confluence:'confluence-agent', macro:'news-macro-agent', news:'news-macro-agent',
+      liquidity:'liquidity-agent', volume:'liquidity-agent', volatility:'volatility-agent',
+      anomaly:'anomaly-agent', portfolio:'portfolio-agent', execution:'execution-agent'
+    };
+    return aliases[raw] || raw;
+  };
+
+  if (command === '/commands' || command === '/aicommands') {
+    await sendTelegramReply(chatId,
+      `<b>🤖 AI CONTROL CENTER</b>\n━━━━━━━━━━━━━━━━━━\n` +
+      `<b>Agents</b>\n/agents /agents_status /agent &lt;name&gt;\n/agent_on &lt;name&gt; /agent_off &lt;name&gt;\n/agents_on /agents_off /agent_weights\n` +
+      `<b>LLM</b>\n/llm /llm_status /llm_on /llm_off /llm_test\n` +
+      `<b>Analyse</b>\n/signals /signal &lt;symbol&gt; /explain &lt;symbol&gt;\n/confluence &lt;symbol&gt; /risk /regime /anomalies\n` +
+      `<b>Monitoring</b>\n/status /scan /scanstats /stats /week /month /ai_hardening /drift /agent_attribution\n` +
+      `<b>Safety</b>\n/pause /resume /kill_status\n\n<i>AI/LLM kann niemals RiskEngine oder Kill-Switch umgehen.</i>`);
+    return;
+  }
+
+  if (command === '/agents' || command === '/agents_status') {
+    const rows = aiAgents.listAgents();
+    const enabledCount = rows.filter(x => x.enabled).length;
+    const text = rows.map(x => `${x.enabled ? '🟢' : '⚪'} <code>${x.name}</code> | w=${x.weight.toFixed(2)}`).join('\n');
+    await sendTelegramReply(chatId, `<b>🤖 AGENTS ${enabledCount}/${rows.length} AKTIV</b>\n━━━━━━━━━━━━━━━━━━\n${text}\n\nOrchestrator: ${config.AI_AGENTS_ENABLED ? '🟢 ON' : '🔴 OFF'}`);
+    return;
+  }
+
+  if (command === '/agent') {
+    const name = agentAlias(args[0]);
+    const row = aiAgents.listAgents().find(x => x.name === name);
+    if (!row) { await sendTelegramReply(chatId, '⚠️ Agent nicht gefunden. Nutze /agents.'); return; }
+    await sendTelegramReply(chatId, `🤖 <b>${escapeHtml(row.name)}</b>\nStatus: ${row.enabled ? '🟢 aktiv' : '⚪ aus'}\nGewicht: <b>${row.weight.toFixed(2)}</b>`);
+    return;
+  }
+
+  if (command === '/agent_on' || command === '/agent_off') {
+    const name = agentAlias(args[0]);
+    const enabled = command === '/agent_on';
+    if (!aiAgents.setAgent(name, enabled)) { await sendTelegramReply(chatId, '⚠️ Agent nicht gefunden. Nutze /agents.'); return; }
+    await sendTelegramReply(chatId, `${enabled ? '🟢' : '⚪'} Agent <code>${escapeHtml(name)}</code> ${enabled ? 'aktiviert' : 'deaktiviert'}.`);
+    return;
+  }
+
+  if (command === '/agents_on' || command === '/agents_off') {
+    const enabled = command === '/agents_on';
+    aiAgents.setAll(enabled);
+    await sendTelegramReply(chatId, `${enabled ? '🟢' : '⚪'} Alle AI-Agents ${enabled ? 'aktiviert' : 'deaktiviert'}.`);
+    return;
+  }
+
+  if (command === '/agent_weights') {
+    const weights = aiAgents.getWeights();
+    await sendTelegramReply(chatId, `<b>⚖️ AGENT WEIGHTS</b>\n━━━━━━━━━━━━━━━━━━\n${Object.entries(weights).map(([k,v]) => `• ${k}: <b>${Number(v).toFixed(2)}</b>`).join('\n')}`);
+    return;
+  }
+
+  if (command === '/llm' || command === '/llm_status') {
+    const st = llmEngine.status();
+    await sendTelegramReply(chatId, `<b>🧠 LLM STATUS</b>\nStatus: ${st.available ? '🟢 verfügbar' : (st.enabled ? '🟡 aktiviert, aber nicht verfügbar' : '⚪ deaktiviert')}\nModel: <code>${escapeHtml(st.model)}</code>\nCooldown: ${Math.round(st.cooldownMs/1000)}s`);
+    return;
+  }
+
+  if (command === '/llm_on') {
+    if (!config.GEMINI_API_KEY) { await sendTelegramReply(chatId, '⚠️ GEMINI_API_KEY fehlt. LLM bleibt deaktiviert.'); return; }
+    llmEngine.enable(config.GEMINI_API_KEY); config.AI_LLM_ENABLED = true;
+    await sendTelegramReply(chatId, '🟢 <b>LLM Reviewer aktiviert.</b> Er darf nur Signale prüfen und niemals RiskEngine/Kill-Switch umgehen.');
+    return;
+  }
+
+  if (command === '/llm_off') {
+    llmEngine.disable(); config.AI_LLM_ENABLED = false;
+    await sendTelegramReply(chatId, '⚪ <b>LLM Reviewer deaktiviert.</b>');
+    return;
+  }
+
+  if (command === '/llm_test') {
+    const st = llmEngine.status();
+    if (!st.available) { await sendTelegramReply(chatId, '⚠️ LLM ist nicht verfügbar. Nutze /llm_status.'); return; }
+    const result = await llmEngine.analyzeSignal({ symbol:'TEST-USDT', direction:'LONG', marketPhase:currentMarketPhase, signalScore:80, mlProbability:0.72, dqnAction:1, confluenceScore:75, ichimokuScore:70, volumeMACDScore:68, cvdScore:65, trend1h:'BULLISH', trend4h:'BULLISH', adx:25, rsi:55, atrPct:1.5, spreadPct:0.05, fundingRate:0 });
+    await sendTelegramReply(chatId, `🧠 <b>LLM TEST</b>\nResult: ${result.approved ? '✅ APPROVED' : '❌ REJECTED'}\nConfidence: ${(result.confidence*100).toFixed(0)}%\nRisk: ${escapeHtml(result.risk || 'N/A')}\n${(result.reasons||[]).map(x => `• ${escapeHtml(x)}`).join('\n')}`);
+    return;
+  }
+
+  if (command === '/ai_hardening' || command === '/ai_architecture') {
+    const drift = modelDriftMonitor.status();
+    const wf = walkForwardEngine.windows(1000).length;
+    const attr = agentAttribution.summary().slice(0,5).map(x => `${x.agent}: avg=${x.avgScore.toFixed(2)} pnl=${x.avgPnl.toFixed(2)}`).join('\n') || 'noch keine Attribution-Daten';
+    await sendTelegramReply(chatId, `<b>🧠 AI HARDENING</b>\nDataFusion: 🟢\nArbitration: 🟢\nPortfolio Risk: 🟢\nWalk-Forward-Fenster (1000 Bars): ${wf}\nDrift: ${drift.drift ? '🔴 DRIFT' : '🟢 STABLE'} (${drift.score.toFixed(2)})\n\n<b>Agent Attribution</b>\n${escapeHtml(attr)}`);
+    return;
+  }
+
+  if (command === '/drift' || command === '/model_drift') {
+    const st = modelDriftMonitor.status();
+    await sendTelegramReply(chatId, `<b>📉 MODEL DRIFT</b>\nStatus: ${st.drift ? '🔴 DRIFT' : '🟢 STABLE'}\nScore: <b>${Number(st.score).toFixed(3)}</b>\nReason: ${escapeHtml(st.reason)}`);
+    return;
+  }
+
+  if (command === '/agent_attribution' || command === '/agent_stats') {
+    const rows = agentAttribution.summary();
+    await sendTelegramReply(chatId, `<b>📊 AGENT ATTRIBUTION</b>\n${rows.length ? rows.map(x => `• ${x.agent}: n=${x.count}, avg=${x.avgScore.toFixed(2)}, veto=${x.vetoes}, avgPnL=${x.avgPnl.toFixed(2)}`).join('\n') : 'Noch keine Daten.'}`);
+    return;
+  }
+
+  if (command === '/kill_status') {
+    const st = killSwitch.status();
+    await sendTelegramReply(chatId, `🛡️ <b>KILL-SWITCH STATUS</b>\n${st.active ? '🔴 ACTIVE / FAIL-CLOSED' : '🟢 not active'}\nReason: <code>${escapeHtml(st.reason)}</code>`);
+    return;
+  }
+
+  if (command === '/signals' || command === '/top_signals' || command === '/anomalies' || command === '/regime') {
+    const phase = currentMarketPhase || 'UNKNOWN';
+    await sendTelegramReply(chatId, `📊 <b>MARKET AI SNAPSHOT</b>\nPhase: <b>${escapeHtml(phase)}</b>\nLetzter Scan: ${lastScanTime ? new Date(lastScanTime).toISOString() : 'noch keiner'}\n\nNutze /scanstats für den vollständigen Scan-Report.`);
+    return;
+  }
+
+  if (command === '/risk') {
+    const equity = config.CAPITAL_USD + dailyNetPnL;
+    const dd = peakCapital > 0 ? ((peakCapital - equity) / peakCapital * 100) : 0;
+    await sendTelegramReply(chatId, `🛡️ <b>RISK SNAPSHOT</b>\nExposure: ${((config.MAX_EXPOSURE_RATIO||0)*100).toFixed(1)}% max\nRisk/Trade: ${config.RISK_PERCENT}%\nDaily PnL: $${dailyNetPnL.toFixed(2)}\nDrawdown: ${dd.toFixed(2)}%\nTrades: ${activeTrades.size}/${config.MAX_CONCURRENT_TRADES}`);
+    return;
+  }
+
+  if (command === '/explain') {
+    const symbol = args[0] ? (args[0].toUpperCase().endsWith('-USDT') ? args[0].toUpperCase() : `${args[0].toUpperCase()}-USDT`) : null;
+    if (!symbol) { await sendTelegramReply(chatId, '⚠️ Syntax: <code>/explain BTC-USDT</code>'); return; }
+    await sendTelegramReply(chatId, `🧠 <b>Explain ${escapeHtml(symbol)}</b>\nDie detaillierte Erklärung wird beim nächsten Kandidaten-Scan aus den Agent-, ML-, DQN- und LLM-Ergebnissen erzeugt.\n\nNutze /scan für einen aktuellen Scan.`);
+    return;
+  }
+
+  if (command === '/confluence') {
+    await sendTelegramReply(chatId, '🔗 Confluence wird pro Signal im Agent-Report bewertet. Nutze /scan und anschließend /scanstats.');
+    return;
+  }
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,

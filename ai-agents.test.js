@@ -1,0 +1,13 @@
+'use strict';
+const assert = require('assert');
+const { AIAgentOrchestrator } = require('./ai-agents');
+const a = new AIAgentOrchestrator({ logger: { warn() {} } });
+assert.strictEqual(a.listAgents().length, 10);
+assert.ok(a.listAgents().every(x => x.enabled));
+assert.strictEqual(a.setAgent('liquidity-agent', false), true);
+assert.strictEqual(a.listAgents().find(x => x.name === 'liquidity-agent').enabled, false);
+a.setAll(true);
+const d = a.evaluate({ direction:'LONG', marketPhase:'TRENDING', signalScore:80, mlProbability:0.75, confluenceScore:80, ichimokuScore:75, volumeMACDScore:70, cvdScore:65, trend1h:'BULLISH', trend4h:'BULLISH', adx:30, atrPct:1.2, spreadPct:0.03, dailyPnL:0, maxDailyLossUSD:250, exposureRatio:0.2 });
+assert.ok(Number.isFinite(d.score));
+assert.strictEqual(d.results.length, 10);
+console.log('✅ Multi-agent tests passed');

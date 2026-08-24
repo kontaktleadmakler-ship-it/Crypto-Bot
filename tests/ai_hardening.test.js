@@ -1,0 +1,17 @@
+'use strict';
+const assert=require('assert');
+const {DataFusion}=require('../data-fusion');
+const {SignalArbitrator}=require('../signal-arbitration');
+const {PortfolioRiskAgent}=require('../portfolio-risk-agent');
+const {WalkForwardEngine}=require('../walk-forward-engine');
+const {ModelDriftMonitor}=require('../model-drift-monitor');
+const {AgentAttribution}=require('../agent-attribution');
+const now=Date.now();
+const candles=Array.from({length:30},(_,i)=>({time:(now-30*60000+i*60000)/1000,open:100,high:101,low:99,close:100,volume:10}));
+const fusion=new DataFusion({maxAgeMs:120000}); assert.equal(fusion.candles(candles,{timeframeMs:60000}).valid,true);
+const arb=new SignalArbitrator(); assert.equal(arb.decide({agentDecision:{score:.8,veto:false},riskApproved:true,dataQuality:1}).approved,true); assert.equal(arb.decide({agentDecision:{score:.8,veto:true},riskApproved:true,dataQuality:1}).approved,false);
+assert.equal(new PortfolioRiskAgent({maxExposureRatio:.6}).evaluate({exposureRatio:.7}).veto,true);
+assert.equal(new WalkForwardEngine({trainBars:10,testBars:5,stepBars:5}).windows(25).length,3);
+const drift=new ModelDriftMonitor({windowSize:30,threshold:.1}); drift.setBaseline([{x:1},{x:1},{x:1}]); for(let i=0;i<30;i++)drift.observe([{x:3}]); assert.equal(drift.status().drift,true);
+const attr=new AgentAttribution(); attr.record({symbol:'BTC-USDT',decision:{results:[{agent:'risk',score:.8,veto:false}]},outcome:{pnl:10}}); assert.equal(attr.summary()[0].agent,'risk');
+console.log('AI hardening tests passed');
