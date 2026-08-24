@@ -1,16 +1,17 @@
 {
   "name": "trading-bot-v24.6-institutional-edition",
-  "version": "24.6.0",
+  "version": "24.7.0-agent-suite",
   "private": true,
   "description": "Signal/Paper/Shadow institutional trading platform - B13-B16",
   "scripts": {
     "test:b13": "node tests/b13.test.js",
-    "test": "node tests/b13.test.js && node tests/b10.test.js && node tests/b11.test.js && node institutional-self-test.js && node tests/v24.6-hotfix.test.js",
+    "test": "node tests/b13.test.js && node tests/b10.test.js && node tests/b11.test.js && node institutional-self-test.js && node tests/v24.6-hotfix.test.js && node tests/dqn-hotfix-source.test.js && node tests/agent-suite.test.js",
     "test:b10": "node tests/b10.test.js",
     "test:b11": "node tests/b11.test.js",
     "test:v24": "node institutional-self-test.js",
     "start": "node trading-bot-v24.6.js",
-    "check": "node --check trading-bot-v24.6-runtime.js && node --check rl-engine.js && node --check trading-bot-v21.1-tfjs.js && node --check trading-bot-v24.6.js"
+    "check": "node --check trading-bot-v24.6-runtime.js && node --check rl-engine.js && node --check trading-bot-v21.1-tfjs.js && node --check trading-bot-v24.6.js",
+    "test:dqn-hotfix": "node tests/dqn-hotfix-source.test.js"
   },
   "engines": {
     "node": ">=18"

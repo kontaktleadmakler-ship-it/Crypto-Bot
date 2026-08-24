@@ -1,3 +1,3 @@
 'use strict';
-// Compatibility wrapper for existing Render deployments.
-require('./trading-bot-v24.6-runtime.js');
+// Render compatibility entrypoint. Delegates to v24.6 Institutional runtime.
+require('./trading-bot-v24.6-runtime');

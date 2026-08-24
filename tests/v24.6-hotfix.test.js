@@ -6,7 +6,7 @@ const runtime = fs.readFileSync(require('path').join(__dirname, '..', 'trading-b
 const rl = fs.readFileSync(require('path').join(__dirname, '..', 'rl-engine.js'), 'utf8');
 const pkg = require('../package.json');
 
-assert.ok(runtime.includes("version: '24.6.0'"), 'v24 status endpoint missing');
+assert.ok(runtime.includes("version: '24.7.0-agent-suite'"), 'v24.7 status endpoint missing');
 assert.ok(runtime.includes("const normalizedText = String(text || '').trim();"), 'Telegram normalization missing');
 assert.ok(runtime.includes("/pause | /resume | /scan | /backtest [Symbol] [Days]\n` +"), 'Telegram help concatenation not fixed');
 assert.ok(!runtime.includes("/backtest [Symbol] [Days]`\n      `"), 'Telegram help still contains tagged-template bug');

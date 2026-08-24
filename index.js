@@ -11,5 +11,6 @@ module.exports={
   ...require('./binance-testnet-adapter'),
   ...require('./observability-suite'),
   ...require('./institutional-reporting'),
-  ...require('./shadow-analyzer')
+  ...require('./shadow-analyzer'),
+  ...require('./agent-suite')
 };

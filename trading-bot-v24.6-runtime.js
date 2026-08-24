@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - ULTIMATE v21.7 DYNAMIC VOLATILITY SURFACE & DQN EDITION
+ * TRADING SIGNAL BOT - v24.6 INSTITUTIONAL EDITION
  * (Mit adaptivem TensorFlow.js ML, Deep Q-Network Agent, globaler Telegram-Queue,
  *  State-Persistenz, Hurst-Exponent, Marktphasen-Logging & Dynamic Filter Control)
  * ============================================================================
@@ -29,6 +29,7 @@ const { RiskEngine } = require('./risk-engine');
 const { splitWalkForward } = require('./walk-forward-validator');
 const { evaluateProbabilities } = require('./ml-evaluation');
 const { evaluateActions } = require('./dqn-evaluation');
+const { InstitutionalAgentSuite } = require('./agent-suite');
 
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
@@ -624,6 +625,9 @@ const hedgeManager = new HedgeManager({ logger, thresholdDropPct: -2.5 });
 const volManager = new VolatilitySurfaceManager({ logger });
 const orderFlowManager = new OrderFlowAnalyzer({ logger });
 const macroEngine = new MacroFilterEngine({ logger });
+
+// Institutional AI Agent Suite: advisory/evaluation only. Hard risk controls remain authoritative.
+const agentSuite = new InstitutionalAgentSuite();
 
 let isModelTrained = false;
 let lastMLTrainingStats = null;
@@ -1865,7 +1869,7 @@ async function checkRiskLevels() {
 }
 
 function formatScanStatsReport(stats) {
-  const lines = [`🔎 <b>SCAN-DIAGNOSE v21.7 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
+  const lines = [`🔎 <b>SCAN-DIAGNOSE v24.6 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
   lines.push(`Coins geprüft: ${stats.total} | Signale gesendet: ${stats.signalsSent}`);
   if (stats.avgSignalScore !== undefined) lines.push(`Ø Signal-Score: ${stats.avgSignalScore}/100`);
   lines.push(`Marktphase: ${currentMarketPhase}\n`);
@@ -2409,7 +2413,7 @@ async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v21.7 (mit DQN)...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v24.6 (mit DQN)...`);
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
@@ -2692,6 +2696,32 @@ async function scanMarket() {
           const mlPrediction = predictSignalSuccess(mlFeatures);
           if (mlPrediction.trained && mlPrediction.probability < config.ML_MIN_PREDICTION_PROBABILITY) {
             scanStats.mlBlocked++;
+            return;
+          }
+
+          // ==========================================
+          // 🧠 INSTITUTIONAL AGENT SUITE
+          // ==========================================
+          const agentEvaluation = agentSuite.evaluate({
+            symbol, direction,
+            spreadPct: orderBookMetrics.spreadPct,
+            depthUSD: Number(orderBookMetrics.depthUSD || futuresData?.volume24h || 0),
+            orderSizeUSD: Number(currentPrice || 0) * 0.001,
+            apiLatencyMs: apiLatencyStats.getAverage('kucoin'),
+            candleDelayMs: Math.max(0, Date.now() - new Date(raw15m?.[raw15m.length - 1]?.time || Date.now()).getTime()),
+            exposurePct: Number(config.MAX_EXPOSURE_PERCENT || config.MAX_TOTAL_EXPOSURE_PERCENT || 100),
+            maxExposurePct: Number(config.MAX_EXPOSURE_PERCENT || config.MAX_TOTAL_EXPOSURE_PERCENT || 100),
+            drawdownPct: Math.max(0, peakCapital > 0 ? ((peakCapital - (config.CAPITAL_USD + dailyNetPnL)) / peakCapital) * 100 : 0),
+            maxDrawdownPct: MAX_DRAWDOWN_PERCENT,
+            dailyLossPct: Math.max(0, -(dailyNetPnL / Math.max(config.CAPITAL_USD, 1)) * 100),
+            maxDailyLossPct: Number(config.MAX_DAILY_LOSS_PERCENT || 100),
+            killSwitch: false, circuitBreaker: Date.now() < kucoinCircuitOpenUntil,
+            regime: { confidence: currentMarketPhase === 'RANGING' || currentMarketPhase === 'TRENDING' ? 0.75 : 0.5 },
+            oosScore: 0.75, driftScore: 0.10
+          });
+          if (agentEvaluation.meta.hardBlock) {
+            scanStats.agentBlocked = (scanStats.agentBlocked || 0) + 1;
+            logger.warn(`[AGENT-SUPERVISOR] Signal für ${symbol} (${direction}) blockiert: ${agentEvaluation.meta.decision}`);
             return;
           }
 
@@ -3634,7 +3664,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v21.7 ULTIMATE DQN</b>`);
+    lines.push(`🤖 <b>BOT STATUS v24.6 INSTITUTIONAL EDITION</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
@@ -3794,11 +3824,12 @@ app.get('/', (req, res) => {
 
 app.get('/api/v24/status', (req, res) => {
   res.json({
-    version: '24.6.0',
+    version: '24.7.0-agent-suite',
     mode: 'SIGNAL_PAPER_SHADOW',
     liveOrderExecution: false,
     execution: { enabled: false, paperOnly: true, shadowEnabled: true },
     dqn: dqnAgent.getStats(),
+    agents: { enabled: true, names: ['risk-supervisor','portfolio-allocation','anomaly-detection','liquidity','exit-evaluation','strategy-evaluation','meta-supervisor'] },
     marketPhase: currentMarketPhase,
     scanCounter,
     lastScanStats
@@ -3809,7 +3840,7 @@ app.get('/health', (req, res) => {
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
   const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : '0';
   res.status(isDbConnected ? 200 : 503).json({
-    status: isDbConnected ? 'ok' : 'degraded', version: '21.7', dbConnected: isDbConnected,
+    status: isDbConnected ? 'ok' : 'degraded', version: '24.7.0-agent-suite', dbConnected: isDbConnected,
     isPaused, activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, currentEquity, peakCapital, drawdownPercent
   });
 });

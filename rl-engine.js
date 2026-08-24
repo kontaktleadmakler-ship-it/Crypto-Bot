@@ -58,33 +58,36 @@ class DeepQTheTradingAgent {
     const meanLayer = tf.layers.dense({
       units: 1, useBias: false, trainable: false, kernelInitializer: 'zeros'
     });
+    // Important: functional Dense layers are unbuilt until they are applied.
+    // Calling setWeights() before apply() causes: "layer ... was expecting 0 weights".
+    const meanAdv = meanLayer.apply(advOut);
     const meanKernel = tf.tensor2d(
       Array.from({ length: this.actionSize }, () => 1 / this.actionSize),
       [this.actionSize, 1]
     );
     meanLayer.setWeights([meanKernel]);
     meanKernel.dispose();
-    const meanAdv = meanLayer.apply(advOut);
 
     const meanRepLayer = tf.layers.dense({
       units: this.actionSize, useBias: false, trainable: false, kernelInitializer: 'zeros'
     });
+    const meanRep = meanRepLayer.apply(meanAdv);
     const onesKernel = tf.tensor2d(
       Array.from({ length: this.actionSize }, () => 1), [1, this.actionSize]
     );
     meanRepLayer.setWeights([onesKernel]);
     onesKernel.dispose();
-    const centeredAdv = tf.layers.subtract().apply([advOut, meanRepLayer.apply(meanAdv)]);
+    const centeredAdv = tf.layers.subtract().apply([advOut, meanRep]);
 
     const valueRepLayer = tf.layers.dense({
       units: this.actionSize, useBias: false, trainable: false, kernelInitializer: 'zeros'
     });
+    const valueRep = valueRepLayer.apply(valueOut);
     const valueKernel = tf.tensor2d(
       Array.from({ length: this.actionSize }, () => 1), [1, this.actionSize]
     );
     valueRepLayer.setWeights([valueKernel]);
     valueKernel.dispose();
-    const valueRep = valueRepLayer.apply(valueOut);
 
     const q = tf.layers.add().apply([valueRep, centeredAdv]);
     const model = tf.model({ inputs: input, outputs: q });
