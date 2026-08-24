@@ -35,6 +35,10 @@ const { GeminiLLMEngine } = require('./llm-engine');
 const { WalkForwardEngine } = require('./walk-forward-engine');
 const { ModelDriftMonitor } = require('./model-drift-monitor');
 const { AgentAttribution } = require('./agent-attribution');
+const { SafetyController } = require('./institutional-core/safety-controller');
+const { PortfolioLedger } = require('./institutional-core/portfolio-ledger');
+const { ProductionReadinessGate } = require('./institutional-core/readiness-gate');
+const { AuditTrail } = require('./audit-trail');
 
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
@@ -606,6 +610,10 @@ const config = {
   BACKTEST_PURGE_DAYS: parseInt(process.env.BACKTEST_PURGE_DAYS, 10) || 1,
   BACKTEST_EMBARGO_DAYS: parseInt(process.env.BACKTEST_EMBARGO_DAYS, 10) || 1,
   MAX_PORTFOLIO_EXPOSURE_USD: parseFloat(process.env.MAX_PORTFOLIO_EXPOSURE_USD) || 0,
+  API_KEY: process.env.API_KEY || '',
+  HEALTH_PUBLIC: process.env.HEALTH_PUBLIC === 'true',
+  ALLOW_UNAUTHENTICATED_API: process.env.ALLOW_UNAUTHENTICATED_API === 'true',
+  BACKTEST_API_ENABLED: process.env.BACKTEST_API_ENABLED === 'true',
 };
 
 function validateConfig() {
@@ -647,6 +655,7 @@ function validateCriticalEnv() {
   if (!config.MONGODB_URI) missing.push('MONGODB_URI');
   if (!config.TELEGRAM_BOT_TOKEN) missing.push('TELEGRAM_BOT_TOKEN');
   if (!config.TELEGRAM_CHAT_ID) missing.push('TELEGRAM_CHAT_ID');
+  if (!config.API_KEY && !config.ALLOW_UNAUTHENTICATED_API) missing.push('API_KEY');
   if (missing.length > 0) throw new Error(`[STARTUP ERROR] Fehlende Variablen: ${missing.join(', ')}`);
 }
 validateCriticalEnv();
@@ -704,7 +713,7 @@ const mlModel = new TensorFlowSignalModel({
 const dqnAgent = new DeepQTheTradingAgent({
   modelDir: process.env.DQN_MODEL_DIR || './models/rl-dqn-model',
   stateSize: 16,
-  actionSize: 3,
+  actionSize: 5,
   logger
 });
 
@@ -719,6 +728,11 @@ const aiAgents = new AIAgentOrchestrator({ logger });
 const walkForwardEngine = new WalkForwardEngine({ trainBars: Number(process.env.AI_WALK_FORWARD_TRAIN_BARS || 500), testBars: Number(process.env.AI_WALK_FORWARD_TEST_BARS || 150), stepBars: Number(process.env.AI_WALK_FORWARD_STEP_BARS || 150) });
 const modelDriftMonitor = new ModelDriftMonitor({ windowSize: Number(process.env.AI_DRIFT_WINDOW || 200), threshold: Number(process.env.AI_DRIFT_THRESHOLD || 0.35) });
 const agentAttribution = new AgentAttribution({ maxRecords: Number(process.env.AI_ATTRIBUTION_MAX_RECORDS || 5000) });
+const safetyController = new SafetyController({ logger });
+const portfolioLedger = new PortfolioLedger({ logger });
+const readinessGate = new ProductionReadinessGate({ required: ['apiKeyConfigured','paperExecution','reconciliationHealthy','dataFeedHealthy','riskEngineHealthy','oosValidated','rollbackReady','auditTrail','independentOosEvidence','shadowValidated','reconciliationDrillPassed','securityReviewApproved','humanApproval'] });
+const auditTrail = new AuditTrail();
+auditTrail.append({ event: 'RUNTIME_START', version: '25.0.0-institutional-hardening', mode: 'PAPER_SHADOW' });
 const llmEngine = new GeminiLLMEngine({ apiKey: config.GEMINI_API_KEY, model: config.GEMINI_MODEL, enabled: config.AI_LLM_ENABLED, cooldownMs: config.AI_LLM_COOLDOWN_MS, logger });
 
 let isModelTrained = false;
@@ -1242,6 +1256,7 @@ function checkGlobalDrawdown(currentEquity) {
   if (drawdown > config.MAX_DRAWDOWN_PERCENT) {
     sendDeduplicatedAlert('global_drawdown', `🔴 <b>MAX DRAWDOWN ERREICHT: ${drawdown.toFixed(1)}%!</b>\nBot wurde pausiert.`);
     isPaused = true;
+    safetyController.set('pause', true, 'risk-limit');
     persistPauseState();
     persistPeakCapital();
     return true;
@@ -1267,6 +1282,7 @@ async function evaluateFundingAndSentiment(fundingRate, direction) {
 function checkDailyProfitTarget() {
   if (config.DAILY_PROFIT_TARGET > 0 && dailyNetPnL >= config.DAILY_PROFIT_TARGET) {
     isPaused = true;
+    safetyController.set('pause', true, 'risk-limit');
     persistPauseState();
     sendDeduplicatedAlert('daily_profit_target', `🎯 <b>TÄGLICHES PROFIT-ZIEL ERREICHT!</b>\nProfit heute: $${dailyNetPnL.toFixed(2)}`);
     return true;
@@ -1274,7 +1290,9 @@ function checkDailyProfitTarget() {
   return false;
 }
 
-async function recordTradePnL(pnlUSD) {
+async function recordTradePnL(pnlUSD, meta = {}) {
+  const eventId = meta.eventId || `pnl:${meta.symbol || 'portfolio'}:${meta.closeTime || Date.now()}:${Number(pnlUSD).toFixed(8)}`;
+  portfolioLedger.append({ eventId, type: 'REALIZED_PNL', symbol: meta.symbol || null, realizedPnLUSD: Number(pnlUSD) || 0, feeUSD: Number(meta.feeUSD || 0), fundingUSD: Number(meta.fundingUSD || 0), closeReason: meta.closeReason || null });
   dailyNetPnL += pnlUSD;
   await persistDailyPnLState();
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
@@ -2219,6 +2237,16 @@ async function checkActiveTrades() {
         }
 
         if (trade.direction === 'LONG') {
+          // Conservative intrabar policy: if one OHLC bar touches the stop and
+          // any target, stop wins. This must match backtest assumptions.
+          if (lowPrice <= trade.stopLoss) {
+            const exitPrice = applySlippage(trade.stopLoss, 'LONG', 'exit');
+            const pnlUSD = (exitPrice - trade.entry) * trade.positionSizeUnits - applyFees(trade.notionalUSD) - remainingEntryFee - (trade.fundingCostUSD || 0);
+            await recordTradePnL(pnlUSD, { symbol, closeTime: Date.now(), closeReason: 'stop-loss-intrabar', feeUSD: applyFees(trade.notionalUSD), fundingUSD: trade.fundingCostUSD || 0 });
+            await sendTelegramAlert(`🛑 <b>STOP LOSS (INTRABAR-CONSERVATIVE): ${cleanSymbol}/USDT</b> PnL: $${pnlUSD.toFixed(2)}`);
+            await removeTrade(symbol, { symbol, direction: trade.direction, closeTime: Date.now(), closeReason: 'stop-loss', pnlUSD, exitPrice });
+            continue;
+          }
           if (highPrice >= trade.tp2) {
             const exitPrice = applySlippage(trade.tp2, 'LONG', 'exit');
             const pnlUSD = (exitPrice - trade.entry) * trade.positionSizeUnits - applyFees(trade.notionalUSD) - remainingEntryFee - fundingCostSoFar;
@@ -2275,6 +2303,15 @@ async function checkActiveTrades() {
             continue;
           }
         } else if (trade.direction === 'SHORT') {
+          // Conservative intrabar policy: stop wins over targets on ambiguous bars.
+          if (highPrice >= trade.stopLoss) {
+            const exitPrice = applySlippage(trade.stopLoss, 'SHORT', 'exit');
+            const pnlUSD = (trade.entry - exitPrice) * trade.positionSizeUnits - applyFees(trade.notionalUSD) - remainingEntryFee - (trade.fundingCostUSD || 0);
+            await recordTradePnL(pnlUSD, { symbol, closeTime: Date.now(), closeReason: 'stop-loss-intrabar', feeUSD: applyFees(trade.notionalUSD), fundingUSD: trade.fundingCostUSD || 0 });
+            await sendTelegramAlert(`🛑 <b>STOP LOSS (INTRABAR-CONSERVATIVE): ${cleanSymbol}/USDT</b> PnL: $${pnlUSD.toFixed(2)}`);
+            await removeTrade(symbol, { symbol, direction: trade.direction, closeTime: Date.now(), closeReason: 'stop-loss', pnlUSD, exitPrice });
+            continue;
+          }
           if (lowPrice <= trade.tp2) {
             const exitPrice = applySlippage(trade.tp2, 'SHORT', 'exit');
             const pnlUSD = (trade.entry - exitPrice) * trade.positionSizeUnits - applyFees(trade.notionalUSD) - remainingEntryFee - fundingCostSoFar;
@@ -2795,6 +2832,8 @@ async function scanMarket() {
           // ==========================================
           // 🧠 INSTITUTIONAL AGENT SUITE
           // ==========================================
+          safetyController.set('pause', isPaused, isPaused ? 'runtime-paused' : 'runtime-active');
+          safetyController.set('kill-switch', Boolean(riskEngine.killSwitch), riskEngine.killSwitch ? 'risk-engine-kill-switch' : 'risk-engine-clear');
           const agentEvaluation = agentSuite.evaluate({
             symbol, direction,
             spreadPct: orderBookMetrics.spreadPct,
@@ -2802,15 +2841,15 @@ async function scanMarket() {
             orderSizeUSD: Number(currentPrice || 0) * 0.001,
             apiLatencyMs: apiLatencyStats.getAverage('kucoin'),
             candleDelayMs: Math.max(0, Date.now() - new Date(raw15m?.[raw15m.length - 1]?.time || Date.now()).getTime()),
-            exposurePct: Number(config.MAX_EXPOSURE_PERCENT || config.MAX_TOTAL_EXPOSURE_PERCENT || 100),
-            maxExposurePct: Number(config.MAX_EXPOSURE_PERCENT || config.MAX_TOTAL_EXPOSURE_PERCENT || 100),
+            exposurePct: (() => { const eq = Math.max(config.CAPITAL_USD + dailyNetPnL, 1); const gross = [...activeTrades.values()].reduce((sum,t) => sum + Math.abs(Number(t.notionalUSD || 0)), 0); return gross / eq * 100; })(),
+            maxExposurePct: Math.max(0, Number(config.MAX_EXPOSURE_RATIO || 0)) * Math.max(1, Number(config.LEVERAGE || 1)) * 100,
             drawdownPct: Math.max(0, peakCapital > 0 ? ((peakCapital - (config.CAPITAL_USD + dailyNetPnL)) / peakCapital) * 100 : 0),
             maxDrawdownPct: MAX_DRAWDOWN_PERCENT,
             dailyLossPct: Math.max(0, -(dailyNetPnL / Math.max(config.CAPITAL_USD, 1)) * 100),
-            maxDailyLossPct: Number(config.MAX_DAILY_LOSS_PERCENT || 100),
-            killSwitch: false, circuitBreaker: Date.now() < kucoinCircuitOpenUntil,
+            maxDailyLossPct: Math.max(0, Number(config.MAX_DAILY_LOSS_USD || 0) / Math.max(config.CAPITAL_USD, 1) * 100),
+            killSwitch: safetyController.isActive('kill-switch') || isPaused, circuitBreaker: Date.now() < kucoinCircuitOpenUntil,
             regime: { confidence: currentMarketPhase === 'RANGING' || currentMarketPhase === 'TRENDING' ? 0.75 : 0.5 },
-            oosScore: 0.75, driftScore: 0.10
+            oosScore: Number(mlModel.getStats().validationAccuracy || 0), driftScore: Number(modelDriftMonitor.status().score || 0)
           });
           if (agentEvaluation.meta.hardBlock) {
             scanStats.agentBlocked = (scanStats.agentBlocked || 0) + 1;
@@ -2832,9 +2871,9 @@ async function scanMarket() {
             const dqnAction = dqnAgent.act(dqnState);
 
             // Wenn Action = 0 (Veto/Ablehnen) und außerhalb der Exploration (Epsilon)
-            if (dqnAction === 0 && Math.random() >= dqnAgent.epsilon) {
+            if (dqnAgent.shouldVetoCandidate(dqnAction, direction) && Math.random() >= dqnAgent.epsilon) {
               scanStats.dqnBlocked++;
-              logger.info(`[DQN-VETO] Trade für ${symbol} (${direction}) vom DQN-Agenten blockiert.`);
+              logger.info(`[DQN-VETO] Trade für ${symbol} (${direction}) vom DQN-Agenten blockiert (${dqnAgent.actions[dqnAction] || dqnAction}).`);
               return;
             }
           }
@@ -4063,10 +4102,40 @@ async function pollTelegramUpdates() {
 // 18. EXPRESS ENDPOINTS & WEB-BACKTEST
 // ==========================================
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '256kb' }));
+
+// Institutional API boundary: authenticated by default, fail-closed.
+app.use((req, res, next) => {
+  if (req.path === '/health' && config.HEALTH_PUBLIC) return next();
+  if (config.ALLOW_UNAUTHENTICATED_API) return next();
+  if (!config.API_KEY) return res.status(503).json({ error: 'API_KEY_NOT_CONFIGURED' });
+  if (req.get('X-API-Key') !== config.API_KEY) return res.status(401).json({ error: 'UNAUTHORIZED' });
+  next();
+});
 
 app.get('/', (req, res) => {
   res.send(`🤖 Trading Bot v24.6 Institutional Edition | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+});
+
+app.get('/api/v24/readiness', (req, res) => {
+  const risk = riskEngine.assess({ equity: config.CAPITAL_USD + dailyNetPnL, peakEquity: peakCapital, dailyPnL: dailyNetPnL, openPositions: [...activeTrades.values()] });
+  const recon = reconciliationEngine.getStatus ? reconciliationEngine.getStatus() : { healthy: reconciliationEngine.healthy !== false };
+  const checks = readinessGate.evaluate({
+    apiKeyConfigured: Boolean(config.API_KEY || config.ALLOW_UNAUTHENTICATED_API),
+    paperExecution: Boolean(config.PAPER_EXECUTION_ENABLED),
+    reconciliationHealthy: recon.healthy !== false,
+    dataFeedHealthy: kucoinErrorCount < 3 && Date.now() >= kucoinCircuitOpenUntil,
+    riskEngineHealthy: risk.allowed === true,
+    oosValidated: Number(mlModel.getStats().validationAccuracy || 0) >= Number(process.env.PRODUCTION_MIN_OOS_ACCURACY || 0.55),
+    rollbackReady: Boolean(process.env.MODEL_REGISTRY_DIR || process.env.DQN_REGISTRY_DIR),
+    auditTrail: Boolean(auditTrail && auditTrail.file),
+    independentOosEvidence: process.env.PRODUCTION_OOS_EVIDENCE === 'true',
+    shadowValidated: process.env.SHADOW_VALIDATED === 'true',
+    reconciliationDrillPassed: process.env.RECON_DRILL_PASSED === 'true',
+    securityReviewApproved: process.env.SECURITY_REVIEW_APPROVED === 'true',
+    humanApproval: process.env.HUMAN_APPROVAL === 'true'
+  });
+  res.status(checks.ready ? 200 : 503).json(checks);
 });
 
 app.get('/api/v24/status', (req, res) => {
@@ -4079,7 +4148,9 @@ app.get('/api/v24/status', (req, res) => {
     agents: { enabled: true, names: ['risk-supervisor','portfolio-allocation','anomaly-detection','liquidity','exit-evaluation','strategy-evaluation','meta-supervisor'] },
     marketPhase: currentMarketPhase,
     scanCounter,
-    lastScanStats
+    lastScanStats,
+    safety: safetyController.snapshot(),
+    ledger: portfolioLedger.snapshot()
   });
 });
 
@@ -4113,6 +4184,7 @@ app.get('/metrics', (req, res) => {
 });
 
 app.get('/backtest', async (req, res) => {
+  if (!config.BACKTEST_API_ENABLED) return res.status(403).json({ error: 'BACKTEST_API_DISABLED' });
   try {
     const symbol = req.query.symbol || 'BTC-USDT';
     const days = Number(req.query.days || 30);

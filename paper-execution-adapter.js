@@ -37,7 +37,7 @@ class PaperExecutionAdapter {
       paper: true,
       liveExecution: false,
       idempotency: true,
-      partialFills: false,
+      partialFills: true,
       marketImpact: true,
       fees: true,
       latencyModel: true

@@ -34,7 +34,9 @@ class DataValidator {
     timeframeMs,
     now = Date.now(),
     minLength = 20,
-    requireClosed = true
+    requireClosed = true,
+    allowGaps = false,
+    maxGapFactor = 1.5
   } = {}) {
     if (!Array.isArray(candles) || candles.length < minLength) {
       return { valid: false, reason: 'insufficient-candles' };
@@ -47,7 +49,8 @@ class DataValidator {
     let prevTs = null;
 
     for (const c of candles) {
-      const ts = Number(c?.time ?? c?.timestamp ?? c?.[0]);
+      let ts = Number(c?.time ?? c?.timestamp ?? c?.[0]);
+      if (Number.isFinite(ts) && ts > 0 && ts < 1e12) ts *= 1000;
       const open = Number(c?.open ?? c?.[1]);
       const high = Number(c?.high ?? c?.[2]);
       const low = Number(c?.low ?? c?.[3]);
@@ -73,7 +76,7 @@ class DataValidator {
         if (ts <= prevTs) {
           return { valid: false, reason: 'out-of-order-or-duplicate' };
         }
-        if (ts - prevTs > timeframeMs * 1.5) {
+        if (ts - prevTs > timeframeMs * Math.max(1, Number(maxGapFactor) || 1.5) && !allowGaps) {
           return { valid: false, reason: 'candle-gap' };
         }
       }
@@ -85,11 +88,12 @@ class DataValidator {
       prevTs = ts;
     }
 
-    const latest = Number(
+    let latest = Number(
       candles[candles.length - 1]?.time ??
       candles[candles.length - 1]?.timestamp ??
       candles[candles.length - 1]?.[0]
     );
+    if (Number.isFinite(latest) && latest > 0 && latest < 1e12) latest *= 1000;
 
     // The candle timestamp is its OPEN time.
     const closeTime = latest + timeframeMs;
