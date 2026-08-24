@@ -20,7 +20,7 @@ const drift=new ConceptDriftMonitor({window:20,threshold:.01}); for(let i=0;i<30
 assert.strictEqual(twapSchedule({quantity:100,slices:4}).reduce((a,b)=>a+b.size,0),100);
 assert(vwapSchedule({quantity:100,volumeBuckets:[1,2,1],participation:1}).length===3);
 assert(slippageBps(100,101,'buy')===100);
-const gapCandles = candles(30).filter((_, i) => i !== 15); const tolerant = require('../data-validator').DataValidator; const dv = new tolerant({maxAgeMs: 60*60*1000}); assert(dv.candles(gapCandles, {timeframeMs:15*60*1000, now:gapCandles.at(-1).time, allowGaps:true, maxGapFactor:4}).valid);
+const gapCandles = candles(30).filter((_, i) => i !== 15); const tolerant = require('../data-validator').DataValidator; const dv = new tolerant({maxAgeMs: 60*60*1000}); assert(dv.candles(gapCandles, {timeframeMs:15*60*1000, now:gapCandles.at(-1).time + 15*60*1000 + 1000, allowGaps:true, maxGapFactor:4}).valid);
 const ks=new KillSwitch(); assert(ks.status().active===true); ks.disable(); assert(ks.status().active===false); ks.enable(); assert(ks.status().active===true);
 console.log('✅ Pro feature tests passed');
 
@@ -36,7 +36,7 @@ console.log('✅ Pro feature tests passed');
     time: sec - (19 - i) * 15 * 60, open: 100, high: 101, low: 99, close: 100, volume: 10
   }));
   const result = validator.candles(legacySeconds, {
-    timeframeMs: 15 * 60 * 1000, maxAgeMs: 30 * 60 * 1000, allowGaps: true
+    timeframeMs: 15 * 60 * 1000, maxAgeMs: 30 * 60 * 1000, allowGaps: true, now: now + 15 * 60 * 1000 + 1000
   });
   assert.strictEqual(result.valid, true);
 }

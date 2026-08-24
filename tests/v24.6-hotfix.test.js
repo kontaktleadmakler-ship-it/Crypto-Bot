@@ -13,5 +13,5 @@ assert.ok(!runtime.includes("/backtest [Symbol] [Days]`\n      `"), 'Telegram he
 assert.ok(rl.includes('const meanLayer = tf.layers.dense'), 'DQN mean layer missing');
 assert.ok(rl.includes('meanLayer.setWeights([meanKernel])'), 'DQN layer weights are not assigned to the Layer');
 assert.ok(!rl.includes('}).apply(advOut);\n\n    // Set the fixed averaging kernel'), 'DQN still assigns setWeights to symbolic tensor');
-assert.strictEqual(pkg.scripts.start, 'node trading-bot-v24.6.js');
+assert.strictEqual(pkg.scripts.start, 'node trading-bot-v25.js');
 console.log('v24.6 hotfix tests: OK');
