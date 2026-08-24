@@ -5,10 +5,12 @@
   "description": "Signal/Paper/Shadow institutional trading platform - B13-B16",
   "scripts": {
     "test:b13": "node tests/b13.test.js",
-    "test": "node tests/b13.test.js && node tests/b10.test.js && node tests/b11.test.js && node institutional-self-test.js",
+    "test": "node tests/b13.test.js && node tests/b10.test.js && node tests/b11.test.js && node institutional-self-test.js && node tests/v24.6-hotfix.test.js",
     "test:b10": "node tests/b10.test.js",
     "test:b11": "node tests/b11.test.js",
-    "test:v24": "node institutional-self-test.js"
+    "test:v24": "node institutional-self-test.js",
+    "start": "node trading-bot-v24.6.js",
+    "check": "node --check trading-bot-v24.6-runtime.js && node --check rl-engine.js && node --check trading-bot-v21.1-tfjs.js && node --check trading-bot-v24.6.js"
   },
   "engines": {
     "node": ">=18"

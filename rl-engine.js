@@ -53,43 +53,38 @@ class DeepQTheTradingAgent {
     // mean(A) = A * (1/actionSize)
     // A_centered = A - mean(A)
     // V is replicated across all actions and added to A_centered.
+    // TensorFlow.js: .apply() returns a symbolic Tensor. setWeights()
+    // must be called on the Layer object itself.
+    const meanLayer = tf.layers.dense({
+      units: 1, useBias: false, trainable: false, kernelInitializer: 'zeros'
+    });
     const meanKernel = tf.tensor2d(
       Array.from({ length: this.actionSize }, () => 1 / this.actionSize),
       [this.actionSize, 1]
     );
-    const meanLayer = tf.layers.dense({
-      units: 1,
-      useBias: false,
-      trainable: false,
-      kernelInitializer: 'zeros'
-    }).apply(advOut);
-
-    // Set the fixed averaging kernel after layer creation.
     meanLayer.setWeights([meanKernel]);
     meanKernel.dispose();
+    const meanAdv = meanLayer.apply(advOut);
 
-    const centeredAdv = tf.layers.subtract().apply([
-      advOut,
-      tf.layers.dense({
-        units: this.actionSize,
-        useBias: false,
-        trainable: false,
-        kernelInitializer: 'ones'
-      }).apply(meanLayer)
-    ]);
-
-    const valueKernel = tf.tensor2d(
-      Array.from({ length: this.actionSize }, () => 1),
-      [1, this.actionSize]
+    const meanRepLayer = tf.layers.dense({
+      units: this.actionSize, useBias: false, trainable: false, kernelInitializer: 'zeros'
+    });
+    const onesKernel = tf.tensor2d(
+      Array.from({ length: this.actionSize }, () => 1), [1, this.actionSize]
     );
-    const valueRep = tf.layers.dense({
-      units: this.actionSize,
-      useBias: false,
-      trainable: false,
-      kernelInitializer: 'zeros'
-    }).apply(valueOut);
-    valueRep.setWeights([valueKernel]);
+    meanRepLayer.setWeights([onesKernel]);
+    onesKernel.dispose();
+    const centeredAdv = tf.layers.subtract().apply([advOut, meanRepLayer.apply(meanAdv)]);
+
+    const valueRepLayer = tf.layers.dense({
+      units: this.actionSize, useBias: false, trainable: false, kernelInitializer: 'zeros'
+    });
+    const valueKernel = tf.tensor2d(
+      Array.from({ length: this.actionSize }, () => 1), [1, this.actionSize]
+    );
+    valueRepLayer.setWeights([valueKernel]);
     valueKernel.dispose();
+    const valueRep = valueRepLayer.apply(valueOut);
 
     const q = tf.layers.add().apply([valueRep, centeredAdv]);
     const model = tf.model({ inputs: input, outputs: q });
@@ -105,6 +100,11 @@ class DeepQTheTradingAgent {
       if (fs.existsSync(modelPath)) {
         try {
           this.model = await tf.loadLayersModel(`file://${path.resolve(modelPath)}`);
+          const inputShape = this.model.inputs?.[0]?.shape || [];
+          const outputShape = this.model.outputs?.[0]?.shape || [];
+          if (inputShape[inputShape.length - 1] !== this.stateSize || outputShape[outputShape.length - 1] !== this.actionSize) {
+            throw new Error(`DQN model shape mismatch: expected [${this.stateSize}] -> [${this.actionSize}], got ${JSON.stringify(inputShape)} -> ${JSON.stringify(outputShape)}`);
+          }
           this.model.compile({ optimizer: tf.train.adam(this.learningRate), loss: 'meanSquaredError' });
           this.targetModel = this._createModel();
           this.updateTargetModel();
