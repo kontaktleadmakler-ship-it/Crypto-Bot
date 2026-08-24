@@ -77,7 +77,20 @@ class DeepQTheTradingAgent {
     );
     meanRepLayer.setWeights([onesKernel]);
     onesKernel.dispose();
-    const centeredAdv = tf.layers.subtract().apply([advOut, meanRep]);
+    // TensorFlow.js has no subtract layer; use add with a negated mean instead.
+    // meanRep contains +mean(A) for every action, so negate it with a
+    // fixed non-trainable Dense layer and use the supported add layer:
+    // A_centered = A + (-mean(A)).
+    const negativeMeanRepLayer = tf.layers.dense({
+      units: this.actionSize, useBias: false, trainable: false, kernelInitializer: 'zeros'
+    });
+    const negativeMeanRep = negativeMeanRepLayer.apply(meanAdv);
+    const negativeOnesKernel = tf.tensor2d(
+      Array.from({ length: this.actionSize }, () => -1), [1, this.actionSize]
+    );
+    negativeMeanRepLayer.setWeights([negativeOnesKernel]);
+    negativeOnesKernel.dispose();
+    const centeredAdv = tf.layers.add().apply([advOut, negativeMeanRep]);
 
     const valueRepLayer = tf.layers.dense({
       units: this.actionSize, useBias: false, trainable: false, kernelInitializer: 'zeros'

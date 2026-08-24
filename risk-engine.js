@@ -17,9 +17,35 @@ class RiskEngine {
     if (dailyLoss >= maxDaily) return { allowed: false, reason: 'daily-loss-limit', dailyLossUSD: dailyLoss };
     const exposure = openPositions.reduce((s, p) => s + Math.abs(this._n(p.notionalUSD ?? p.quantity * p.entryPrice)), 0);
     const proposedExposure = proposed ? Math.abs(this._n(proposed.notionalUSD ?? proposed.quantity * proposed.entryPrice)) : 0;
-    const maxExposure = eq * this._n(this.config.MAX_EXPOSURE_RATIO, 1);
-    if (exposure + proposedExposure > maxExposure) return { allowed: false, reason: 'max-exposure', exposureUSD: exposure, maxExposureUSD: maxExposure };
-    return { allowed: true, drawdownPercent: drawdown, exposureUSD: exposure, maxExposureUSD: maxExposure };
+    // MAX_EXPOSURE_RATIO is defined as a fraction of account equity available
+    // as margin. Convert gross notional to margin using the configured leverage
+    // so this gate has the same semantics as canOpenNewTrade().
+    const leverage = Math.max(1, this._n(this.config.LEVERAGE, 1));
+    const totalExposure = exposure + proposedExposure;
+    const exposureMargin = totalExposure / leverage;
+    const maxExposureMargin = eq * this._n(this.config.MAX_EXPOSURE_RATIO, 1);
+    if (exposureMargin > maxExposureMargin) {
+      return {
+        allowed: false,
+        reason: 'max-exposure',
+        exposureUSD: exposure,
+        proposedExposureUSD: proposedExposure,
+        totalExposureUSD: totalExposure,
+        exposureMarginUSD: exposureMargin,
+        maxExposureMarginUSD: maxExposureMargin,
+        leverage
+      };
+    }
+    return {
+      allowed: true,
+      drawdownPercent: drawdown,
+      exposureUSD: exposure,
+      proposedExposureUSD: proposedExposure,
+      totalExposureUSD: totalExposure,
+      exposureMarginUSD: exposureMargin,
+      maxExposureMarginUSD: maxExposureMargin,
+      leverage
+    };
   }
 }
 module.exports = { RiskEngine };
