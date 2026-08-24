@@ -1252,8 +1252,9 @@ function canOpenNewTrade(activeTradesCount, direction, notionalUSD = 0) {
   }
 
   const totalNotional = [...activeTrades.values()].reduce((sum, t) => sum + (t.notionalUSD || 0), 0) + notionalUSD;
-  const totalMarginUSD = totalNotional / config.LEVERAGE;
-  if (totalMarginUSD > config.CAPITAL_USD * config.MAX_EXPOSURE_RATIO) return { allowed: false, reason: 'skippedExposureLimit' };
+  const leverage = Math.max(1, Number(config.LEVERAGE) || 1);
+  const totalMarginUSD = totalNotional / leverage;
+  if (totalMarginUSD > currentEquity * config.MAX_EXPOSURE_RATIO) return { allowed: false, reason: 'skippedExposureLimit' };
 
   return { allowed: true, reason: null };
 }

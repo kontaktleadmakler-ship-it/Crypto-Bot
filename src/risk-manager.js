@@ -29,8 +29,12 @@ class RiskManager {
     if(activeTrades.length>=maxConcurrent)return {allowed:false,reason:'max-concurrent-trades'};
     if(direction && activeTrades.filter(t=>t.direction===direction).length>=maxSameDirection)return {allowed:false,reason:'max-same-direction'};
     const exposure=activeTrades.reduce((s,t)=>s+Math.abs(Number(t.notionalUSD)||0),0);
-    if(exposure+Math.abs(notionalUSD)>equityUSD*maxExposureRatio)return {allowed:false,reason:'max-exposure'};
-    return {allowed:true,reason:null,drawdownPercent:dd};
+    const leverage=Math.max(1,Number(this.config.LEVERAGE)||1);
+    const totalExposure=exposure+Math.abs(Number(notionalUSD)||0);
+    const exposureMargin=totalExposure/leverage;
+    const maxExposureMargin=equityUSD*maxExposureRatio;
+    if(exposureMargin>maxExposureMargin)return {allowed:false,reason:'max-exposure',exposureUSD:exposure,totalExposureUSD:totalExposure,exposureMarginUSD:exposureMargin,maxExposureMarginUSD:maxExposureMargin,leverage};
+    return {allowed:true,reason:null,drawdownPercent:dd,exposureUSD:exposure,totalExposureUSD:totalExposure,exposureMarginUSD:exposureMargin,maxExposureMarginUSD:maxExposureMargin,leverage};
   }
 
   kelly({ winRate, avgWin, avgLoss }) {

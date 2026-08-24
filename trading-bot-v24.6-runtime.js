@@ -30,6 +30,11 @@ const { splitWalkForward } = require('./walk-forward-validator');
 const { evaluateProbabilities } = require('./ml-evaluation');
 const { evaluateActions } = require('./dqn-evaluation');
 const { InstitutionalAgentSuite } = require('./agent-suite');
+const { AIAgentOrchestrator } = require('./ai-agents');
+const { GeminiLLMEngine } = require('./llm-engine');
+const { WalkForwardEngine } = require('./walk-forward-engine');
+const { ModelDriftMonitor } = require('./model-drift-monitor');
+const { AgentAttribution } = require('./agent-attribution');
 
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
@@ -463,6 +468,12 @@ const config = {
   MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,
   LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3,
   MARGIN_MODE: (process.env.MARGIN_MODE || 'ISOLATED').toUpperCase(),
+  AI_AGENTS_ENABLED: process.env.AI_AGENTS_ENABLED !== 'false',
+  AI_AGENT_MIN_SCORE: parseFloat(process.env.AI_AGENT_MIN_SCORE) || 0.58,
+  AI_LLM_ENABLED: process.env.AI_LLM_ENABLED === 'true',
+  AI_LLM_COOLDOWN_MS: parseInt(process.env.AI_LLM_COOLDOWN_MS, 10) || 60000,
+  GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
+  GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-3.7-flash',
 
   LOCK_ACQUIRE_RETRIES: parseInt(process.env.LOCK_ACQUIRE_RETRIES, 10) || 8,
   LOCK_ACQUIRE_RETRY_DELAY_MS: parseInt(process.env.LOCK_ACQUIRE_RETRY_DELAY_MS, 10) || 5000,
@@ -628,6 +639,11 @@ const macroEngine = new MacroFilterEngine({ logger });
 
 // Institutional AI Agent Suite: advisory/evaluation only. Hard risk controls remain authoritative.
 const agentSuite = new InstitutionalAgentSuite();
+const aiAgents = new AIAgentOrchestrator({ logger });
+const walkForwardEngine = new WalkForwardEngine({ trainBars: Number(process.env.AI_WALK_FORWARD_TRAIN_BARS || 500), testBars: Number(process.env.AI_WALK_FORWARD_TEST_BARS || 150), stepBars: Number(process.env.AI_WALK_FORWARD_STEP_BARS || 150) });
+const modelDriftMonitor = new ModelDriftMonitor({ windowSize: Number(process.env.AI_DRIFT_WINDOW || 200), threshold: Number(process.env.AI_DRIFT_THRESHOLD || 0.35) });
+const agentAttribution = new AgentAttribution({ maxRecords: Number(process.env.AI_ATTRIBUTION_MAX_RECORDS || 5000) });
+const llmEngine = new GeminiLLMEngine({ apiKey: config.GEMINI_API_KEY, model: config.GEMINI_MODEL, enabled: config.AI_LLM_ENABLED, cooldownMs: config.AI_LLM_COOLDOWN_MS, logger });
 
 let isModelTrained = false;
 let lastMLTrainingStats = null;
@@ -1241,8 +1257,9 @@ function canOpenNewTrade(activeTradesCount, direction, notionalUSD = 0) {
   }
 
   const totalNotional = [...activeTrades.values()].reduce((sum, t) => sum + (t.notionalUSD || 0), 0) + notionalUSD;
-  const totalMarginUSD = totalNotional / config.LEVERAGE;
-  if (totalMarginUSD > config.CAPITAL_USD * config.MAX_EXPOSURE_RATIO) return { allowed: false, reason: 'skippedExposureLimit' };
+  const leverage = Math.max(1, Number(config.LEVERAGE) || 1);
+  const totalMarginUSD = totalNotional / leverage;
+  if (totalMarginUSD > currentEquity * config.MAX_EXPOSURE_RATIO) return { allowed: false, reason: 'skippedExposureLimit' };
 
   return { allowed: true, reason: null };
 }
@@ -3034,6 +3051,151 @@ async function handleTelegramCommand(chatId, text) {
   const parts = normalizedText.split(/\s+/);
   const command = parts[0].toLowerCase().split('@')[0];
   const args = parts.slice(1);
+
+  // ==========================================
+  // 🤖 AI / AGENT CONTROL CENTER (v24.6)
+  // Advisory controls only: hard RiskEngine/Paper safety gates remain authoritative.
+  // ==========================================
+  const agentAlias = (name) => {
+    const raw = String(name || '').toLowerCase().replace(/_/g, '-');
+    const aliases = {
+      regime:'market-regime-agent', market:'market-regime-agent',
+      critic:'signal-critic-agent', signal:'signal-critic-agent',
+      risk:'risk-sentinel-agent', sentinel:'risk-sentinel-agent',
+      confluence:'confluence-agent', macro:'news-macro-agent', news:'news-macro-agent',
+      liquidity:'liquidity-agent', volume:'liquidity-agent', volatility:'volatility-agent',
+      anomaly:'anomaly-agent', portfolio:'portfolio-agent', execution:'execution-agent'
+    };
+    return aliases[raw] || raw;
+  };
+
+  if (command === '/commands' || command === '/aicommands') {
+    await sendTelegramReply(chatId,
+      `<b>🤖 AI CONTROL CENTER v24.6</b>\n━━━━━━━━━━━━━━━━━━\n` +
+      `<b>Agents</b>\n/agents /agents_status /agent &lt;name&gt;\n/agent_on &lt;name&gt; /agent_off &lt;name&gt;\n/agents_on /agents_off /agent_weights\n` +
+      `<b>LLM</b>\n/llm /llm_status /llm_on /llm_off /llm_test\n` +
+      `<b>Analyse</b>\n/signals /top_signals /anomalies /regime /signal &lt;symbol&gt;\n/explain &lt;symbol&gt; /confluence &lt;symbol&gt; /risk\n` +
+      `<b>Monitoring</b>\n/ai_hardening /ai_architecture /drift /model_drift /agent_attribution /agent_stats\n` +
+      `<b>Safety</b>\n/kill_status /pause /resume\n\n<i>AI/LLM kann niemals RiskEngine, Paper-Execution oder Safety-Gates umgehen.</i>`);
+    return;
+  }
+
+  if (command === '/agents' || command === '/agents_status') {
+    const rows = aiAgents.listAgents();
+    const enabledCount = rows.filter(x => x.enabled).length;
+    const rowsText = rows.map(x => `${x.enabled ? '🟢' : '⚪'} <code>${escapeHtml(x.name)}</code> | w=${Number(x.weight).toFixed(2)}`).join('\n');
+    await sendTelegramReply(chatId, `<b>🤖 AGENTS ${enabledCount}/${rows.length} AKTIV</b>\n━━━━━━━━━━━━━━━━━━\n${rowsText}\n\nOrchestrator: ${config.AI_AGENTS_ENABLED ? '🟢 ON' : '🔴 OFF'}`);
+    return;
+  }
+
+  if (command === '/agent') {
+    const name = agentAlias(args[0]);
+    const row = aiAgents.listAgents().find(x => x.name === name);
+    if (!row) { await sendTelegramReply(chatId, '⚠️ Agent nicht gefunden. Nutze /agents.'); return; }
+    await sendTelegramReply(chatId, `🤖 <b>${escapeHtml(row.name)}</b>\nStatus: ${row.enabled ? '🟢 aktiv' : '⚪ aus'}\nGewicht: <b>${Number(row.weight).toFixed(2)}</b>`);
+    return;
+  }
+
+  if (command === '/agent_on' || command === '/agent_off') {
+    const name = agentAlias(args[0]);
+    const enabled = command === '/agent_on';
+    if (!aiAgents.setAgent(name, enabled)) { await sendTelegramReply(chatId, '⚠️ Agent nicht gefunden. Nutze /agents.'); return; }
+    await sendTelegramReply(chatId, `${enabled ? '🟢' : '⚪'} Agent <code>${escapeHtml(name)}</code> ${enabled ? 'aktiviert' : 'deaktiviert'}.`);
+    return;
+  }
+
+  if (command === '/agents_on' || command === '/agents_off') {
+    const enabled = command === '/agents_on';
+    aiAgents.setAll(enabled);
+    await sendTelegramReply(chatId, `${enabled ? '🟢' : '⚪'} Alle AI-Agents ${enabled ? 'aktiviert' : 'deaktiviert'}.`);
+    return;
+  }
+
+  if (command === '/agent_weights') {
+    const weights = aiAgents.getWeights();
+    await sendTelegramReply(chatId, `<b>⚖️ AGENT WEIGHTS</b>\n━━━━━━━━━━━━━━━━━━\n${Object.entries(weights).map(([k,v]) => `• ${escapeHtml(k)}: <b>${Number(v).toFixed(2)}</b>`).join('\n')}`);
+    return;
+  }
+
+  if (command === '/llm' || command === '/llm_status') {
+    const st = llmEngine.status();
+    await sendTelegramReply(chatId, `<b>🧠 LLM STATUS</b>\nStatus: ${st.available ? '🟢 verfügbar' : (st.enabled ? '🟡 aktiviert, aber nicht verfügbar' : '⚪ deaktiviert')}\nModel: <code>${escapeHtml(st.model)}</code>\nCooldown: ${Math.round(st.cooldownMs / 1000)}s`);
+    return;
+  }
+
+  if (command === '/llm_on') {
+    if (!config.GEMINI_API_KEY) { await sendTelegramReply(chatId, '⚠️ GEMINI_API_KEY fehlt. LLM bleibt deaktiviert.'); return; }
+    llmEngine.enable(config.GEMINI_API_KEY); config.AI_LLM_ENABLED = true;
+    await sendTelegramReply(chatId, '🟢 <b>LLM Reviewer aktiviert.</b> Er darf keine Hard-Risk-Gates umgehen.');
+    return;
+  }
+
+  if (command === '/llm_off') {
+    llmEngine.disable(); config.AI_LLM_ENABLED = false;
+    await sendTelegramReply(chatId, '⚪ <b>LLM Reviewer deaktiviert.</b>');
+    return;
+  }
+
+  if (command === '/llm_test') {
+    const st = llmEngine.status();
+    if (!st.available) { await sendTelegramReply(chatId, '⚠️ LLM ist nicht verfügbar. Nutze /llm_status.'); return; }
+    const result = await llmEngine.analyzeSignal({ symbol:'TEST-USDT', direction:'LONG', marketPhase:currentMarketPhase, signalScore:80, mlProbability:0.72, dqnAction:1, confluenceScore:75, ichimokuScore:70, volumeMACDScore:68, cvdScore:65, trend1h:'BULLISH', trend4h:'BULLISH', adx:25, rsi:55, atrPct:1.5, spreadPct:0.05, fundingRate:0 });
+    await sendTelegramReply(chatId, `🧠 <b>LLM TEST</b>\nResult: ${result.approved ? '✅ APPROVED' : '❌ REJECTED'}\nConfidence: ${(Number(result.confidence || 0) * 100).toFixed(0)}%\nRisk: ${escapeHtml(result.risk || 'N/A')}\n${(result.reasons || []).map(x => `• ${escapeHtml(x)}`).join('\n')}`);
+    return;
+  }
+
+  if (command === '/ai_hardening' || command === '/ai_architecture') {
+    const drift = modelDriftMonitor.status();
+    const wf = walkForwardEngine.windows(1000).length;
+    const attr = agentAttribution.summary().slice(0, 5).map(x => `${x.agent}: avg=${Number(x.avgScore).toFixed(2)} pnl=${Number(x.avgPnl).toFixed(2)}`).join('\n') || 'noch keine Attribution-Daten';
+    await sendTelegramReply(chatId, `<b>🧠 AI HARDENING</b>\nInstitutional Agent Suite: 🟢\nAI Orchestrator: ${config.AI_AGENTS_ENABLED ? '🟢' : '⚪'}\nLLM Reviewer: ${llmEngine.status().enabled ? '🟢' : '⚪'}\nWalk-Forward-Fenster (1000 Bars): ${wf}\nDrift: ${drift.drift ? '🔴 DRIFT' : '🟢 STABLE'} (${Number(drift.score).toFixed(2)})\n\n<b>Agent Attribution</b>\n${escapeHtml(attr)}`);
+    return;
+  }
+
+  if (command === '/drift' || command === '/model_drift') {
+    const st = modelDriftMonitor.status();
+    await sendTelegramReply(chatId, `<b>📉 MODEL DRIFT</b>\nStatus: ${st.drift ? '🔴 DRIFT' : '🟢 STABLE'}\nScore: <b>${Number(st.score).toFixed(3)}</b>\nReason: ${escapeHtml(st.reason || 'n/a')}`);
+    return;
+  }
+
+  if (command === '/agent_attribution' || command === '/agent_stats') {
+    const rows = agentAttribution.summary();
+    await sendTelegramReply(chatId, `<b>📊 AGENT ATTRIBUTION</b>\n${rows.length ? rows.map(x => `• ${escapeHtml(x.agent)}: n=${x.count}, avg=${Number(x.avgScore).toFixed(2)}, veto=${x.vetoes}, avgPnL=${Number(x.avgPnl).toFixed(2)}`).join('\n') : 'Noch keine Daten.'}`);
+    return;
+  }
+
+  if (command === '/kill_status') {
+    const riskState = riskEngine.killSwitch ? '🔴 ACTIVE / FAIL-CLOSED' : '🟢 not active';
+    const circuit = Date.now() < kucoinCircuitOpenUntil ? '🔴 OPEN' : '🟢 CLOSED';
+    await sendTelegramReply(chatId, `🛡️ <b>SAFETY STATUS</b>\nRiskEngine kill-switch: ${riskState}\nKuCoin circuit breaker: ${circuit}\nBot paused: ${isPaused ? '🟡 YES' : '🟢 NO'}`);
+    return;
+  }
+
+  if (command === '/signals' || command === '/top_signals' || command === '/anomalies' || command === '/regime') {
+    const phase = currentMarketPhase || 'UNKNOWN';
+    await sendTelegramReply(chatId, `📊 <b>MARKET AI SNAPSHOT</b>\nPhase: <b>${escapeHtml(phase)}</b>\nLetzter Scan: ${lastScanTime ? new Date(lastScanTime).toISOString() : 'noch keiner'}\n\nNutze /scanstats für den vollständigen Scan-Report.`);
+    return;
+  }
+
+  if (command === '/risk') {
+    const equity = config.CAPITAL_USD + dailyNetPnL;
+    const dd = peakCapital > 0 ? ((peakCapital - equity) / peakCapital * 100) : 0;
+    await sendTelegramReply(chatId, `🛡️ <b>RISK SNAPSHOT</b>\nExposure-Limit: ${((config.MAX_EXPOSURE_RATIO || 0) * 100).toFixed(1)}% Margin\nLeverage: ${config.LEVERAGE}x\nRisk/Trade: ${config.RISK_PERCENT}%\nEquity: $${equity.toFixed(2)}\nDaily PnL: $${dailyNetPnL.toFixed(2)}\nDrawdown: ${dd.toFixed(2)}%\nTrades: ${activeTrades.size}/${config.MAX_CONCURRENT_TRADES}`);
+    return;
+  }
+
+  if (command === '/explain') {
+    const symbol = args[0] ? (args[0].toUpperCase().endsWith('-USDT') ? args[0].toUpperCase() : `${args[0].toUpperCase()}-USDT`) : null;
+    if (!symbol) { await sendTelegramReply(chatId, '⚠️ Syntax: <code>/explain BTC-USDT</code>'); return; }
+    await sendTelegramReply(chatId, `🧠 <b>Explain ${escapeHtml(symbol)}</b>\nDie detaillierte Erklärung wird beim nächsten Kandidaten-Scan aus Agent-, ML- und DQN-Ergebnissen erzeugt.\n\nNutze /scan für einen aktuellen Scan.`);
+    return;
+  }
+
+  if (command === '/confluence') {
+    const symbol = args[0] ? (args[0].toUpperCase().endsWith('-USDT') ? args[0].toUpperCase() : `${args[0].toUpperCase()}-USDT`) : null;
+    await sendTelegramReply(chatId, symbol ? `🔗 <b>Confluence ${escapeHtml(symbol)}</b> wird pro Signal im Agent-Report bewertet.` : '🔗 Confluence wird pro Signal im Agent-Report bewertet. Nutze /scan und /scanstats.');
+    return;
+  }
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
