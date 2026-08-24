@@ -25,3 +25,7 @@ Execution remains fail-closed:
 - `.nvmrc` is pinned to Node 22.14.0.
 - `package.json` uses `engines.node = 22.x` and pins `@tensorflow/tfjs-node` to 4.22.0.
 - Telegram AI commands are registered automatically via the Telegram `setMyCommands` API at startup, including a per-chat command menu for configured `TELEGRAM_CHAT_ID` values.
+
+## Institutional v25 hardening
+
+Use Node 22.x and start with `node trading-bot-v25.js`. Set `API_KEY`, `MODEL_REGISTRY_DIR`, and `AUDIT_TRAIL_FILE`. Keep `LIVE_TRADING_ENABLED=false` and `BACKTEST_API_ENABLED=false` for paper/shadow deployments. Run `npm run check` and `npm test` in CI before deployment.

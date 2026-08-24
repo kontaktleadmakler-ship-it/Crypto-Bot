@@ -63,13 +63,13 @@ class ExecutionSimulator {
   simulateMarketOrder({ symbol, direction, referencePrice, quantity, orderBook = null, liquidity = 'taker' } = {}) {
     const side = String(direction).toUpperCase() === 'SHORT' ? 'SELL' : 'BUY';
     const fillPrice = this.estimateFillPrice({ side, referencePrice, quantity, orderBook, liquidity });
-    const notionalUSD = Math.abs(fillPrice * this._num(quantity));
-    const feeUSD = this.estimateFee(notionalUSD, liquidity);
     const requestedQty = Math.abs(this._num(quantity));
     const partialRatio = Math.min(1, Math.max(0.000001,
       this._num(this.config.PAPER_FILL_RATIO, 1)));
     const filledQty = requestedQty * partialRatio;
     const filledNotionalUSD = Math.abs(fillPrice * filledQty);
+    // Fees are charged on the quantity actually filled, never on the requested quantity.
+    const feeUSD = this.estimateFee(filledNotionalUSD, liquidity);
 
     return {
       fillPrice,

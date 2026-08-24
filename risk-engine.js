@@ -3,7 +3,7 @@
 /** B6: Central, deterministic portfolio risk gate. Fail-closed on invalid input. */
 class RiskEngine {
   constructor({ config = {}, logger = console } = {}) { this.config = config; this.logger = logger; this.killSwitch = false; }
-  setKillSwitch(enabled, reason = 'manual') { this.killSwitch = Boolean(enabled); return { enabled: this.killSwitch, reason }; }
+  setKillSwitch(enabled = true, reason = 'manual') { if (typeof enabled === 'string') { reason = enabled; enabled = true; } this.killSwitch = Boolean(enabled); return { enabled: this.killSwitch, reason }; }
   _n(v, fallback = 0) { const n = Number(v); return Number.isFinite(n) ? n : fallback; }
   assess({ equity, peakEquity, dailyPnL = 0, openPositions = [], proposed = null } = {}) {
     const eq = this._n(equity); const peak = this._n(peakEquity, eq);
@@ -47,5 +47,19 @@ class RiskEngine {
       leverage
     };
   }
+  // Legacy compatibility API. The canonical interface is assess().
+  evaluate({ equityUSD, peakEquityUSD, dailyPnL = 0, activeTrades = [], notionalUSD = 0, maxExposureRatio, maxDailyLossUSD, maxDrawdownPercent, leverage } = {}) {
+    const cfg = { ...this.config };
+    if (maxExposureRatio !== undefined) cfg.MAX_EXPOSURE_RATIO = maxExposureRatio;
+    if (maxDailyLossUSD !== undefined) cfg.MAX_DAILY_LOSS_USD = maxDailyLossUSD;
+    if (maxDrawdownPercent !== undefined) cfg.MAX_DRAWDOWN_PERCENT = maxDrawdownPercent;
+    if (leverage !== undefined) cfg.LEVERAGE = leverage;
+    const previous = this.config; this.config = cfg;
+    try {
+      const openPositions = activeTrades.map(t => ({ notionalUSD: t.notionalUSD ?? t.quantity * t.entryPrice }));
+      return this.assess({ equity: equityUSD, peakEquity: peakEquityUSD, dailyPnL, openPositions, proposed: { notionalUSD } });
+    } finally { this.config = previous; }
+  }
+
 }
 module.exports = { RiskEngine };

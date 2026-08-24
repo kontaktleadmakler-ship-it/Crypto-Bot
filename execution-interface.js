@@ -1,18 +1,21 @@
 'use strict';
 const crypto = require('crypto');
 const axios = require('axios');
+const { LiveExecutionGate } = require('./institutional-core/live-execution-gate');
 
 class ExecutionHaltedError extends Error { constructor(message = 'Execution halted') { super(message); this.name = 'ExecutionHaltedError'; } }
 
 class ExecutionInterface {
-  constructor({ dryRun = true, killSwitch = true, logger = console } = {}) {
+  constructor({ dryRun = true, killSwitch = true, liveTradingEnabled = false, readinessProvider = () => ({ ready: false }), logger = console } = {}) {
     this.dryRun = Boolean(dryRun);
     this.killSwitch = Boolean(killSwitch);
     this.logger = logger;
+    this.liveGate = new LiveExecutionGate({ enabled: liveTradingEnabled, readinessProvider });
   }
   assertCanExecute(order) {
     if (this.killSwitch) throw new ExecutionHaltedError('Global kill-switch is active');
     if (!order?.symbol || !order?.side || !order?.type) throw new Error('Invalid order');
+    if (!this.dryRun) this.liveGate.assertAllowed();
   }
   async placeOrder() { throw new Error('placeOrder() must be implemented by an exchange adapter'); }
   async cancelOrder() { throw new Error('cancelOrder() must be implemented by an exchange adapter'); }
