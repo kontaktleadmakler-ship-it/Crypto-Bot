@@ -43,6 +43,23 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+function classificationMetrics(probabilities, labels, threshold = 0.5) {
+  let tp = 0, tn = 0, fp = 0, fn = 0;
+  for (let i = 0; i < probabilities.length; i++) {
+    const pred = Number(probabilities[i]) >= threshold ? 1 : 0;
+    const y = Number(labels[i]) ? 1 : 0;
+    if (pred === 1 && y === 1) tp++;
+    else if (pred === 0 && y === 0) tn++;
+    else if (pred === 1) fp++;
+    else fn++;
+  }
+  const recall = tp + fn ? tp / (tp + fn) : 0;
+  const specificity = tn + fp ? tn / (tn + fp) : 0;
+  const precision = tp + fp ? tp / (tp + fp) : 0;
+  const balancedAccuracy = (recall + specificity) / 2;
+  return { tp, tn, fp, fn, precision, recall, specificity, balancedAccuracy };
+}
+
 function probabilityMetrics(probabilities, labels, bins = 10) {
   if (!probabilities.length || probabilities.length !== labels.length) return { brierScore: 0, logLoss: 0, calibrationError: 0 };
   let brier = 0, logLoss = 0;
@@ -94,6 +111,10 @@ class TensorFlowSignalModel {
       positiveRate: 0,
       validationAccuracy: 0,
       validationLoss: 0,
+      validationBalancedAccuracy: 0,
+      validationPrecision: 0,
+      validationRecall: 0,
+      selectionScore: 0,
       epochs: 0,
       trainedAt: null,
       modelVersion: null,
@@ -140,17 +161,17 @@ class TensorFlowSignalModel {
   }
 
   featuresFromTrade(trade) {
-    // Bug fix (Punkt 6 - ML-Feature-Leakage): trade.entry ist der tatsächliche
-    // Fill-Preis, der erst NACH Signalentscheidung und Slippage feststeht.
-    // Für die Normalisierung von ATR%/MACD%/POC%/VWAP% muss stattdessen der
-    // Preis zum Zeitpunkt der Signalgenerierung (signalPriceAtEntry) verwendet
-    // werden, sonst lernt das Modell auf leicht verschobenen, zum
-    // Entscheidungszeitpunkt nicht verfügbaren Werten. Fällt auf trade.entry
-    // zurück, falls ältere Trade-Datensätze das Feld noch nicht besitzen.
-    if (!Number.isFinite(Number(trade.signalPriceAtEntry)) || Number(trade.signalPriceAtEntry) <= 0) {
-      return null;
-    }
-    const currentPrice = Number(trade.signalPriceAtEntry);
+    // Neue Trades verwenden den echten Signalpreis. Ältere Trades besitzen
+    // dieses Feld ggf. noch nicht; sie dürfen deshalb nicht die komplette
+    // Trainingsmenge unbrauchbar machen. Für Legacy-Daten fällt das Modell
+    // kontrolliert auf den Fill-Preis `entry` zurück. Neue Trades bleiben
+    // weiterhin leak-frei, weil signalPriceAtEntry beim Signal gespeichert wird.
+    const signalPrice = Number(trade.signalPriceAtEntry);
+    const fillPrice = Number(trade.entry);
+    const currentPrice = Number.isFinite(signalPrice) && signalPrice > 0
+      ? signalPrice
+      : (Number.isFinite(fillPrice) && fillPrice > 0 ? fillPrice : NaN);
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0) return null;
     const atrPct = trade.atrPctAtEntry != null
       ? finite(trade.atrPctAtEntry, 0)
       : (currentPrice > 0 && trade.atrAtEntry ? (finite(trade.atrAtEntry) / currentPrice) * 100 : 0);
@@ -219,10 +240,20 @@ class TensorFlowSignalModel {
     this.training = true;
     try {
       const force = !!options.force;
-      const trades = await collection.find({ isPartial: { $ne: true }, pnlUSD: { $exists: true } })
-        .sort({ closeTime: 1 })
+      this.logger.info(`🧠 [TensorFlow.js] Training gestartet | backend=${tf.getBackend()} | force=${force}`);
+      const trades = await collection.find({
+        isPartial: { $ne: true },
+        pnlUSD: { $exists: true, $ne: null }
+      })
+        // Use the newest completed trades, then restore chronological order.
+        // Training on the oldest 2,000 trades caused severe regime staleness.
+        .sort({ closeTime: -1 })
         .limit(this.maxSamples)
         .toArray();
+      trades.reverse();
+
+      const legacyWithoutSignalPrice = trades.filter(t => !(Number.isFinite(Number(t.signalPriceAtEntry)) && Number(t.signalPriceAtEntry) > 0)).length;
+      this.logger.info(`🧠 [TensorFlow.js] Trainingsdaten geladen: raw=${trades.length}, min=${this.minSamples}, legacyEntryFallback=${legacyWithoutSignalPrice}`);
 
       if (trades.length < this.minSamples) {
         this.logger.warn(`🧠 [TensorFlow.js] Zu wenige Trainingsdaten: ${trades.length}/${this.minSamples}`);
@@ -238,7 +269,9 @@ class TensorFlowSignalModel {
         .filter(item => Array.isArray(item.features) && item.features.length === FEATURE_NAMES.length && item.features.every(Number.isFinite));
 
       if (dataset.length < this.minSamples) {
-        return { trained: false, reason: 'not-enough-valid-data', samples: dataset.length };
+        const invalid = trades.length - dataset.length;
+        this.logger.warn(`🧠 [TensorFlow.js] Zu wenige valide Trainingszeilen: valid=${dataset.length}/${this.minSamples}, invalid=${invalid}`);
+        return { trained: false, reason: 'not-enough-valid-data', samples: dataset.length, rawSamples: trades.length, invalidSamples: invalid, legacyEntryFallback: legacyWithoutSignalPrice };
       }
 
       const positives = dataset.filter(x => x.label === 1).length;
@@ -266,10 +299,13 @@ class TensorFlowSignalModel {
       ];
 
       let bestCandidate = null;
+      let bestSelectionScore = -Infinity;
       let bestValAccuracy = -1;
       let bestValLoss = Infinity;
+      let bestClassification = null;
       let bestHistory = null;
       let bestBestConfig = null;
+      let lastFitError = null;
 
       this.logger.star?.(`🧠 [TensorFlow.js] Starte automatisches Hyperparameter-Tuning (${hyperparameterGrid.length} Kombinationen)...`) || 
       this.logger.info(`🧠 [TensorFlow.js] Starte automatisches Hyperparameter-Tuning (${hyperparameterGrid.length} Kombinationen)...`);
@@ -301,9 +337,11 @@ class TensorFlowSignalModel {
               validationData: [vx, vy],
               shuffle: false,
               verbose: 0,
-              callbacks: tf.callbacks.earlyStopping({ monitor: 'val_loss', patience: 6, restoreBestWeight: true })
+              callbacks: tf.callbacks.earlyStopping({ monitor: 'val_loss', patience: 6, restoreBestWeights: true })
             });
           } catch (fitErr) {
+            lastFitError = fitErr;
+            this.logger.error(`🧠 [TensorFlow.js] Fit-Fehler (lr=${config.learningRate}, units=${config.units}, batch=${config.batchSize}): ${fitErr.message}`);
             candidateModel.dispose();
             continue;
           }
@@ -316,11 +354,19 @@ class TensorFlowSignalModel {
 
           const acc = finite(evalAcc[0], 0);
           const loss = finite(evalLoss[0], 0);
+          const candidateProbs = tf.tidy(() => Array.from(candidateModel.predict(tf.tensor2d(xVal, [xVal.length, FEATURE_NAMES.length])).dataSync()));
+          const cls = classificationMetrics(candidateProbs, yVal);
+          const prob = probabilityMetrics(candidateProbs, yVal);
+          // Trading models should not win a tuning round merely by predicting
+          // the majority class. Favor balanced accuracy and calibration while
+          // retaining some weight for raw accuracy.
+          const selectionScore = 0.45 * cls.balancedAccuracy + 0.20 * acc + 0.20 * (1 - prob.brierScore) + 0.15 * (1 - prob.calibrationError);
 
-          // Prio 1: Accuracy, Prio 2: Loss bei gleicher Accuracy
-          if (acc > bestValAccuracy || (acc === bestValAccuracy && loss < bestValLoss)) {
+          if (selectionScore > bestSelectionScore || (Math.abs(selectionScore - bestSelectionScore) < 1e-9 && loss < bestValLoss)) {
+            bestSelectionScore = selectionScore;
             bestValAccuracy = acc;
             bestValLoss = loss;
+            bestClassification = cls;
             if (bestCandidate) bestCandidate.dispose();
             bestCandidate = candidateModel;
             bestHistory = history;
@@ -334,7 +380,9 @@ class TensorFlowSignalModel {
       }
 
       if (!bestCandidate) {
-        return { trained: false, reason: 'tuning-failed' };
+        const reason = lastFitError ? `tuning-failed: ${lastFitError.message}` : 'tuning-failed';
+        this.logger.error(`🧠 [TensorFlow.js] Kein trainierbares Modell: ${reason}`);
+        return { trained: false, reason, samples: dataset.length, positiveSamples: positives, negativeSamples: negatives };
       }
 
       let probabilityStats = { brierScore: 0, logLoss: 0, calibrationError: 0 };
@@ -347,6 +395,9 @@ class TensorFlowSignalModel {
 
       const validationAccuracy = bestValAccuracy;
       const validationLoss = bestValLoss;
+      const validationBalancedAccuracy = finite(bestClassification?.balancedAccuracy, 0);
+      const validationPrecision = finite(bestClassification?.precision, 0);
+      const validationRecall = finite(bestClassification?.recall, 0);
 
       const oldAccuracy = finite(this.stats.validationAccuracy, 0);
       if (!force && this.trained && validationAccuracy + 0.02 < oldAccuracy) {
@@ -375,6 +426,10 @@ class TensorFlowSignalModel {
         positiveRate: positives / dataset.length,
         validationAccuracy,
         validationLoss,
+        validationBalancedAccuracy,
+        validationPrecision,
+        validationRecall,
+        selectionScore: bestSelectionScore,
         brierScore: probabilityStats.brierScore,
         logLoss: probabilityStats.logLoss,
         calibrationError: probabilityStats.calibrationError,
@@ -387,7 +442,7 @@ class TensorFlowSignalModel {
       };
 
       await this.save();
-      this.logger.info(`🧠 [TensorFlow.js] Getuntes Modell erfolgreich trainiert: ${dataset.length} Trades | Val-Accuracy ${(validationAccuracy * 100).toFixed(1)}% | Val-Loss ${validationLoss.toFixed(4)} | Brier ${probabilityStats.brierScore.toFixed(4)} | ECE ${probabilityStats.calibrationError.toFixed(4)}`);
+      this.logger.info(`🧠 [TensorFlow.js] Getuntes Modell erfolgreich trainiert: ${dataset.length} Trades | Val-Acc ${(validationAccuracy * 100).toFixed(1)}% | Balanced ${(validationBalancedAccuracy * 100).toFixed(1)}% | Precision ${(validationPrecision * 100).toFixed(1)}% | Recall ${(validationRecall * 100).toFixed(1)}% | Brier ${probabilityStats.brierScore.toFixed(4)} | ECE ${probabilityStats.calibrationError.toFixed(4)}`);
       return { trained: true, ...this.getStats() };
     } catch (e) {
       this.logger.error(`🧠 [TensorFlow.js] Training fehlgeschlagen: ${e.stack || e.message}`);

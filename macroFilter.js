@@ -79,3 +79,13 @@ class MacroFilterEngine {
 }
 
 module.exports = { MacroFilterEngine };
+
+
+// Hardened freshness guard: stale/unavailable macro data must fail closed.
+function isSentimentFresh(sentiment, maxStaleMs = 30 * 60 * 1000) {
+  if (!sentiment || !Number.isFinite(sentiment.fetchedAt)) return false;
+  return Date.now() - sentiment.fetchedAt <= maxStaleMs;
+}
+
+module.exports = module.exports || {};
+module.exports.isSentimentFresh = isSentimentFresh;

@@ -292,6 +292,14 @@ class PaperExecutionAdapter {
     return [...this.orders.values()];
   }
 
+  getOrderStatus({ clientOrderId, exchangeOrderId } = {}) {
+    const order = [...this.orders.values()].find(o =>
+      (exchangeOrderId && (o.orderId === exchangeOrderId || o._id === exchangeOrderId)) ||
+      (clientOrderId && (o.clientOrderId === clientOrderId || o.signalId === clientOrderId))
+    );
+    return order || null;
+  }
+
   async restore() {
     if (!this.collection) return;
     const docs = await this.collection.find({ status: 'FILLED', symbol: { $exists: true } })

@@ -53,7 +53,9 @@ class ExecutionRouter {
     const quotes = this.adapters.map(a => ({ adapter: a, quote: a.getQuote ? a.getQuote(order.symbol) : null })).filter(x => x.quote);
     if (!quotes.length) throw new Error('No execution venue with quote');
     const best = order.side === 'buy' ? quotes.reduce((a, b) => a.quote.ask < b.quote.ask ? a : b) : quotes.reduce((a, b) => a.quote.bid > b.quote.bid ? a : b);
-    return best.adapter.placeOrder(order);
+    // Legacy execution router is intentionally disabled. All runtime execution
+    // must enter through execution-core/protected-submit.js.
+    throw new ExecutionHaltedError('LEGACY_EXECUTION_ROUTER_DISABLED_USE_EXECUTION_CORE');
   }
 }
 
