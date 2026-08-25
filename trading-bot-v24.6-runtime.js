@@ -3246,6 +3246,10 @@ async function scanMarket() {
       ? spotWatchlist.filter(isFuturesContractTradable) 
       : spotWatchlist;
 
+    dashboardScanUniverse = [...dynamicWatchlist];
+    dashboardScanState = { scanning: true, startedAt: Date.now(), finishedAt: null, counter: scanCounter + 1, checked: 0, signals: 0 };
+    dashboardScanCache.ts = 0;
+
     if (dynamicWatchlist.length === 0) {
       logger.warn('⚠️ Watchlist ist leer!');
       isScanning = false;
@@ -3260,6 +3264,7 @@ async function scanMarket() {
 
     await asyncPool(config.SCAN_CONCURRENCY, dynamicWatchlist, async (symbol) => {
       scanStats.total++;
+      dashboardScanState.checked = scanStats.total;
 
       if (activeTrades.has(symbol)) { 
         scanStats.skippedActiveTrade++; 
@@ -3777,6 +3782,8 @@ async function scanMarket() {
 
     lastScanStats = scanStats;
     scanCounter++;
+    dashboardScanState = { scanning: false, startedAt: dashboardScanState.startedAt, finishedAt: Date.now(), counter: scanCounter, checked: scanStats.total, signals: signalsSent };
+    dashboardScanCache.ts = 0;
 
     if (scanCounter % config.SCAN_STATS_TELEGRAM_EVERY_N_SCANS === 0) {
       await sendTelegramAlert(formatScanStatsReport(scanStats));
@@ -3797,6 +3804,10 @@ async function scanMarket() {
     logger.error(err.stack);
   } finally {
     isScanning = false;
+    if (dashboardScanState.scanning) {
+      dashboardScanState = { ...dashboardScanState, scanning: false, finishedAt: Date.now() };
+    }
+    dashboardScanCache.ts = 0;
   }
 }
 
@@ -4759,7 +4770,7 @@ app.use(express.json({ limit: '256kb' }));
 app.use((req, res, next) => {
   // Liveness endpoint is intentionally public: UptimeRobot cannot supply
   // the bot's private API key. Authentication remains mandatory everywhere else.
-  if (req.path === '/health' || req.path === '/dashboard' || req.path === '/api/dashboard/live') return next();
+  if (req.path === '/health' || req.path === '/dashboard' || req.path.startsWith('/api/dashboard/')) return next();
   if (config.ALLOW_UNAUTHENTICATED_API) return next();
   if (!config.API_KEY) return res.status(503).json({ error: 'API_KEY_NOT_CONFIGURED' });
   if (req.get('X-API-Key') !== config.API_KEY) return res.status(401).json({ error: 'UNAUTHORIZED' });
@@ -4780,6 +4791,55 @@ app.get('/', (req, res) => {
 const dashboardCache = new Map();
 const DASHBOARD_CACHE_MS = 1200;
 let dashboardEventCounter = 0;
+let dashboardScanUniverse = [];
+let dashboardScanState = { scanning: false, startedAt: null, finishedAt: null, counter: 0, checked: 0, signals: 0 };
+const dashboardScanCache = { ts: 0, data: null };
+
+function dashboardSma(values, period) {
+  if (!values?.length) return 0;
+  const a = values.slice(-period);
+  return a.reduce((sum, v) => sum + Number(v || 0), 0) / Math.max(1, a.length);
+}
+
+async function getDashboardScanMatrix() {
+  const now = Date.now();
+  if (dashboardScanCache.data && now - dashboardScanCache.ts < 1800) return dashboardScanCache.data;
+  let universe = dashboardScanUniverse.length ? [...dashboardScanUniverse] : await getTopKucoinPairs(config.TOP_COIN_LIMIT);
+  universe = universe.filter(isFuturesContractTradable);
+  if (!universe.length) universe = ['BTC-USDT','ETH-USDT','SOL-USDT','XRP-USDT'];
+  const symbols = universe.slice(0, Math.max(6, Math.min(20, Number(config.TOP_COIN_LIMIT || 12))));
+  const rows = [];
+  await asyncPool(4, symbols, async (sym) => {
+    try {
+      const [ticker, candles] = await Promise.all([
+        fetchKucoinTickerPrice(sym),
+        fetchKucoinKlinesCached(sym, '15m', 60)
+      ]);
+      if (!Number.isFinite(Number(ticker)) || !candles?.length) return;
+      const closes = candles.map(c => Number(c.close));
+      const price = Number(ticker);
+      const previous = closes[Math.max(0, closes.length - 4)] || closes[0] || price;
+      const change = previous ? ((price - previous) / previous) * 100 : 0;
+      const rsi = calculateRSI(closes, 14);
+      const macd = calculateMACD(closes);
+      const ma20 = calculateEMA(closes, 20);
+      const ma50 = calculateEMA(closes, 50);
+      const volatility = dashboardVolatility(closes);
+      const tech = rsi >= 25 && rsi <= 75;
+      const trend = ma20 > ma50 ? 'BULL' : ma20 < ma50 ? 'BEAR' : 'FLAT';
+      rows.push({ symbol: sym, price, change, rsi, macd: Number(macd.histogram || 0), ma20, ma50, volatility, trend, tech, timestamp: now });
+    } catch (_) {}
+  });
+  rows.sort((a,b) => symbols.indexOf(a.symbol) - symbols.indexOf(b.symbol));
+  const data = {
+    timestamp: now,
+    scan: { ...dashboardScanState, universe: symbols, isScanning: isScanning },
+    rows
+  };
+  dashboardScanCache.ts = now;
+  dashboardScanCache.data = data;
+  return data;
+}
 
 function dashboardSharpe(closes) {
   if (!closes || closes.length < 20) return 0;
@@ -4912,7 +4972,7 @@ async function getDashboardData(symbol) {
 }
 
 app.get('/dashboard', (req, res) => {
-  res.sendFile(path.join(__dirname, 'dashboard.html'));
+  res.sendFile(require('node:path').join(__dirname, 'dashboard.html'));
 });
 
 app.get('/api/dashboard/live', async (req, res) => {
@@ -4928,6 +4988,17 @@ app.get('/api/dashboard/live', async (req, res) => {
   }
 });
 
+
+app.get('/api/dashboard/scan', async (req, res) => {
+  try {
+    const data = await getDashboardScanMatrix();
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(data);
+  } catch (e) {
+    logger.warn(`[Dashboard Scan] ${e.message}`);
+    res.status(503).json({ error: e.message });
+  }
+});
 
 app.get('/api/v24/readiness', (req, res) => {
   const risk = riskEngine.assess({ equity: config.CAPITAL_USD + dailyNetPnL, peakEquity: peakCapital, dailyPnL: dailyNetPnL, openPositions: [...activeTrades.values()] });
