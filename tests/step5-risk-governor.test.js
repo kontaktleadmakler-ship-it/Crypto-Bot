@@ -1,0 +1,11 @@
+'use strict';
+const assert = require('assert');
+const { RiskGovernor } = require('../risk-governor');
+
+function base() { return { MAX_DRAWDOWN_PERCENT: 10, MAX_DAILY_LOSS_USD: 100, MAX_EXPOSURE_RATIO: 0.6, LEVERAGE: 3, RISK_GOVERNOR_MAX_SPREAD_PCT: 0.15, RISK_GOVERNOR_MAX_SLIPPAGE_PCT: 0.2, RISK_GOVERNOR_MAX_MARKET_DATA_AGE_MS: 5000, RISK_GOVERNOR_MAX_EXCHANGE_LATENCY_MS: 3000, RISK_GOVERNOR_MAX_VOLATILITY_PCT: 12, RISK_GOVERNOR_MAX_CONCENTRATION_PCT: 60, RISK_GOVERNOR_MAX_CORRELATION_PCT: 90 }; }
+function testNormal() { const g = new RiskGovernor({config:base(), logger:{warn(){}}}); assert.equal(g.evaluate({equity:1000,peakEquity:1000}).state,'NORMAL'); assert.doesNotThrow(()=>g.assertExecutionAllowed({action:'OPEN'})); }
+function testReducedAndNoAutoRecovery() { const g = new RiskGovernor({config:base(), logger:{warn(){}}}); assert.equal(g.evaluate({equity:920,peakEquity:1000}).state,'REDUCED'); assert.throws(()=>g.assertExecutionAllowed({action:'OPEN'}),/RISK_GOVERNOR_REDUCED/); g.evaluate({equity:1000,peakEquity:1000}); assert.equal(g.state,'REDUCED'); g.recoverToNormal(); assert.equal(g.state,'NORMAL'); }
+function testHaltButRiskReductionAllowed() { const g = new RiskGovernor({config:base(), logger:{warn(){}}}); assert.equal(g.evaluate({equity:900,peakEquity:1000}).state,'HALT'); assert.throws(()=>g.assertExecutionAllowed({action:'OPEN'}),/RISK_GOVERNOR_HALT/); assert.doesNotThrow(()=>g.assertExecutionAllowed({action:'REDUCE'})); assert.doesNotThrow(()=>g.assertExecutionAllowed({action:'CLOSE'})); }
+function testEmergency() { const g = new RiskGovernor({config:base(), logger:{warn(){}}}); assert.equal(g.evaluate({equity:870,peakEquity:1000}).state,'EMERGENCY'); assert.throws(()=>g.assertExecutionAllowed({action:'OPEN'}),/RISK_GOVERNOR_EMERGENCY/); assert.doesNotThrow(()=>g.assertExecutionAllowed({action:'CLOSE'})); }
+function testMarketAndOrderLimits() { const g = new RiskGovernor({config:base(), logger:{warn(){}}}); assert.equal(g.evaluate({equity:1000,peakEquity:1000,spreadPct:.2}).state,'HALT'); g.recoverToNormal(); assert.equal(g.evaluate({equity:1000,peakEquity:1000,proposed:{notionalUSD:100000}}).state,'HALT'); }
+testNormal(); testReducedAndNoAutoRecovery(); testHaltButRiskReductionAllowed(); testEmergency(); testMarketAndOrderLimits(); console.log('step5-risk-governor: PASS (5 tests)');

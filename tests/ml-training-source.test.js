@@ -1,0 +1,11 @@
+'use strict';
+const assert = require('assert');
+const fs = require('fs');
+const s = fs.readFileSync(require.resolve('../ml-engine'), 'utf8');
+assert(s.includes('const signalPrice = Number(trade.signalPriceAtEntry);'));
+assert(s.includes('const fillPrice = Number(trade.entry);'));
+assert(s.includes("legacyEntryFallback"));
+assert(s.includes('restoreBestWeights: true'));
+assert(s.includes('Fit-Fehler'));
+assert(s.includes('tf.getBackend()'));
+console.log('ML training source regression test: OK');
