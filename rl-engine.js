@@ -221,9 +221,12 @@ class DeepQTheTradingAgent {
     }
     const xs = tf.tensor2d(states);
     const ys = tf.tensor2d(y);
-    const sw = tf.tensor1d(weights);
-    await this.model.fit(xs, ys, { epochs: 1, verbose: 0, sampleWeight: sw });
-    [current,next,currentQ,nextOnline,nextTarget,xs,ys,sw].forEach(t => t && t.dispose());
+    // TensorFlow.js does not support the Keras-style sampleWeight argument in
+    // this model.fit path. PER still controls which experiences are sampled and
+    // priorities are updated from TD-errors below; do not pass an unsupported
+    // weight tensor that makes training fail at runtime.
+    await this.model.fit(xs, ys, { epochs: 1, verbose: 0 });
+    [current,next,currentQ,nextOnline,nextTarget,xs,ys].forEach(t => t && t.dispose());
     this.replay.updatePriorities(indices, errors);
     this.trainingSteps++;
     if (this.trainingSteps % this.targetUpdateEvery === 0) this.updateTargetModel();
