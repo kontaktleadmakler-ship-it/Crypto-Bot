@@ -1,3 +1,15 @@
+
+// P1-P4 execution hardening integration
+import { ExecutionState, ExecutionStateMachine } from './execution-core/execution-state-machine.js';
+import { AtomicIdempotency } from './execution-core/atomic-idempotency.js';
+import { ExecutionEventStore } from './execution-core/execution-event-store.js';
+import { FencingLease } from './execution-core/fencing-lease.js';
+import { SymbolExecutionLock } from './symbol-execution-lock.js';
+import { assertPreTradeSafe } from './pre-trade-gate.js';
+import { RecoveryCoordinator } from './execution-core/recovery-coordinator.js';
+import { protectedSubmit } from './execution-core/protected-submit.js';
+import { CriticalStateQueue } from './execution-core/critical-state-queue.js';
+
 /**
  * ============================================================================
  * TRADING SIGNAL BOT - v24.6 INSTITUTIONAL EDITION
@@ -24,8 +36,10 @@ const { ExecutionSimulator } = require('./execution-simulator');
 const { ExecutionIdempotency } = require('./execution-idempotency');
 const { PaperExecutionAdapter } = require('./paper-execution-adapter');
 const { ReconciliationEngine } = require('./reconciliation-engine');
+const { OrderBookEngine } = require('./orderbook-engine');
 const { ExecutionParity } = require('./execution-parity');
 const { RiskEngine } = require('./risk-engine');
+const { RiskGovernor } = require('./risk-governor');
 const { splitWalkForward } = require('./walk-forward-validator');
 const { evaluateProbabilities } = require('./ml-evaluation');
 const { evaluateActions } = require('./dqn-evaluation');
@@ -39,6 +53,8 @@ const { SafetyController } = require('./institutional-core/safety-controller');
 const { PortfolioLedger } = require('./institutional-core/portfolio-ledger');
 const { ProductionReadinessGate } = require('./institutional-core/readiness-gate');
 const { AuditTrail } = require('./audit-trail');
+const { DynamicTimeStopAgent } = require('./dynamic-time-stop-agent');
+const { TimesFMForecastAgent } = require('./timesfm-forecast-agent');
 
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
@@ -693,7 +709,155 @@ client.on('error', (err) => {
 let tradesCollection, closedTradesCollection, botStateCollection, lockCollection, marketPhaseLogsCollection, filterChangeLogCollection;
 let paperOrdersCollection, executionIdempotencyCollection;
 const activeTrades = new Map();
+// ===== Integrated Execution Core (P1-P4) =====
+const symbolExecutionLock = new SymbolExecutionLock();
+let executionIdempotency = null;
+let executionEventStore = null;
+let fencingLease = null;
+let currentFencingToken = 0;
+let executionCoreReady = false;
+let orderBookEngine = new OrderBookEngine({
+  logger,
+  maxAgeMs: Number(process.env.ORDERBOOK_MAX_AGE_MS || process.env.MAX_MARKET_DATA_AGE_MS || 1500),
+  depth: Number(process.env.ORDERBOOK_DEPTH_LEVELS || 10),
+  onTradingPause: ({ symbol, reason }) => {
+    logger.error?.(`[MARKET-DATA] TRADING PAUSE ${symbol}: ${reason}`);
+  }
+});
+
+function makeExecutionId(symbol, side, clientOrderId = '') {
+  return clientOrderId || `${symbol}:${side}:${Date.now()}:${crypto.randomUUID()}`;
+}
+
+async function initializeExecutionCore() {
+  if (!db || !isDbConnected) {
+    executionCoreReady = false;
+    return false;
+  }
+
+  const executionCollection = db.collection('executionIntents');
+  const executionEvents = db.collection('executionEvents');
+  const executionOutbox = db.collection('executionOutbox');
+  const leaseCollection = db.collection('instanceLeases');
+
+  executionIdempotency = new AtomicIdempotency({
+    collection: executionCollection,
+    logger
+  });
+
+  executionEventStore = new ExecutionEventStore({
+    eventsCollection: executionEvents,
+    outboxCollection: executionOutbox,
+    logger
+  });
+
+  fencingLease = new FencingLease({
+    collection: leaseCollection,
+    instanceId,
+    leaseMs: 15000
+  });
+
+  const lease = await fencingLease.acquire();
+  if (!lease.acquired) {
+    executionCoreReady = false;
+    logger.error?.('[EXECUTION] fencing lease not acquired');
+    return false;
+  }
+
+  currentFencingToken = lease.fencingToken;
+  executionCoreReady = true;
+  return true;
+}
+
+async function renewExecutionLease() {
+  if (!fencingLease) return false;
+  const result = await fencingLease.renew();
+  if (!result.renewed) {
+    executionCoreReady = false;
+    isPaused = true;
+    logger.error?.('[EXECUTION] fencing lease lost; trading paused');
+    return false;
+  }
+  currentFencingToken = result.fencingToken;
+  return true;
+}
+
+function buildPreTradeContext({ orderBookValid = false, spreadPct = Infinity, marketDataAgeMs = Infinity, risk = { allowed: false, reason: 'UNKNOWN' } } = {}) {
+  return {
+    dbHealthy: isDbConnected === true,
+    instanceLeaseValid: executionCoreReady === true && currentFencingToken > 0,
+    marketDataHealthy: Number.isFinite(marketDataAgeMs),
+    marketDataAgeMs,
+    maxMarketDataAgeMs: Number(process.env.MAX_MARKET_DATA_AGE_MS || 5000),
+    orderBookValid,
+    spreadPct,
+    maxSpreadPct: Number(process.env.MAX_SPREAD_PCT || 1),
+    risk,
+    reconciliationHealthy: global.reconciliationHealthy !== false,
+    killSwitch: global.killSwitch === true
+  };
+}
+
+async function reserveExecutionIntent({ symbol, side, clientOrderId, payload = {} }) {
+  if (!executionCoreReady || !executionIdempotency || !executionEventStore) {
+    throw new Error('EXECUTION_CORE_NOT_READY');
+  }
+
+  const executionId = makeExecutionId(symbol, side, clientOrderId);
+  const reservation = await executionIdempotency.reserve(executionId, {
+    executionId,
+    symbol,
+    side,
+    clientOrderId,
+    fencingToken: currentFencingToken
+  });
+
+  if (!reservation.acquired) {
+    throw new Error(`DUPLICATE_EXECUTION:${executionId}`);
+  }
+
+  const sm = new ExecutionStateMachine({
+    state: ExecutionState.INTENT_CREATED
+  });
+
+  await executionEventStore.append({
+    executionId,
+    type: 'EXECUTION_INTENT_CREATED',
+    state: sm.state,
+    sequence: sm.version,
+    fencingToken: currentFencingToken,
+    payload
+  });
+
+  return { executionId, sm };
+}
+
+async function transitionExecution({ executionId, sm, next, payload = {} }) {
+  sm.transition(next);
+  await executionIdempotency.setStatus(executionId, sm.state, {
+    fencingToken: currentFencingToken,
+    stateVersion: sm.version
+  });
+
+  await executionEventStore.append({
+    executionId,
+    type: `EXECUTION_${sm.state}`,
+    state: sm.state,
+    sequence: sm.version,
+    fencingToken: currentFencingToken,
+    payload
+  });
+
+  return sm.snapshot();
+}
+
+async function executeProtected(symbol, fn) {
+  return symbolExecutionLock.run(symbol, fn);
+}
+
 let isDbConnected = false, dbReconnectInterval = null, pendingClosedTrades = [], isReconnecting = false;
+let criticalStateQueue = null;
+
 const priceFailureCounts = new Map();
 let isPaused = false, lastScanTime = null, lastTrackerCheckTime = null;
 let trackerLock = false;
@@ -724,6 +888,18 @@ const macroEngine = new MacroFilterEngine({ logger });
 
 // Institutional AI Agent Suite: advisory/evaluation only. Hard risk controls remain authoritative.
 const agentSuite = new InstitutionalAgentSuite();
+const timesFMForecastAgent = new TimesFMForecastAgent({
+  enabled: String(process.env.TIMESFM_ENABLED || 'false').toLowerCase() === 'true',
+  logger,
+  timeoutMs: Number(process.env.TIMESFM_TIMEOUT_MS || 15000)
+});
+const dynamicTimeStopAgent = new DynamicTimeStopAgent({
+  timesFM: timesFMForecastAgent,
+  timesFMWeight: Number(process.env.TIMESFM_WEIGHT || 0.30),
+  maxExtensionHours: Number(process.env.DYNAMIC_TIME_STOP_MAX_EXTENSION_HOURS || 2),
+  extensionStepHours: Number(process.env.DYNAMIC_TIME_STOP_EXTENSION_STEP_HOURS || 1),
+  minTrendScoreToHold: Number(process.env.DYNAMIC_TIME_STOP_MIN_TREND_SCORE || 0.56)
+});
 const aiAgents = new AIAgentOrchestrator({ logger });
 const walkForwardEngine = new WalkForwardEngine({ trainBars: Number(process.env.AI_WALK_FORWARD_TRAIN_BARS || 500), testBars: Number(process.env.AI_WALK_FORWARD_TEST_BARS || 150), stepBars: Number(process.env.AI_WALK_FORWARD_STEP_BARS || 150) });
 const modelDriftMonitor = new ModelDriftMonitor({ windowSize: Number(process.env.AI_DRIFT_WINDOW || 200), threshold: Number(process.env.AI_DRIFT_THRESHOLD || 0.35) });
@@ -765,19 +941,29 @@ function buildDQNStateVector(params) {
 
 async function trainSignalMLModel(force = false) {
   if (!config.ML_ENABLED) return { trained: false, reason: 'disabled' };
-  if (!closedTradesCollection || !isDbConnected) return { trained: false, reason: 'db-unavailable' };
+  if (!closedTradesCollection || !isDbConnected) {
+    logger.warn('[TensorFlow.js ML] Training übersprungen: MongoDB/closedTrades nicht verfügbar.');
+    return { trained: false, reason: 'db-unavailable' };
+  }
   try {
+    logger.info(`🧠 [TensorFlow.js ML] Training angefordert | force=${force} | collection=closedTrades`);
     const result = await mlModel.trainFromTrades(closedTradesCollection, { force });
     isModelTrained = !!result.trained;
     lastMLTrainingStats = result;
 
+    // DQN darf ein erfolgreiches TensorFlow-Training nicht nachträglich als
+    // fehlgeschlagen melden. Beide Lernpfade werden getrennt behandelt.
     if (config.DQN_ENABLED) {
-      await dqnAgent.trainFromClosedTrades(closedTradesCollection);
+      try {
+        await dqnAgent.trainFromClosedTrades(closedTradesCollection);
+      } catch (dqnError) {
+        logger.error(`[DQN Training Fehler]: ${dqnError.stack || dqnError.message}`);
+      }
     }
 
     return result;
   } catch (e) {
-    logger.error(`[TensorFlow.js ML Fehler beim Training]: ${e.message}`);
+    logger.error(`[TensorFlow.js ML Fehler beim Training]: ${e.stack || e.message}`);
     return { trained: false, reason: e.message };
   }
 }
@@ -1006,7 +1192,7 @@ async function initDatabase() {
     executionIdempotencyCollection = db.collection('executionIdempotency');
 
     // Wire persistence after the DB connection is known to be healthy.
-    executionIdempotency.collection = executionIdempotencyCollection;
+    paperExecutionIdempotency.collection = executionIdempotencyCollection;
     paperExecutionAdapter.collection = paperOrdersCollection;
     reconciliationEngine = new ReconciliationEngine({
       getBotTrades: () => activeTrades,
@@ -1015,6 +1201,23 @@ async function initDatabase() {
     });
 
     isDbConnected = true;
+    if (!criticalStateQueue) {
+      criticalStateQueue = new CriticalStateQueue({
+        isHealthy: () => isDbConnected === true && Boolean(tradesCollection && closedTradesCollection),
+        logger
+      });
+    }
+    try { await initializeExecutionCore();
+    await runExecutionRecovery();
+executionLeaseHeartbeat = setInterval(() => {
+  renewExecutionLease().catch(err => {
+    logger.error?.(`[EXECUTION] lease heartbeat failed: ${err.message}`);
+    executionCoreReady = false;
+    isPaused = true;
+  });
+}, 5000);
+intervalTimers.push(executionLeaseHeartbeat);
+ } catch (err) { logger.error?.(`[EXECUTION] core init failed: ${err.message}`); executionCoreReady = false; isPaused = true; }
     apiLatencyStats.record('mongodb', Date.now() - startTime);
     logger.info('✅ Datenbank erfolgreich verbunden');
 
@@ -1069,9 +1272,15 @@ async function initDatabase() {
       const recon = reconciliationEngine.reconcile();
       if (!recon.healthy) {
         isPaused = true;
+        global.reconciliationHealthy = false;
         logger.error('🚫 [RECONCILIATION] Inkonsistenter Paper-State nach Restart – Bot pausiert.');
       }
     }
+
+    // STEP 3: recovery/reconciliation is deliberately the final startup gate.
+    // DB state and paper positions must already be restored before any UNKNOWN
+    // execution is queried. A failed reconciliation always leaves trading paused.
+    await runExecutionRecovery();
 
     if (dbBulkTimer) clearInterval(dbBulkTimer);
     dbBulkTimer = setInterval(processDbBulkQueue, config.DB_BULK_INTERVAL_MS);
@@ -1130,9 +1339,121 @@ async function persistPeakCapital() {
   try { await botStateCollection.updateOne({ _id: 'peakCapital' }, { $set: { value: peakCapital } }, { upsert: true }); } catch (e) {}
 }
 
+async function persistCriticalState(operation, label) {
+  if (!criticalStateQueue) {
+    throw new Error('CRITICAL_STATE_QUEUE_NOT_READY');
+  }
+  try {
+    return await criticalStateQueue.enqueue(operation, label);
+  } catch (err) {
+    isPaused = true;
+    global.reconciliationHealthy = false;
+    logger.error?.(`[STATE-QUEUE] ${label} -> TRADING PAUSED: ${err.message}`);
+    throw err;
+  }
+}
+
 async function upsertTrade(symbol, tradeData) {
+  if (!tradesCollection || !isDbConnected) {
+    isPaused = true;
+    throw new Error('CRITICAL_STATE_DB_UNHEALTHY');
+  }
+
+  // Persist first; only then publish the new state to the in-memory runtime.
+  await persistCriticalState(
+    () => tradesCollection.updateOne(
+      { symbol },
+      { $set: { ...tradeData, symbol } },
+      { upsert: true }
+    ),
+    `upsertTrade:${symbol}`
+  );
+
   activeTrades.set(symbol, tradeData);
-  if (tradesCollection && isDbConnected) dbBulkQueue.push({ type: 'upsertTrade', symbol, data: tradeData });
+}
+
+async function executePaperExecutionThroughCore({
+  symbol,
+  direction,
+  clientOrderId,
+  action,
+  quantity,
+  referencePrice,
+  fillPriceOverride = null,
+  reason = 'runtime',
+  orderBookValid = false,
+  spreadPct = Infinity,
+  marketDataAgeMs = Infinity,
+  risk = { allowed: false, reason: 'UNKNOWN' },
+  riskGovernorContext = null,
+  riskGovernorAction = 'OPEN',
+  riskGovernorReducedSize = false
+}) {
+  const side = String(direction).toUpperCase() === 'SHORT' ? 'SELL' : 'BUY';
+
+  riskGovernor.assertExecutionAllowed({
+    action,
+    proposed: riskGovernorContext?.proposed || { notionalUSD: Number(quantity) * Number(referencePrice) },
+    reducedSize: riskGovernorReducedSize
+  });
+
+  return protectedSubmit({
+    symbol,
+    side,
+    clientOrderId,
+    payload: {
+      action,
+      quantity,
+      referencePrice,
+      fillPriceOverride,
+      reason
+    },
+    riskContext: buildPreTradeContext({
+      orderBookValid,
+      spreadPct,
+      marketDataAgeMs,
+      risk,
+      riskGovernorState: riskGovernor.snapshot()
+    }),
+    orderBookValid,
+    spreadPct,
+    marketDataAgeMs,
+    reserveExecutionIntent,
+    transitionExecution,
+    submitter: async ({ action: submitAction, quantity: submitQty, referencePrice: submitPrice, fillPriceOverride: override, reason: submitReason }) => {
+      if (submitAction === 'OPEN') {
+        return paperExecutionAdapter.submitMarketOrder({
+          signalId: clientOrderId,
+          symbol,
+          direction,
+          quantity: submitQty,
+          referencePrice: submitPrice
+        });
+      }
+
+      if (submitAction === 'REDUCE') {
+        return paperExecutionAdapter.reducePosition({
+          symbol,
+          quantity: submitQty,
+          referencePrice: submitPrice,
+          fillPriceOverride: override,
+          reason: submitReason
+        });
+      }
+
+      if (submitAction === 'CLOSE') {
+        return paperExecutionAdapter.closePosition({
+          symbol,
+          referencePrice: submitPrice,
+          fillPriceOverride: override,
+          reason: submitReason
+        });
+      }
+
+      throw new Error(`UNSUPPORTED_PAPER_EXECUTION_ACTION:${submitAction}`);
+    },
+    logger
+  });
 }
 
 async function removeTrade(symbol, closedTradeRecord = null) {
@@ -1142,38 +1463,65 @@ async function removeTrade(symbol, closedTradeRecord = null) {
 
     if (config.PAPER_EXECUTION_ENABLED && paperExecutionAdapter.getPosition(symbol)) {
       try {
-        const closeExecution = await paperExecutionAdapter.closePosition({
+        const closeExecution = await executePaperExecutionThroughCore({
           symbol,
-          referencePrice: finalRecord.exitPrice || trade.entry,
+          direction: trade.direction === 'LONG' ? 'SHORT' : 'LONG',
+          clientOrderId: `close:${trade.signalId || symbol}:${finalRecord.closeReason || 'unknown'}`,
+          action: 'CLOSE',
+          quantity: Number(trade.positionSizeUnits),
+          referencePrice: Number(finalRecord.exitPrice || trade.entry),
           fillPriceOverride: finalRecord.exitPrice || null,
-          reason: finalRecord.closeReason || 'unknown'
+          reason: finalRecord.closeReason || 'unknown',
+          orderBookValid: true,
+          spreadPct: 0,
+          marketDataAgeMs: 0,
+          risk: { allowed: true, reason: 'POSITION_CLOSE' }
         });
-        if (closeExecution) {
-          finalRecord.paperExitOrderId = closeExecution.orderId;
-          finalRecord.executionExitFeeUSD = closeExecution.feeUSD;
-          finalRecord.executionExitPrice = closeExecution.avgFillPrice;
+
+        if (closeExecution?.remote) {
+          finalRecord.paperExitOrderId = closeExecution.remote.orderId;
+          finalRecord.executionExitFeeUSD = closeExecution.remote.feeUSD;
+          finalRecord.executionExitPrice = closeExecution.remote.avgFillPrice;
           finalRecord.executionLatencyMs = Math.max(
             Number(finalRecord.executionLatencyMs || 0),
-            Number(closeExecution.latencyMs || 0)
+            Number(closeExecution.remote.latencyMs || 0)
           );
         }
       } catch (e) {
         logger.error(`[PAPER CLOSE] ${symbol} fehlgeschlagen: ${e.message}`);
-        // Fail closed: keep the bot state visible; do not silently pretend execution succeeded.
         finalRecord.executionStatus = 'CLOSE_EXECUTION_ERROR';
+        // Never delete the active position unless the execution has definitely
+        // completed. A failed/ambiguous close must remain reconcilable.
+        isPaused = true;
+        global.reconciliationHealthy = false;
+        return;
       }
     }
 
     await persistClosedTradeRecord(finalRecord);
+
+    // Delete the durable active state before deleting the in-memory state.
+    await persistCriticalState(
+      () => tradesCollection.deleteOne({ symbol }),
+      `removeTrade:${symbol}`
+    );
     activeTrades.delete(symbol);
   }
   priceFailureCounts.delete(symbol);
-  if (tradesCollection && isDbConnected) dbBulkQueue.push({ type: 'removeTrade', symbol });
 }
 
 async function persistClosedTradeRecord(record) {
-  if (closedTradesCollection && isDbConnected) dbBulkQueue.push({ type: 'insertClosed', data: record });
-  else pendingClosedTrades.push(record);
+  if (!closedTradesCollection || !isDbConnected) {
+    isPaused = true;
+    global.reconciliationHealthy = false;
+    throw new Error('CRITICAL_STATE_DB_UNHEALTHY');
+  }
+
+  await persistCriticalState(
+    () => closedTradesCollection.insertOne(record),
+    `insertClosed:${record.symbol}:${record.closeTime || Date.now()}`
+  );
+
   updateSignalHistory(record);
   updateStreak(record.pnlUSD || 0);
 }
@@ -1665,14 +2013,15 @@ logger.info(`🔌 Exchange Adapter: ${exchangeAdapter.name} | Execution: DISABLE
 const executionSimulator = new ExecutionSimulator({ config, logger });
 const executionParity = new ExecutionParity({ config, simulator: executionSimulator });
 const riskEngine = new RiskEngine({ config, logger });
-const executionIdempotency = new ExecutionIdempotency({
+const riskGovernor = new RiskGovernor({ config, logger });
+const paperExecutionIdempotency = new ExecutionIdempotency({
   collection: null,
   logger,
   ttlMs: 7 * 24 * 3600 * 1000
 });
 const paperExecutionAdapter = new PaperExecutionAdapter({
   simulator: executionSimulator,
-  idempotency: executionIdempotency,
+  idempotency: paperExecutionIdempotency,
   collection: null,
   logger
 });
@@ -1740,11 +2089,40 @@ async function fetchFuturesData(symbol) {
 }
 
 async function fetchOrderBookMetrics(symbol) {
+  // Step 4: strategy may consume only a locally validated, fresh L2 book.
+  // A REST snapshot is retained as a compatibility fallback, but is explicitly
+  // marked non-WS and cannot clear a WS gap/invalid state.
   try {
+    if (orderBookEngine && orderBookEngine.isTradable(symbol)) {
+      return orderBookEngine.metrics(symbol);
+    }
+    // Once a sequenced L2 stream has declared a gap, REST must not silently
+    // clear the pause. Recovery requires a validated snapshot/replay.
+    if (orderBookEngine && orderBookEngine.isPaused(symbol)) return null;
+
     const book = await exchangeAdapter.getOrderBook(symbol);
     if (!book) return null;
-    return { spreadPct: book.spreadPct, bidAskRatio: book.bidAskRatio ?? 1 };
-  } catch (e) { return null; }
+    const spreadPct = Number(book.spreadPct);
+    const valid = Number.isFinite(spreadPct) && Number(book.bestBid) > 0 && Number(book.bestAsk) >= Number(book.bestBid);
+    if (!valid) return null;
+
+    // Compatibility path: REST snapshots have no validated sequence, therefore
+    // they are never installed into the sequenced local L2 book.
+    if (String(process.env.MARKET_DATA_REQUIRE_WS || 'false').toLowerCase() === 'true') return null;
+    return {
+      ...book,
+      spreadPct,
+      bidAskRatio: Number.isFinite(Number(book.bidAskRatio)) ? Number(book.bidAskRatio) : null,
+      fetchedAt: Date.now(),
+      valid: true,
+      fresh: true,
+      source: 'rest_snapshot_unsequenced',
+      sequenceValidated: false,
+      tradingPaused: false
+    };
+  } catch (e) {
+    return null;
+  }
 }
 
 const contractSpecsCache = new Map();
@@ -2174,23 +2552,78 @@ async function checkActiveTrades() {
           await sendTelegramAlert(`⏱️ <b>TIME-STOP WARNUNG: ${cleanSymbol}/USDT</b>`);
         }
 
+        // The absolute hold limit is authoritative for every position.
+        if (hoursElapsed >= config.ABSOLUTE_MAX_HOLD_HOURS) {
+          const exitPrice = applySlippage(currentPrice, trade.direction, 'exit');
+          const pnlPerUnit = trade.direction === 'LONG' ? exitPrice - trade.entry : trade.entry - exitPrice;
+          const pnlUSD = pnlPerUnit * (trade.positionSizeUnits || 0) - applyFees(trade.notionalUSD) - remainingEntryFee - fundingCostSoFar;
+          await recordTradePnL(pnlUSD);
+          await sendTelegramAlert(`⌛ <b>ABSOLUTES ZEITLIMIT: ${cleanSymbol}/USDT</b> PnL: $${pnlUSD.toFixed(2)}`);
+          try { timesFMShadowJournal.recordClose(symbol, trade, exitPrice, pnlUSD); } catch (journalError) { logger.warn(`[TimesFM Shadow] Journal: ${journalError.message}`); }
+          await removeTrade(symbol, { symbol, direction: trade.direction, closeTime: Date.now(), closeReason: 'absolute-time-limit', pnlUSD, exitPrice });
+          continue;
+        }
+
         if (!trade.tp1Hit && hoursElapsed >= trade.maxHoldHours) {
+          const timeStopCandles = await fetchKucoinKlinesCached(symbol, '15m', 80).catch(() => null);
+          const timeStopDecision = await dynamicTimeStopAgent.evaluate({
+            trade,
+            candles: timeStopCandles,
+            currentPrice,
+            hoursElapsed,
+            normalMaxHoldHours: config.MAX_HOLD_HOURS,
+            absoluteMaxHoldHours: config.ABSOLUTE_MAX_HOLD_HOURS
+          });
+
+          if (timeStopDecision.decision === 'DEFER') {
+            trade.timeStopLastDecision = {
+              at: Date.now(), decision: 'DEFER', score: 0, extensionHours: 0,
+              recommendedHoldHours: Number(trade.maxHoldHours) || config.MAX_HOLD_HOURS,
+              reasons: timeStopDecision.reasons
+            };
+            await upsertTrade(symbol, trade);
+            logger.warn(`[DYNAMIC-TIME-STOP] ${symbol}: DEFER wegen fehlender Marktdaten (${timeStopDecision.reasons.join(', ')})`);
+            continue;
+          }
+
+          if (timeStopDecision.decision === 'EXTEND') {
+            const oldMaxHold = Number(trade.maxHoldHours) || config.MAX_HOLD_HOURS;
+            const extension = Math.max(0, Math.min(
+              Number(timeStopDecision.extensionHours) || 0,
+              config.ABSOLUTE_MAX_HOLD_HOURS - oldMaxHold
+            ));
+            if (extension <= 0) {
+              timeStopDecision.decision = 'EXIT';
+            } else {
+              trade.timeStopExtensionUsedHours = Math.min(
+                Number(config.DYNAMIC_TIME_STOP_MAX_EXTENSION_HOURS || 2),
+                (Number(trade.timeStopExtensionUsedHours) || 0) + extension
+              );
+              trade.maxHoldHours = Math.min(config.ABSOLUTE_MAX_HOLD_HOURS, oldMaxHold + extension);
+              trade.timeStopLastDecision = {
+                at: Date.now(), decision: 'EXTEND', score: timeStopDecision.score,
+                extensionHours: extension, extensionUsedHours: trade.timeStopExtensionUsedHours,
+                recommendedHoldHours: trade.maxHoldHours, reasons: timeStopDecision.reasons,
+                timesFM: timeStopDecision.timesFM || null, decisionPrice: currentPrice
+              };
+              trade.timeStopDecisionHistory = Array.isArray(trade.timeStopDecisionHistory) ? trade.timeStopDecisionHistory : [];
+              trade.timeStopDecisionHistory.push(trade.timeStopLastDecision);
+              if (trade.timeStopDecisionHistory.length > 10) trade.timeStopDecisionHistory = trade.timeStopDecisionHistory.slice(-10);
+              try { timesFMShadowJournal.recordDecision(symbol, trade, currentPrice, timeStopDecision); } catch (journalError) { logger.warn(`[TimesFM Shadow] Journal: ${journalError.message}`); }
+              trade.timeStopWarningSent = false;
+              await upsertTrade(symbol, trade);
+              logger.info(`[DYNAMIC-TIME-STOP] ${symbol}: HOLD +${extension.toFixed(2)}h -> ${trade.maxHoldHours.toFixed(2)}h used=${trade.timeStopExtensionUsedHours.toFixed(2)}h (${timeStopDecision.reasons.join(', ')})`);
+              continue;
+            }
+          }
+
           const exitPrice = applySlippage(currentPrice, trade.direction, 'exit');
           const pnlPerUnit = trade.direction === 'LONG' ? exitPrice - trade.entry : trade.entry - exitPrice;
           const pnlUSD = pnlPerUnit * (trade.positionSizeUnits || 0) - applyFees(trade.notionalUSD) - remainingEntryFee - fundingCostSoFar;
           await recordTradePnL(pnlUSD);
           await sendTelegramAlert(`⌛ <b>TIME-STOP: ${cleanSymbol}/USDT</b> PnL: $${pnlUSD.toFixed(2)}`);
+          try { timesFMShadowJournal.recordClose(symbol, trade, exitPrice, pnlUSD); } catch (journalError) { logger.warn(`[TimesFM Shadow] Journal: ${journalError.message}`); }
           await removeTrade(symbol, { symbol, direction: trade.direction, closeTime: Date.now(), closeReason: 'time-stop', pnlUSD, exitPrice });
-          continue;
-        }
-
-        if (trade.tp1Hit && hoursElapsed >= config.ABSOLUTE_MAX_HOLD_HOURS) {
-          const exitPrice = applySlippage(currentPrice, trade.direction, 'exit');
-          const pnlPerUnit = trade.direction === 'LONG' ? exitPrice - trade.entry : trade.entry - exitPrice;
-          const pnlUSD = pnlPerUnit * trade.positionSizeUnits - applyFees(trade.notionalUSD) - remainingEntryFee - fundingCostSoFar;
-          await recordTradePnL(pnlUSD);
-          await sendTelegramAlert(`⌛ <b>ABSOLUTES ZEITLIMIT: ${cleanSymbol}/USDT</b> PnL: $${pnlUSD.toFixed(2)}`);
-          await removeTrade(symbol, { symbol, direction: trade.direction, closeTime: Date.now(), closeReason: 'absolute-time-limit', pnlUSD, exitPrice });
           continue;
         }
 
@@ -2262,30 +2695,44 @@ async function checkActiveTrades() {
             const partialUnits = trade.positionSizeUnits * (config.TP1_CLOSE_PERCENT / 100);
             const partialEntryFee = (trade.entryFeeUSD || 0) * (config.TP1_CLOSE_PERCENT / 100);
             const partialFundingCost = fundingCostSoFar * (config.TP1_CLOSE_PERCENT / 100);
-            const partialPnl = (exitPrice - trade.entry) * partialUnits - applyFees(trade.notionalUSD * config.TP1_CLOSE_PERCENT / 100) - partialEntryFee - partialFundingCost;
+            let partialExecution = null;
+            if (config.PAPER_EXECUTION_ENABLED) {
+              try {
+                partialExecution = await executePaperExecutionThroughCore({
+                  symbol,
+                  direction: trade.direction === 'LONG' ? 'SHORT' : 'LONG',
+                  clientOrderId: `partial:${trade.signalId || symbol}:tp1:${Number(partialUnits).toFixed(12)}`,
+                  action: 'REDUCE',
+                  quantity: partialUnits,
+                  referencePrice: trade.tp1,
+                  fillPriceOverride: exitPrice,
+                  reason: 'tp1-partial',
+                  orderBookValid: true,
+                  spreadPct: 0,
+                  marketDataAgeMs: 0,
+                  risk: { allowed: true, reason: 'POSITION_REDUCTION' }
+                });
+              } catch (e) {
+                logger.error(`[PAPER PARTIAL CLOSE] ${symbol}: ${e.message}`);
+                reconciliationEngine.healthy = false;
+                isPaused = true;
+                global.reconciliationHealthy = false;
+                return;
+              }
+            }
 
-            trade.positionSizeUnits -= partialUnits;
+            const partialFillPrice = Number(partialExecution?.remote?.avgFillPrice || exitPrice);
+            const partialFilledQty = Number(partialExecution?.remote?.filledQty || partialUnits);
+            const actualPartialUnits = Math.min(partialUnits, partialFilledQty);
+            const partialPnl = (partialFillPrice - trade.entry) * actualPartialUnits - applyFees(trade.notionalUSD * (actualPartialUnits / Math.max(partialUnits, 1e-12))) - partialEntryFee - partialFundingCost;
+
+            trade.positionSizeUnits -= actualPartialUnits;
             trade.partiallyClosed = true;
             trade.notionalUSD = trade.positionSizeUnits * trade.entry;
             trade.entryFeePaidUSD = (trade.entryFeePaidUSD || 0) + partialEntryFee;
             trade.fundingCostUSD = fundingCostSoFar - partialFundingCost;
             trade.stopLoss = trade.entry;
-            trade.highestSinceTP1 = exitPrice;
-
-            if (config.PAPER_EXECUTION_ENABLED) {
-              try {
-                await paperExecutionAdapter.reducePosition({
-                  symbol,
-                  quantity: partialUnits,
-                  referencePrice: trade.tp1,
-                  fillPriceOverride: exitPrice,
-                  reason: 'tp1-partial'
-                });
-              } catch (e) {
-                logger.error(`[PAPER PARTIAL CLOSE] ${symbol}: ${e.message}`);
-                reconciliationEngine.healthy = false;
-              }
-            }
+            trade.highestSinceTP1 = partialFillPrice;
 
             await upsertTrade(symbol, trade);
             await recordTradePnL(partialPnl);
@@ -2327,30 +2774,44 @@ async function checkActiveTrades() {
             const partialUnits = trade.positionSizeUnits * (config.TP1_CLOSE_PERCENT / 100);
             const partialEntryFee = (trade.entryFeeUSD || 0) * (config.TP1_CLOSE_PERCENT / 100);
             const partialFundingCost = fundingCostSoFar * (config.TP1_CLOSE_PERCENT / 100);
-            const partialPnl = (trade.entry - exitPrice) * partialUnits - applyFees(trade.notionalUSD * config.TP1_CLOSE_PERCENT / 100) - partialEntryFee - partialFundingCost;
+            let partialExecution = null;
+            if (config.PAPER_EXECUTION_ENABLED) {
+              try {
+                partialExecution = await executePaperExecutionThroughCore({
+                  symbol,
+                  direction: trade.direction === 'LONG' ? 'SHORT' : 'LONG',
+                  clientOrderId: `partial:${trade.signalId || symbol}:tp1:${Number(partialUnits).toFixed(12)}`,
+                  action: 'REDUCE',
+                  quantity: partialUnits,
+                  referencePrice: trade.tp1,
+                  fillPriceOverride: exitPrice,
+                  reason: 'tp1-partial',
+                  orderBookValid: true,
+                  spreadPct: 0,
+                  marketDataAgeMs: 0,
+                  risk: { allowed: true, reason: 'POSITION_REDUCTION' }
+                });
+              } catch (e) {
+                logger.error(`[PAPER PARTIAL CLOSE] ${symbol}: ${e.message}`);
+                reconciliationEngine.healthy = false;
+                isPaused = true;
+                global.reconciliationHealthy = false;
+                return;
+              }
+            }
 
-            trade.positionSizeUnits -= partialUnits;
+            const partialFillPrice = Number(partialExecution?.remote?.avgFillPrice || exitPrice);
+            const partialFilledQty = Number(partialExecution?.remote?.filledQty || partialUnits);
+            const actualPartialUnits = Math.min(partialUnits, partialFilledQty);
+            const partialPnl = (trade.entry - partialFillPrice) * actualPartialUnits - applyFees(trade.notionalUSD * (actualPartialUnits / Math.max(partialUnits, 1e-12))) - partialEntryFee - partialFundingCost;
+
+            trade.positionSizeUnits -= actualPartialUnits;
             trade.partiallyClosed = true;
             trade.notionalUSD = trade.positionSizeUnits * trade.entry;
             trade.entryFeePaidUSD = (trade.entryFeePaidUSD || 0) + partialEntryFee;
             trade.fundingCostUSD = fundingCostSoFar - partialFundingCost;
             trade.stopLoss = trade.entry;
-            trade.lowestSinceTP1 = exitPrice;
-
-            if (config.PAPER_EXECUTION_ENABLED) {
-              try {
-                await paperExecutionAdapter.reducePosition({
-                  symbol,
-                  quantity: partialUnits,
-                  referencePrice: trade.tp1,
-                  fillPriceOverride: exitPrice,
-                  reason: 'tp1-partial'
-                });
-              } catch (e) {
-                logger.error(`[PAPER PARTIAL CLOSE] ${symbol}: ${e.message}`);
-                reconciliationEngine.healthy = false;
-              }
-            }
+            trade.lowestSinceTP1 = partialFillPrice;
 
             await upsertTrade(symbol, trade);
             await recordTradePnL(partialPnl);
@@ -2712,7 +3173,11 @@ async function scanMarket() {
         }
 
         const futuresData = await fetchFuturesData(symbol).catch(() => null);
-        const orderBookMetrics = await fetchOrderBookMetrics(symbol).catch(() => ({ spreadPct: 0, bidAskRatio: 1 }));
+        const orderBookMetrics = await fetchOrderBookMetrics(symbol).catch(() => null);
+        if (!orderBookMetrics?.valid) {
+          scanStats.orderBookBlocked = (scanStats.orderBookBlocked || 0) + 1;
+          return;
+        }
 
         const orderFlowEval = orderFlowManager.evaluateOrderFlow(raw15m, orderBookMetrics);
 
@@ -2950,6 +3415,22 @@ async function scanMarket() {
             return;
           }
 
+          const governorSnapshot = riskGovernor.evaluate({
+            equity: config.CAPITAL_USD + dailyNetPnL,
+            peakEquity: peakCapital,
+            dailyPnL: dailyNetPnL,
+            openPositions: [...activeTrades.values()],
+            proposed: sizing,
+            spreadPct: Number(orderBookMetrics.spreadPct),
+            slippagePct: Number(config.SLIPPAGE_PERCENT || 0),
+            marketDataAgeMs: Math.max(0, Date.now() - Number(orderBookMetrics.fetchedAt || Date.now()))
+          });
+          if (governorSnapshot.state === 'HALT' || governorSnapshot.state === 'EMERGENCY') {
+            scanStats.riskGovernorBlocked = (scanStats.riskGovernorBlocked || 0) + 1;
+            logger.warn(`[RISK-GOVERNOR] ${governorSnapshot.state}: ${governorSnapshot.reason}`);
+            return;
+          }
+
           const riskCheck = riskEngine.assess({
             equity: config.CAPITAL_USD + dailyNetPnL,
             peakEquity: peakCapital,
@@ -2973,24 +3454,35 @@ async function scanMarket() {
           if (config.PAPER_EXECUTION_ENABLED) {
             const signalId = `${symbol}:${direction}:${Date.now()}:${scanCounter}`;
             try {
-              paperOrder = await paperExecutionAdapter.submitMarketOrder({
-                signalId,
+              const executionResult = await executePaperExecutionThroughCore({
                 symbol,
                 direction,
+                clientOrderId: signalId,
+                action: 'OPEN',
                 quantity: sizing.positionSizeUnits,
                 referencePrice: entryZoneMid,
-                metadata: {
-                  strategyVersion: 'v22.3',
-                  featureVersion: process.env.FEATURE_VERSION || 'phase-a',
-                  modelVersion: process.env.MODEL_VERSION || 'unknown',
-                  config: {
-                    RISK_PERCENT: config.RISK_PERCENT,
-                    LEVERAGE: config.LEVERAGE,
-                    SLIPPAGE_PERCENT: config.SLIPPAGE_PERCENT,
-                    FEE_PERCENT: config.FEE_PERCENT
-                  }
-                }
+                orderBookValid: Number.isFinite(orderBookMetrics.spreadPct),
+                spreadPct: Number(orderBookMetrics.spreadPct),
+                marketDataAgeMs: Math.max(0, Date.now() - Number(orderBookMetrics.fetchedAt || Date.now())),
+                risk: riskCheck,
+                riskGovernorContext: {
+                  proposed: sizing,
+                  equity: config.CAPITAL_USD + dailyNetPnL,
+                  peakEquity: peakCapital,
+                  dailyPnL: dailyNetPnL,
+                  openPositions: [...activeTrades.values()],
+                  spreadPct: Number(orderBookMetrics.spreadPct),
+                  slippagePct: Number(config.SLIPPAGE_PERCENT || 0),
+                  marketDataAgeMs: Math.max(0, Date.now() - Number(orderBookMetrics.fetchedAt || Date.now()))
+                },
+                riskGovernorReducedSize: riskGovernor.state === 'REDUCED'
               });
+              paperOrder = executionResult?.remote || null;
+              if (executionResult?.state === ExecutionState.UNKNOWN) {
+                isPaused = true;
+                global.reconciliationHealthy = false;
+                throw new Error('EXECUTION_UNKNOWN_RECONCILIATION_REQUIRED');
+              }
               if (!paperOrder || !['FILLED', 'PARTIALLY_FILLED'].includes(paperOrder.status) || paperOrder.filledQty <= 0) {
                 scanStats.paperExecutionRejected = (scanStats.paperExecutionRejected || 0) + 1;
                 return;
@@ -3971,6 +4463,7 @@ async function handleTelegramCommand(chatId, text) {
     const currentEquity = config.CAPITAL_USD + dailyNetPnL;
     const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : 0;
     lines.push(`Drawdown: ${drawdownPercent}%`);
+    lines.push(`Risk Governor: <b>${riskGovernor.state}</b> | ${escapeHtml(riskGovernor.reason)}`);
     lines.push(`KuCoin Fehler: ${kucoinErrorCount} | Circuit Breaker: ${Date.now() < kucoinCircuitOpenUntil ? '🚨 AKTIV' : '✅ Inaktiv'}`);
 
     if (activeTrades.size > 0) {
@@ -4106,7 +4599,9 @@ app.use(express.json({ limit: '256kb' }));
 
 // Institutional API boundary: authenticated by default, fail-closed.
 app.use((req, res, next) => {
-  if (req.path === '/health' && config.HEALTH_PUBLIC) return next();
+  // Liveness endpoint is intentionally public: UptimeRobot cannot supply
+  // the bot's private API key. Authentication remains mandatory everywhere else.
+  if (req.path === '/health') return next();
   if (config.ALLOW_UNAUTHENTICATED_API) return next();
   if (!config.API_KEY) return res.status(503).json({ error: 'API_KEY_NOT_CONFIGURED' });
   if (req.get('X-API-Key') !== config.API_KEY) return res.status(401).json({ error: 'UNAUTHORIZED' });
@@ -4157,9 +4652,33 @@ app.get('/api/v24/status', (req, res) => {
 app.get('/health', (req, res) => {
   const currentEquity = config.CAPITAL_USD + dailyNetPnL;
   const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : '0';
-  res.status(isDbConnected ? 200 : 503).json({
-    status: isDbConnected ? 'ok' : 'degraded', version: '24.7.0-agent-suite', dbConnected: isDbConnected,
+  // Liveness must answer 200 while the Node process is alive. Database health is
+  // reported as data, not encoded as an HTTP failure, so UptimeRobot does not
+  // restart a healthy process merely because MongoDB is temporarily unavailable.
+  res.status(200).json({
+    status: isDbConnected ? 'ok' : 'degraded',
+    liveness: 'ok',
+    version: '25.0.0-agent-suite',
+    dbConnected: isDbConnected,
     isPaused, activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, currentEquity, peakCapital, drawdownPercent
+  });
+});
+
+app.get('/ready', async (req, res) => {
+  const timesfm = timesFMForecastAgent.getStatus();
+  const checks = {
+    database: isDbConnected,
+    tradingEngine: !isShuttingDown,
+    ml: !config.ML_ENABLED || isModelTrained,
+    timesfm: !config.TIMESFM_ENABLED || timesfm.ready
+  };
+  const ready = Object.values(checks).every(Boolean);
+  res.status(ready ? 200 : 503).json({
+    status: ready ? 'ready' : 'not-ready',
+    checks,
+    timesfm,
+    ml: mlModel.getStats(),
+    lastMLTrainingStats
   });
 });
 
@@ -4177,7 +4696,16 @@ app.get('/metrics', (req, res) => {
     `bot_daily_pnl ${dailyNetPnL}`,
     `# HELP bot_kucoin_errors Current KuCoin circuit breaker error count`,
     `# TYPE bot_kucoin_errors gauge`,
-    `bot_kucoin_errors ${kucoinErrorCount}`
+    `bot_kucoin_errors ${kucoinErrorCount}`,
+    `# HELP bot_timesfm_requests Total TimesFM requests`,
+    `# TYPE bot_timesfm_requests counter`,
+    `bot_timesfm_requests ${timesFMForecastAgent.getStatus().requests}`,
+    `# HELP bot_timesfm_errors Total TimesFM errors`,
+    `# TYPE bot_timesfm_errors counter`,
+    `bot_timesfm_errors ${timesFMForecastAgent.getStatus().errors}`,
+    `# HELP bot_timesfm_timeouts Total TimesFM timeouts`,
+    `# TYPE bot_timesfm_timeouts counter`,
+    `bot_timesfm_timeouts ${timesFMForecastAgent.getStatus().timeouts}`
   ].join('\n');
   res.setHeader('Content-Type', 'text/plain');
   res.send(metrics);
@@ -4260,6 +4788,8 @@ const server = app.listen(config.PORT, '0.0.0.0', () => {
 // ==========================================
 const cronJobs = [];
 const intervalTimers = [];
+let executionLeaseHeartbeat = null;
+
 
 intervalTimers.push(setInterval(async () => {
   try { await checkActiveTrades(); }
@@ -4281,14 +4811,145 @@ cronJobs.push(cron.schedule('59 23 * * *', async () => {
   }
 }, { timezone: 'UTC' }));
 
-cronJobs.push(cron.schedule('0 */6 * * *', async () => {
+let lastMLTrainingAttemptAt = 0;
+cronJobs.push(cron.schedule('0 * * * *', async () => {
   try {
-    await loadFuturesContractSpecs();
-    await trainSignalMLModel();
+    const intervalMs = Math.max(1, Number(config.ML_RETRAIN_HOURS || 6)) * 60 * 60 * 1000;
+    const due = !lastMLTrainingAttemptAt || (Date.now() - lastMLTrainingAttemptAt >= intervalMs);
+    // Wenn noch kein Modell existiert, sofort bei jedem stündlichen Tick erneut
+    // versuchen. Das verhindert, dass ein temporärer DB-/Datenzustand das Lernen
+    // für bis zu 6 Stunden blockiert.
+    if (!isModelTrained || due) {
+      lastMLTrainingAttemptAt = Date.now();
+      await loadFuturesContractSpecs();
+      const result = await trainSignalMLModel(!isModelTrained);
+      if (!result.trained) logger.warn(`🧠 [TensorFlow.js ML] Kein neues Modell: ${result.reason}`);
+    }
   } catch (e) {
-    logger.error(`[6H CRON ERROR] ${e.message}\n${e.stack}`);
+    logger.error(`[ML CRON ERROR] ${e.message}\n${e.stack}`);
   }
 }, { timezone: 'UTC' }));
+
+
+async function runExecutionRecovery() {
+  if (!db || !isDbConnected || !executionCoreReady) {
+    global.reconciliationHealthy = false;
+    isPaused = true;
+    logger.error?.('[RECOVERY] prerequisites unavailable; trading remains paused');
+    return;
+  }
+
+  try {
+    const executionRepository = {
+      async findByStates(states) {
+        return db.collection('executionIntents')
+          .find({ status: { $in: states } })
+          .sort({ createdAt: 1 })
+          .limit(500)
+          .toArray();
+      }
+    };
+
+    const { ReconciliationEngine: StartupReconciliationEngine } =
+      await import('./execution-core/reconciliation-engine.js');
+
+    // Current system is intentionally paper-only. The paper adapter is the
+    // authoritative remote ledger for paper mode. A future account-enabled
+    // exchange adapter can be supplied here without changing the recovery flow.
+    const mode = String(process.env.EXECUTION_MODE || (config.PAPER_EXECUTION_ENABLED ? 'paper' : 'shadow')).toLowerCase();
+    const reconciliationAdapter = mode === 'paper'
+      ? {
+          name: 'paper-execution-ledger',
+          async getReconciliationSnapshot() {
+            return {
+              ok: true,
+              source: 'paper-execution-adapter',
+              openOrders: paperExecutionAdapter.getOrders().filter(o => !['FILLED', 'CANCELLED', 'REJECTED'].includes(String(o.status || '').toUpperCase())),
+              fills: paperExecutionAdapter.getOrders().filter(o => Number(o.filledQty || o.quantity || 0) > 0),
+              positions: paperExecutionAdapter.getPositions(),
+              balances: [{ asset: 'PAPER_USD', available: Number(config.CAPITAL_USD || 0) }]
+            };
+          },
+          async getOrderStatus({ clientOrderId, exchangeOrderId }) {
+            const orders = paperExecutionAdapter.getOrders();
+            const order = orders.find(o =>
+              o.orderId === exchangeOrderId ||
+              o.clientOrderId === clientOrderId ||
+              o.signalId === clientOrderId
+            );
+            if (!order) return null;
+            return order;
+          }
+        }
+      : global.exchange || global.exchangeClient || null;
+
+    if (!reconciliationAdapter) {
+      throw new Error('RECONCILIATION_ADAPTER_UNAVAILABLE');
+    }
+
+    const startupEngine = new StartupReconciliationEngine({
+      exchange: reconciliationAdapter,
+      executionStore: {
+        async setState(executionId, state, remote) {
+          const doc = await db.collection('executionIntents').findOne({ executionId });
+          if (!doc) throw new Error(`EXECUTION_INTENT_NOT_FOUND:${executionId}`);
+          await db.collection('executionIntents').updateOne(
+            {
+              executionId,
+              fencingToken: { $lte: Number(currentFencingToken || 0) },
+              version: Number(doc.version || 0)
+            },
+            {
+              $set: {
+                status: state,
+                remote,
+                reconciledAt: new Date(),
+                fencingToken: Number(currentFencingToken || 0)
+              },
+              $inc: { version: 1 }
+            }
+          );
+        }
+      },
+      logger
+    });
+
+    const unknownExecutions = await executionRepository.findByStates([
+      'ORDER_SUBMITTING',
+      'UNKNOWN',
+      'RECONCILING'
+    ]);
+
+    const internalPositions = [...activeTrades.values()].map(trade => ({
+      symbol: trade.symbol,
+      direction: trade.direction,
+      quantity: Number(trade.positionSizeUnits || trade.quantity || 0),
+      positionSizeUnits: Number(trade.positionSizeUnits || trade.quantity || 0),
+      source: 'activeTrades'
+    }));
+
+    const result = await startupEngine.startupReconcile({
+      internalPositions,
+      unknownExecutions
+    });
+
+    global.reconciliationHealthy = result.ok === true;
+    global.reconciliationStatus = result;
+
+    if (!result.ok) {
+      isPaused = true;
+      logger.error?.(`[RECOVERY] STARTUP RECONCILIATION HALT: ${result.reason || 'ledger mismatch'}`);
+      return;
+    }
+
+    logger.info?.(`[RECOVERY] STARTUP RECONCILIATION PASS source=${result.source} openOrders=${result.openOrders?.length || 0} fills=${result.fills?.length || 0}`);
+  } catch (err) {
+    global.reconciliationHealthy = false;
+    global.reconciliationStatus = { ok: false, phase: 'HALT', reason: err.message, ts: Date.now() };
+    isPaused = true;
+    logger.error?.(`[RECOVERY] failed closed: ${err.message}`);
+  }
+}
 
 async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
@@ -4344,7 +5005,8 @@ process.on('unhandledRejection', async (reason) => {
   await runScanCycle();
 
   const SCAN_INTERVAL_MS = 5 * 60 * 1000; 
-  setInterval(runScanCycle, SCAN_INTERVAL_MS);
+  const scanTimer = setInterval(runScanCycle, SCAN_INTERVAL_MS);
+intervalTimers.push(scanTimer);
   
   logger.info(`🔄 Bot-Dauerschleife aktiv. Nächster Scan in ${SCAN_INTERVAL_MS / 60000} Minuten.`);
 })();

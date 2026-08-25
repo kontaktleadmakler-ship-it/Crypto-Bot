@@ -1,0 +1,88 @@
+{
+  "source": "trading-bot-final-2026-08-25.zip",
+  "hardening": [
+    "package.json",
+    "symbol-execution-lock.js",
+    "durable-state-outbox.js",
+    "pre-trade-gate.js",
+    "macroFilter.js",
+    "orderFlowAnalyzer.js",
+    "graceful-shutdown.js",
+    "HARDENING-AUDIT.md",
+    "tests/hardening/pre-trade-gate.test.js"
+  ],
+  "generated_at": "2026-08-25",
+  "status": "P1-P4 integrated into runtime baseline; exchange-specific submitter wiring and end-to-end chaos validation remain mandatory before live capital.",
+  "p1_p4_implemented": true,
+  "p1": [
+    "execution-state-machine",
+    "atomic-idempotency",
+    "execution-event-store"
+  ],
+  "p2": [
+    "fencing-lease",
+    "fenced-write"
+  ],
+  "p3": [
+    "reconciliation-engine",
+    "recovery-coordinator"
+  ],
+  "p4": [
+    "failure-scenario-suite/scaffolds"
+  ],
+  "runtime_execution_path_integrated": true,
+  "integration": [
+    "runtime initializes execution idempotency/event store/fencing lease",
+    "lease heartbeat pauses trading when fencing is lost",
+    "startup recovery reconciles ambiguous executions",
+    "critical state writes use a fail-closed serialized Mongo-backed queue",
+    "paper opening/reduction/close actions are routed through protectedSubmit",
+    "scan timer participates in shutdown lifecycle"
+  ],
+  "step1_runtime_integration": {
+    "status": "PASS",
+    "state_queue_fix": true,
+    "protected_execution_gateway": true,
+    "direct_runtime_exchange_submit_blocked": true
+  },
+  "step3_reconciliation": {
+    "status": "PASS",
+    "startup_order": "DB_LOAD->LEDGER_RESTORE->UNKNOWN_DISCOVERY->REMOTE_SNAPSHOT->LEDGER_COMPARE->RESUME_OR_HALT",
+    "fail_closed": true,
+    "live_execution_enabled": false
+  },
+  "step4_marketdata": {
+    "status": "PASS",
+    "sequence_validation": true,
+    "gap_detection": true,
+    "local_order_book": true,
+    "freshness_gate": true,
+    "fail_closed": true
+  },
+  "step5_risk_governor": {
+    "status": "PASS",
+    "states": [
+      "NORMAL",
+      "REDUCED",
+      "HALT",
+      "EMERGENCY"
+    ],
+    "automatic_recovery": false,
+    "global_execution_gate": true,
+    "limits": [
+      "position",
+      "notional",
+      "leverage",
+      "daily_loss",
+      "drawdown",
+      "slippage",
+      "spread",
+      "market_data_latency",
+      "exchange_latency",
+      "concentration",
+      "correlation",
+      "volatility"
+    ]
+  },
+  "live_execution_enabled": false
+}
