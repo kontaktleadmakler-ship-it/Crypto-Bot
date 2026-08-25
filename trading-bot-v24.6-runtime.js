@@ -708,6 +708,7 @@ client.on('error', (err) => {
   logger.error(`🔴 MongoDB-Client-Fehler: ${err.message}`);
 });
 
+let db = null;
 let tradesCollection, closedTradesCollection, botStateCollection, lockCollection, marketPhaseLogsCollection, filterChangeLogCollection;
 let paperOrdersCollection, executionIdempotencyCollection;
 const activeTrades = new Map();
@@ -755,7 +756,7 @@ async function initializeExecutionCore() {
 
   fencingLease = new FencingLease({
     collection: leaseCollection,
-    instanceId,
+    instanceId: currentInstanceId,
     leaseMs: 15000
   });
 
@@ -1183,7 +1184,7 @@ async function initDatabase() {
   try {
     const startTime = Date.now();
     await client.connect();
-    const db = client.db('tradingBotDB');
+    db = client.db('tradingBotDB');
     tradesCollection = db.collection('activeTrades');
     closedTradesCollection = db.collection('closedTrades');
     botStateCollection = db.collection('botState');
@@ -1209,17 +1210,32 @@ async function initDatabase() {
         logger
       });
     }
-    try { await initializeExecutionCore();
-    await runExecutionRecovery();
-executionLeaseHeartbeat = setInterval(() => {
-  renewExecutionLease().catch(err => {
-    logger.error?.(`[EXECUTION] lease heartbeat failed: ${err.message}`);
-    executionCoreReady = false;
-    isPaused = true;
-  });
-}, 5000);
-intervalTimers.push(executionLeaseHeartbeat);
- } catch (err) { logger.error?.(`[EXECUTION] core init failed: ${err.message}`); executionCoreReady = false; isPaused = true; }
+    // Acquire the process/instance lock BEFORE initializing the execution core.
+    // The fencing lease uses the same stable currentInstanceId; initializing it
+    // before the lock made the execution core race startup and also left the
+    // fencing identity undefined.
+    const acquiredInstanceId = await acquireInstanceLock();
+    if (!acquiredInstanceId) throw new Error('INSTANCE_LOCK_NOT_ACQUIRED');
+
+    try {
+      await initializeExecutionCore();
+      if (!executionCoreReady) throw new Error('EXECUTION_CORE_NOT_READY');
+      await runExecutionRecovery();
+      executionLeaseHeartbeat = setInterval(() => {
+        renewExecutionLease().catch(err => {
+          logger.error?.(`[EXECUTION] lease heartbeat failed: ${err.message}`);
+          executionCoreReady = false;
+          isPaused = true;
+        });
+      }, 5000);
+      intervalTimers.push(executionLeaseHeartbeat);
+    } catch (err) {
+      logger.error?.(`[EXECUTION] core init failed: ${err.message}`);
+      executionCoreReady = false;
+      isPaused = true;
+      throw err;
+    }
+
     apiLatencyStats.record('mongodb', Date.now() - startTime);
     logger.info('✅ Datenbank erfolgreich verbunden');
 
@@ -1234,8 +1250,7 @@ intervalTimers.push(executionLeaseHeartbeat);
     } catch (e) {}
 
     if (dbReconnectInterval) { clearInterval(dbReconnectInterval); dbReconnectInterval = null; }
-    const instanceId = await acquireInstanceLock();
-    startLockHeartbeat(instanceId);
+    startLockHeartbeat(currentInstanceId);
 
     const runtimeDoc = await botStateCollection.findOne({ _id: 'runtimeConfig' });
     if (runtimeDoc) {
