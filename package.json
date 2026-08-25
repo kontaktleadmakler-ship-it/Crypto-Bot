@@ -17,7 +17,8 @@
     "readiness": "node scripts/production-readiness.js",
     "test:step4": "node tests/step4-orderbook.test.js",
     "test:step5": "node tests/step5-risk-governor.test.js",
-    "test:steps6-11": "node tests/steps6-11.test.js"
+    "test:steps6-11": "node tests/steps6-11.test.js",
+    "ml:recover": "node scripts/recover-ml-history.js"
   },
   "engines": {
     "node": "22.x"
