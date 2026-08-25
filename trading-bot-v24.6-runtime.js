@@ -4759,7 +4759,7 @@ app.use(express.json({ limit: '256kb' }));
 app.use((req, res, next) => {
   // Liveness endpoint is intentionally public: UptimeRobot cannot supply
   // the bot's private API key. Authentication remains mandatory everywhere else.
-  if (req.path === '/health' || req.path === '/dashboard') return next();
+  if (req.path === '/health' || req.path === '/dashboard' || req.path === '/api/dashboard/live') return next();
   if (config.ALLOW_UNAUTHENTICATED_API) return next();
   if (!config.API_KEY) return res.status(503).json({ error: 'API_KEY_NOT_CONFIGURED' });
   if (req.get('X-API-Key') !== config.API_KEY) return res.status(401).json({ error: 'UNAUTHORIZED' });
