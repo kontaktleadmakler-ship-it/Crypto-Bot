@@ -1079,6 +1079,98 @@ async function persistPauseState() {
   try { await botStateCollection.updateOne({ _id: 'botControl' }, { $set: { isPaused } }, { upsert: true }); } catch (e) {}
 }
 
+let lastMLHistoryRecoveryAt = 0;
+
+async function recoverHistoricalMLDataOnStartup() {
+  if (String(process.env.ML_AUTO_RECOVERY || 'true').toLowerCase() === 'false') return;
+  if (!isDbConnected || !closedTradesCollection || !paperOrdersCollection || !db) return;
+
+  // Avoid repeated full scans during a short Mongo reconnect storm.
+  if (Date.now() - lastMLHistoryRecoveryAt < 10 * 60 * 1000) return;
+  lastMLHistoryRecoveryAt = Date.now();
+
+  try {
+    const {
+      indexPaperOrders,
+      indexExecutionIntents,
+      indexExecutionEvents,
+      findExactPaperOrder,
+      findExactExecutionSource,
+      recoverTrade
+    } = require('./ml-history-recovery');
+
+    const recoveryLimit = Math.max(1, Number(process.env.ML_RECOVERY_LIMIT || 2000));
+
+    const [trades, orders, intents, events] = await Promise.all([
+      closedTradesCollection.find({
+        isPartial: { $ne: true },
+        pnlUSD: { $exists: true, $ne: null }
+      }).sort({ closeTime: -1 }).limit(recoveryLimit).toArray(),
+      paperOrdersCollection.find({}).sort({ simulatedAt: 1 }).limit(Math.max(recoveryLimit * 2, 5000)).toArray(),
+      db.collection('executionIntents').find({}).sort({ createdAt: 1 }).limit(Math.max(recoveryLimit * 2, 5000)).toArray(),
+      db.collection('executionEvents').find({}).sort({ createdAt: 1, sequence: 1 }).limit(Math.max(recoveryLimit * 5, 10000)).toArray()
+    ]);
+
+    const paperIndex = indexPaperOrders(orders);
+    const intentIndex = indexExecutionIntents(intents);
+    const eventIndex = indexExecutionEvents(events);
+
+    let eligible = 0;
+    let recoverable = 0;
+    let updated = 0;
+    let unresolved = 0;
+    let paperCount = 0;
+    let eventCount = 0;
+
+    for (const trade of trades) {
+      const missingSignalPrice = !(Number.isFinite(Number(trade.signalPriceAtEntry)) && Number(trade.signalPriceAtEntry) > 0);
+      const missingEntry = !(Number.isFinite(Number(trade.entry)) && Number(trade.entry) > 0);
+      if (!missingSignalPrice && !missingEntry) continue;
+
+      eligible++;
+
+      const paperMatch = findExactPaperOrder(trade, paperIndex);
+      const executionMatch = paperMatch.order
+        ? { intent: null, event: null, source: null, sourceId: null }
+        : findExactExecutionSource(trade, intentIndex, eventIndex);
+
+      if (!paperMatch.order && !executionMatch.event && !executionMatch.intent) {
+        unresolved++;
+        continue;
+      }
+
+      const { patch, reasons } = recoverTrade(trade, paperMatch.order, executionMatch);
+      if (!Object.keys(patch).length) {
+        unresolved++;
+        continue;
+      }
+
+      recoverable++;
+
+      const result = await closedTradesCollection.updateOne(
+        { _id: trade._id },
+        { $set: patch }
+      );
+
+      if (result.modifiedCount > 0) updated++;
+      if (paperMatch.order) paperCount++;
+      else eventCount++;
+
+      logger.info?.(`[ML-RECOVERY] ${trade._id} ${trade.symbol || ''} ${reasons.join(', ')}`);
+    }
+
+    logger.info?.(
+      `[ML-RECOVERY] v2 complete scanned=${trades.length} eligible=${eligible} ` +
+      `recoverable=${recoverable} updated=${updated} unresolved=${unresolved} ` +
+      `paperOrders=${paperCount} executionEvents=${eventCount}`
+    );
+  } catch (err) {
+    // Recovery is non-critical to execution safety. If it fails, normal ML
+    // training remains fail-closed and the bot continues in its existing mode.
+    logger.warn?.(`[ML-RECOVERY] v2 skipped: ${err.message}`);
+  }
+}
+
 let currentInstanceId = null;
 
 async function tryAcquireLockOnce(instanceId) {
@@ -1298,6 +1390,7 @@ async function initDatabase() {
     // DB state and paper positions must already be restored before any UNKNOWN
     // execution is queried. A failed reconciliation always leaves trading paused.
     await runExecutionRecovery();
+    await recoverHistoricalMLDataOnStartup();
 
     if (dbBulkTimer) clearInterval(dbBulkTimer);
     dbBulkTimer = setInterval(processDbBulkQueue, config.DB_BULK_INTERVAL_MS);
