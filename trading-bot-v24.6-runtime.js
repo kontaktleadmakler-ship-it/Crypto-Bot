@@ -575,7 +575,7 @@ const config = {
 
   LOCK_ACQUIRE_RETRIES: parseInt(process.env.LOCK_ACQUIRE_RETRIES, 10) || 8,
   LOCK_ACQUIRE_RETRY_DELAY_MS: parseInt(process.env.LOCK_ACQUIRE_RETRY_DELAY_MS, 10) || 5000,
-  LOCK_STALE_AFTER_MS: parseInt(process.env.LOCK_STALE_AFTER_MS, 10) || 5 * 60 * 1000,
+  LOCK_STALE_AFTER_MS: parseInt(process.env.LOCK_STALE_AFTER_MS, 10) || 90 * 1000,
 
   FUNDING_INTERVAL_HOURS: parseFloat(process.env.FUNDING_INTERVAL_HOURS) || 8,
   SCAN_STATS_TELEGRAM_EVERY_N_SCANS: parseInt(process.env.SCAN_STATS_TELEGRAM_EVERY_N_SCANS, 10) || 4,
@@ -1174,12 +1174,37 @@ async function recoverHistoricalMLDataOnStartup() {
 let currentInstanceId = null;
 
 async function tryAcquireLockOnce(instanceId) {
-  try { await lockCollection.insertOne({ _id: 'instanceLock', instanceId: null, lastSeen: new Date(0) }); } catch (e) { if (e.code !== 11000) throw e; }
-  const result = await lockCollection.updateOne(
-    { _id: 'instanceLock', $or: [{ instanceId }, { lastSeen: { $lt: new Date(Date.now() - config.LOCK_STALE_AFTER_MS) } }] },
-    { $set: { instanceId, lastSeen: new Date() } }
+  const now = new Date();
+  const staleBefore = new Date(now.getTime() - config.LOCK_STALE_AFTER_MS);
+
+  // Ensure the singleton document exists, then atomically claim it only if
+  // it is already ours or the previous owner has stopped heartbeating.
+  try {
+    await lockCollection.updateOne(
+      { _id: 'instanceLock' },
+      { $setOnInsert: { instanceId: null, lastSeen: new Date(0) } },
+      { upsert: true }
+    );
+  } catch (e) {
+    throw e;
+  }
+
+  const result = await lockCollection.findOneAndUpdate(
+    {
+      _id: 'instanceLock',
+      $or: [
+        { instanceId },
+        { lastSeen: { $lt: staleBefore } }
+      ]
+    },
+    {
+      $set: { instanceId, lastSeen: now }
+    },
+    { returnDocument: 'after' }
   );
-  return result.matchedCount > 0;
+
+  const doc = result?.value || result;
+  return doc?.instanceId === instanceId;
 }
 
 async function acquireInstanceLock() {
@@ -1187,14 +1212,26 @@ async function acquireInstanceLock() {
   try {
     for (let attempt = 1; attempt <= config.LOCK_ACQUIRE_RETRIES; attempt++) {
       const acquired = await tryAcquireLockOnce(instanceId);
-      if (acquired) { currentInstanceId = instanceId; return instanceId; }
-      if (attempt < config.LOCK_ACQUIRE_RETRIES) await sleep(config.LOCK_ACQUIRE_RETRY_DELAY_MS);
+      if (acquired) {
+        currentInstanceId = instanceId;
+        // Start the heartbeat immediately after ownership is acquired.
+        // Startup/reconciliation can take longer than the lease window; the
+        // old implementation only started heartbeating after execution-core
+        // initialization, which could make a healthy startup look stale.
+        startLockHeartbeat(instanceId);
+        logger.info(`[INSTANCE-LOCK] acquired owner=${instanceId} attempt=${attempt}`);
+        return instanceId;
+      }
+      if (attempt < config.LOCK_ACQUIRE_RETRIES) {
+        logger.warn(`[INSTANCE-LOCK] busy; retry ${attempt}/${config.LOCK_ACQUIRE_RETRIES}`);
+        await sleep(config.LOCK_ACQUIRE_RETRY_DELAY_MS);
+      }
     }
     logger.error('🔴 Konnte Instance-Lock nicht erwerben – beende Prozess.');
     await sendTelegramAlert('🚨 <b>Instance-Lock fehlgeschlagen!</b> Bot wird beendet.');
     process.exit(1);
   } catch (e) {
-    logger.error('🔴 Kritischer Fehler beim Instance-Lock – beende Prozess.');
+    logger.error(`🔴 Kritischer Fehler beim Instance-Lock – ${e.message}`);
     await sendTelegramAlert('🚨 <b>Instance-Lock Fehler!</b> Bot wird beendet.');
     process.exit(1);
   }
@@ -1211,7 +1248,7 @@ function startLockHeartbeat(instanceId) {
   lockHeartbeatInterval = setInterval(async () => {
     if (!isDbConnected || !lockCollection) return;
     try { await lockCollection.updateOne({ _id: 'instanceLock', instanceId }, { $set: { lastSeen: new Date() } }); } catch (e) {}
-  }, 60_000);
+  }, 15_000);
 }
 
 async function loadPersistedFilterState() {
@@ -1342,8 +1379,6 @@ async function initDatabase() {
     } catch (e) {}
 
     if (dbReconnectInterval) { clearInterval(dbReconnectInterval); dbReconnectInterval = null; }
-    startLockHeartbeat(currentInstanceId);
-
     const runtimeDoc = await botStateCollection.findOne({ _id: 'runtimeConfig' });
     if (runtimeDoc) {
       if (runtimeDoc.CAPITAL_USD) config.CAPITAL_USD = runtimeDoc.CAPITAL_USD;
