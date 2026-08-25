@@ -4755,7 +4755,7 @@ app.use(express.json({ limit: '256kb' }));
 app.use((req, res, next) => {
   // Liveness endpoint is intentionally public: UptimeRobot cannot supply
   // the bot's private API key. Authentication remains mandatory everywhere else.
-  if (req.path === '/health') return next();
+  if (req.path === '/health' || req.path === '/dashboard') return next();
   if (config.ALLOW_UNAUTHENTICATED_API) return next();
   if (!config.API_KEY) return res.status(503).json({ error: 'API_KEY_NOT_CONFIGURED' });
   if (req.get('X-API-Key') !== config.API_KEY) return res.status(401).json({ error: 'UNAUTHORIZED' });
@@ -4765,6 +4765,165 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => {
   res.send(`🤖 Trading Bot v24.6 Institutional Edition | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
+
+
+// ---------------------------------------------------------------------------
+// JARVIS LIVE NEURAL DASHBOARD
+// Uses the existing ExchangeAdapter + RiskEngine + MacroFilterEngine boundary.
+// No mock market values are generated here. The browser polls this endpoint
+// every 2.5s and receives live/closed-candle market data from KuCoin Futures.
+// ---------------------------------------------------------------------------
+const dashboardCache = new Map();
+const DASHBOARD_CACHE_MS = 1200;
+let dashboardEventCounter = 0;
+
+function dashboardSharpe(closes) {
+  if (!closes || closes.length < 20) return 0;
+  const r = [];
+  for (let i = 1; i < closes.length; i++) r.push(Math.log(closes[i] / closes[i - 1]));
+  const mean = r.reduce((a,b) => a+b, 0) / r.length;
+  const variance = r.reduce((a,b) => a + Math.pow(b - mean, 2), 0) / Math.max(1, r.length - 1);
+  const sd = Math.sqrt(variance);
+  return sd > 0 ? Number((mean / sd * Math.sqrt(96 * 365)).toFixed(2)) : 0;
+}
+
+function dashboardBollinger(closes, period = 20, mult = 2) {
+  if (!closes || closes.length < period) return { middle: closes?.at(-1) || 0, upper: 0, lower: 0, position: 'MID' };
+  const a = closes.slice(-period);
+  const mean = a.reduce((x,y) => x+y, 0) / a.length;
+  const sd = Math.sqrt(a.reduce((x,y) => x + Math.pow(y-mean,2), 0) / a.length);
+  const upper = mean + mult * sd, lower = mean - mult * sd, price = closes.at(-1);
+  return { middle: mean, upper, lower, position: price >= upper ? 'UPPER' : price <= lower ? 'LOWER' : 'MID' };
+}
+
+function dashboardVolatility(closes) {
+  if (!closes || closes.length < 20) return 0;
+  const r = [];
+  for (let i = 1; i < closes.length; i++) r.push(Math.log(closes[i] / closes[i-1]));
+  const mean = r.reduce((a,b)=>a+b,0)/r.length;
+  const sd = Math.sqrt(r.reduce((a,b)=>a+Math.pow(b-mean,2),0)/Math.max(1,r.length-1));
+  return sd * Math.sqrt(96) * 100;
+}
+
+async function getDashboardData(symbol) {
+  const cached = dashboardCache.get(symbol);
+  if (cached && Date.now() - cached.ts < DASHBOARD_CACHE_MS) return cached.data;
+
+  const [candles, ticker, book, contract, macro] = await Promise.all([
+    fetchKucoinKlines(symbol, '15m', 100),
+    fetchKucoinTickerPrice(symbol),
+    fetchOrderBookMetrics(symbol),
+    fetchFuturesData(symbol),
+    macroEngine.evaluateMacroEnvironment().catch(() => ({ value: 50, classification: 'Neutral', safe: true, multiplier: 1 }))
+  ]);
+
+  if (!candles || candles.length < 50 || !Number.isFinite(ticker)) {
+    throw new Error('LIVE_MARKET_DATA_UNAVAILABLE');
+  }
+
+  const closes = candles.map(c => c.close);
+  const price = Number(ticker);
+  const prev24h = closes[Math.max(0, closes.length - 97)] || closes[0] || price;
+  const change24h = ((price - prev24h) / prev24h) * 100;
+  const volume24h = candles.slice(-96).reduce((sum, c) => sum + Number(c.volume || 0) * Number(c.close || 0), 0);
+  const rsi = calculateRSI(closes, 14);
+  const macd = calculateMACD(closes);
+  const ma20 = calculateEMA(closes, 20);
+  const ma50 = calculateEMA(closes, 50);
+  const bb = dashboardBollinger(closes);
+  const trend = ma20 > ma50 ? 'BULLISH' : ma20 < ma50 ? 'BEARISH' : 'NEUTRAL';
+  const volatilityPct = dashboardVolatility(closes);
+  const sharpe = dashboardSharpe(closes);
+  const returns = [];
+  for (let i=1;i<closes.length;i++) returns.push((closes[i]-closes[i-1])/closes[i-1]);
+  const sorted = [...returns].sort((a,b)=>a-b);
+  const q = sorted[Math.max(0, Math.floor(sorted.length * .05))] || 0;
+  const var95 = Math.abs(q) * price;
+  const peak = Math.max(...closes);
+  const drawdownPct = peak > 0 ? ((price - peak) / peak) * 100 : 0;
+  const technicalAllowed = rsi >= 25 && rsi <= 75;
+
+  const funding = Number(contract?.fundingRate || 0);
+  const imbalance = Number(book?.bidAskRatio || 1);
+  const orderFlowBias = imbalance > 1.15 ? 'BUY PRESSURE' : imbalance < .87 ? 'SELL PRESSURE' : 'BALANCED';
+  const sentimentBias = macro.sentimentValue >= 55 ? 'BULLISH' : macro.sentimentValue <= 45 ? 'BEARISH' : 'NEUTRAL';
+  const sentimentAllowed = macro.safe !== false && macro.sentimentValue >= 30;
+
+  const liveRiskCheck = riskEngine.assess({ equity: config.CAPITAL_USD + dailyNetPnL, peakEquity: peakCapital, dailyPnL: dailyNetPnL, openPositions: [...activeTrades.values()] });
+  const riskAllowed = liveRiskCheck.allowed === true && volatilityPct <= 6 && sharpe >= .5;
+  const approvals = [technicalAllowed, sentimentAllowed, riskAllowed].filter(Boolean).length;
+  let action = 'VERWERFEN';
+  if (approvals === 3) action = macd.histogram >= 0 ? 'KAUFEN' : 'VERKAUFEN';
+  const confidence = Math.round(Math.max(55, Math.min(99, 60 + approvals * 10 + Math.abs(macd.histogram / Math.max(price,1))*10000)));
+  const reason = approvals < 3
+    ? (!technicalAllowed ? `Technical Veto: RSI ${rsi.toFixed(1)} außerhalb 25–75` : !sentimentAllowed ? `Sentiment Veto: Fear & Greed ${macro.sentimentValue}` : `Risk Veto: Vol ${volatilityPct.toFixed(2)}% / Sharpe ${sharpe.toFixed(2)}`)
+    : `Konsens ${approvals}/3 · RSI ${rsi.toFixed(1)} · MACD ${macd.histogram >= 0 ? 'positiv' : 'negativ'} · Risk OK`;
+
+  const data = {
+    symbol,
+    market: {
+      price, timestamp: Date.now(), change24h,
+      volume24h,
+      orderBook: book,
+      contract
+    },
+    candles,
+    technical: {
+      rsi, macd, ma20, ma50,
+      bbPosition: bb.position,
+      trend,
+      allowed: technicalAllowed,
+      reason: technicalAllowed ? '✓ TECHNICAL PASSED' : `RSI ${rsi.toFixed(1)} außerhalb Grenzbereich`
+    },
+    sentiment: {
+      value: macro.sentimentValue,
+      classification: macro.sentimentClass,
+      allowed: sentimentAllowed,
+      fundingRate: funding,
+      orderFlow: orderFlowBias,
+      bias: sentimentBias,
+      reason: sentimentAllowed ? `✓ MACRO ${macro.sentimentClass}` : `F&G ${macro.sentimentValue} blockiert`
+    },
+    risk: {
+      volatilityPct,
+      sharpe,
+      drawdownPct,
+      var95,
+      level: !riskAllowed ? 'HIGH' : volatilityPct > 4 ? 'MEDIUM' : 'LOW',
+      allowed: riskAllowed,
+      reason: riskAllowed ? '✓ RISK GATE OPEN' : (!liveRiskCheck.allowed ? `BOT RISK: ${liveRiskCheck.reason || 'BLOCKED'}` : volatilityPct > 6 ? 'Volatility > 6%' : 'Sharpe < 0.5')
+    },
+    decision: {
+      action, approvals,
+      confidence,
+      reason,
+      eventId: ++dashboardEventCounter
+    },
+    marketPhase: currentMarketPhase,
+    activeTrades: activeTrades.size,
+    ticker: `LIVE ${symbol} · KuCoin Futures · ${new Date().toISOString()}`
+  };
+  dashboardCache.set(symbol, { ts: Date.now(), data });
+  return data;
+}
+
+app.get('/dashboard', (req, res) => {
+  res.sendFile(require('node:path').join(__dirname, 'dashboard.html'));
+});
+
+app.get('/api/dashboard/live', async (req, res) => {
+  try {
+    const symbol = String(req.query.symbol || 'BTC-USDT').toUpperCase();
+    if (!/^[A-Z0-9]+-USDT$/.test(symbol)) return res.status(400).json({ error: 'INVALID_SYMBOL' });
+    const data = await getDashboardData(symbol);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(data);
+  } catch (e) {
+    logger.warn(`[Dashboard] ${e.message}`);
+    res.status(503).json({ error: e.message });
+  }
+});
+
 
 app.get('/api/v24/readiness', (req, res) => {
   const risk = riskEngine.assess({ equity: config.CAPITAL_USD + dailyNetPnL, peakEquity: peakCapital, dailyPnL: dailyNetPnL, openPositions: [...activeTrades.values()] });
