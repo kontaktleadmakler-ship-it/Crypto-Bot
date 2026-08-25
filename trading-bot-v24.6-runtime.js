@@ -1459,7 +1459,16 @@ async function executePaperExecutionThroughCore({
 async function removeTrade(symbol, closedTradeRecord = null) {
   const trade = activeTrades.get(symbol);
   if (trade) {
-    const finalRecord = closedTradeRecord || { ...trade, closeTime: Date.now(), closeReason: 'manual/unknown' };
+    // Always preserve the complete entry-time feature snapshot when a trade is closed.
+    // Callers historically passed only close-time fields (pnl/exit/reason), which
+    // caused closedTrades to lose the ML features collected at signal/entry.
+    // Merge the durable active trade first, then apply close-time fields on top.
+    const finalRecord = {
+      ...trade,
+      ...(closedTradeRecord || {}),
+      closeTime: closedTradeRecord?.closeTime || Date.now(),
+      closeReason: closedTradeRecord?.closeReason || trade.closeReason || 'manual/unknown'
+    };
 
     if (config.PAPER_EXECUTION_ENABLED && paperExecutionAdapter.getPosition(symbol)) {
       try {
