@@ -9,6 +9,8 @@ import { assertPreTradeSafe } from './pre-trade-gate.js';
 import { RecoveryCoordinator } from './execution-core/recovery-coordinator.js';
 import { protectedSubmit } from './execution-core/protected-submit.js';
 import { CriticalStateQueue } from './execution-core/critical-state-queue.js';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
 
 /**
  * ============================================================================
