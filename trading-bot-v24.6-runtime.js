@@ -10,7 +10,11 @@ import { RecoveryCoordinator } from './execution-core/recovery-coordinator.js';
 import { protectedSubmit } from './execution-core/protected-submit.js';
 import { CriticalStateQueue } from './execution-core/critical-state-queue.js';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 const require = createRequire(import.meta.url);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 /**
  * ============================================================================
@@ -4908,7 +4912,7 @@ async function getDashboardData(symbol) {
 }
 
 app.get('/dashboard', (req, res) => {
-  res.sendFile(require('node:path').join(__dirname, 'dashboard.html'));
+  res.sendFile(path.join(__dirname, 'dashboard.html'));
 });
 
 app.get('/api/dashboard/live', async (req, res) => {
