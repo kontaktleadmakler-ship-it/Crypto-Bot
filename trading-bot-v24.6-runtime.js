@@ -67,6 +67,7 @@ const { analyze: analyzeRegimeIntelligence } = require('./jarvis-regime-intellig
 const { route: adaptiveStrategyRoute } = require('./adaptive-strategy-router');
 const { compare: counterfactualCompare } = require('./counterfactual-decision-engine');
 const { MarketDataReplay } = require('./market-data-replay.js');
+const { buildCoinTimeline } = require('./coin-timeline.js');
 
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
@@ -923,7 +924,7 @@ const readinessGate = new ProductionReadinessGate({ required: ['apiKeyConfigured
 const auditTrail = new AuditTrail();
 auditTrail.append({ event: 'RUNTIME_START', version: '25.0.0-institutional-hardening', mode: 'PAPER_SHADOW' });
 
-const jarvisEventBus = new JarvisEventBus({ maxEvents: Number(process.env.JARVIS_EVENT_BUFFER_SIZE || 1000), auditTrail, logger });
+const jarvisEventBus = new JarvisEventBus({ maxEvents: Number(process.env.JARVIS_EVENT_BUFFER_SIZE || 1000), auditTrail, logger, replayDir: process.env.MARKET_DATA_DIR || './data/market-replay' });
 jarvisEventBus.emitEvent('SYSTEM:READY', { version: '25.0.0', mode: 'PAPER_SHADOW' }, { source: 'runtime', persist: true, persistMinIntervalMs: 60000 });
 const llmEngine = new GeminiLLMEngine({ apiKey: config.GEMINI_API_KEY, model: config.GEMINI_MODEL, enabled: config.AI_LLM_ENABLED, cooldownMs: config.AI_LLM_COOLDOWN_MS, logger });
 
@@ -3404,6 +3405,50 @@ async function scanMarket() {
           scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
         }
 
+        // JARVIS LIVE SCAN SNAPSHOT: every coin that reaches validated market-data
+        // evaluation is persisted with its complete observable market state.
+        // This is the canonical bridge between the live scanner and Historical
+        // Intelligence: the same snapshot shown live is replayable later.
+        jarvisEventBus.emitEvent('SCAN:COIN', {
+          symbol,
+          scanCounter: scanCounter + 1,
+          price: Number(currentPrice || 0),
+          changePct: Number(((currentPrice - (closes15m[Math.max(0, closes15m.length - 4)] || currentPrice)) / Math.max(1e-12, (closes15m[Math.max(0, closes15m.length - 4)] || currentPrice))) * 100),
+          rsi: Number(rsi || 0),
+          macdHistogram: Number(macd?.histogram || 0),
+          ma20: Number(calculateEMA(closes15m, 20) || 0),
+          ma50: Number(calculateEMA(closes15m, 50) || 0),
+          adx: Number(adx || 0),
+          atr: Number(atr || 0),
+          atrPct: currentPrice > 0 ? Number((atr / currentPrice) * 100) : 0,
+          hurst: Number(hurst || 0),
+          chop: Number(chop || 0),
+          relativeVolume: Number(relativeVolume || 0),
+          trend4h, trend1h, trend15m, btcTrend,
+          fundingRate: Number(fundingRate || 0),
+          openInterest: Number(futuresData?.openInterest || 0),
+          volume24h: Number(futuresData?.volume24h || 0),
+          orderBook: {
+            valid: Boolean(orderBookMetrics?.valid),
+            bidAskRatio: Number(orderBookMetrics?.bidAskRatio || 0),
+            bidVolume: Number(orderBookMetrics?.bidVolume || 0),
+            askVolume: Number(orderBookMetrics?.askVolume || 0),
+            spreadPct: Number(orderBookMetrics?.spreadPct || 0),
+            depthUSD: Number(orderBookMetrics?.depthUSD || 0),
+            fetchedAt: Number(orderBookMetrics?.fetchedAt || Date.now())
+          },
+          orderFlow: { score: Number(orderFlowEval?.score || 0), pressure: orderFlowEval?.pressure || 'UNKNOWN' },
+          poc: Number(poc || 0),
+          vwap: Number(vwap || 0),
+          bosBullish: Boolean(bosBullish),
+          bosBearish: Boolean(bosBearish),
+          gateDirection: direction,
+          gateStatus: direction ? 'PASS' : 'REJECT',
+          gateReason: direction ? null : (primaryFail || 'NO_DIRECTION'),
+          marketPhase: currentMarketPhase,
+          timestamp: Date.now()
+        }, { source: 'scanner', severity: direction ? 'INFO' : 'WARN', persist: true, persistReplay: true, persistMinIntervalMs: 0 });
+
         if (direction !== null) {
           if (direction === 'LONG' && orderFlowEval.pressure === 'BEARISH_DOMINANT' && orderFlowEval.score < 35) {
             scanStats.orderFlowBlocked++;
@@ -4816,7 +4861,7 @@ function pushDashboardReplay(snapshot) {
   const item = { ...snapshot, id: ++dashboardEventCounter, timestamp: Date.now() };
   dashboardDecisionReplay.unshift(item);
   if (dashboardDecisionReplay.length > DASHBOARD_REPLAY_MAX) dashboardDecisionReplay.length = DASHBOARD_REPLAY_MAX;
-  jarvisEventBus.emitEvent('DECISION:REPLAY', item, { source: 'decision-core', severity: item.vetoes?.length ? 'WARN' : 'INFO', persist: true, persistMinIntervalMs: 5000 });
+  jarvisEventBus.emitEvent('DECISION:REPLAY', item, { source: 'decision-core', severity: item.vetoes?.length ? 'WARN' : 'INFO', persist: true, persistReplay: true, persistMinIntervalMs: 0 });
 }
 
 function dashboardAgentPerformance() {
@@ -5192,7 +5237,7 @@ app.get('/dashboard', (req, res) => {
 });
 
 app.get('/api/dashboard/build', (req, res) => {
-  res.json({ build: 'JARVIS-UNIFIED-COMMAND-CENTER-6.6-CONSOLIDATED', runtime: 'v25', dashboard: 'unified', timestamp: Date.now(), modules: ['live-market','agent-neural-layer','supervisor','execution','portfolio','rl-learning','event-bus','historical-replay','walk-forward-oos','monte-carlo','attribution','regime-intelligence','adaptive-router','counterfactual'] });
+  res.json({ build: 'JARVIS-NEURAL-BRAIN-6.9', runtime: 'v25', dashboard: 'unified', timestamp: Date.now(), modules: ['live-market','agent-neural-layer','supervisor','execution','portfolio','rl-learning','event-bus','historical-replay','walk-forward-oos','monte-carlo','attribution','regime-intelligence','adaptive-router','counterfactual','coin-forensics-outcomes','mfe-mae-forward-horizons'] });
 });
 
 app.get('/api/dashboard/live', async (req, res) => {
@@ -5307,8 +5352,8 @@ async function getDashboardAgentNetwork(symbol) {
   const finalAction = vetoes.length ? 'VERWERFEN' : (dqn.action === 'SELL' || dqn.action === 'SHORT' ? 'VERKAUFEN' : dqn.action === 'BUY' || dqn.action === 'LONG' ? 'KAUFEN' : agentEvaluation.meta.decision || 'MONITOR');
   const replay = { timestamp: Date.now(), symbol, direction, action: finalAction, confidence, consensus, totalAgents: nodes.length, vetoes, marketPhase: currentMarketPhase, dqnAction: dqn.action, mlProbability, riskLevel: data.risk?.level || 'UNKNOWN' };
   pushDashboardReplay(replay);
-  jarvisEventBus.emitEvent('AGENTS:EVALUATED', { symbol, nodes, dqn, confidence, consensus, vetoes, finalAction }, { source: 'agent-suite', severity: vetoes.length ? 'WARN' : 'INFO', persist: false });
-  jarvisEventBus.emitEvent('RISK:EVALUATED', { symbol, allowed: liveRiskCheck.allowed, level: liveRiskCheck.level, reason: liveRiskCheck.reason, equity, exposurePct }, { source: 'risk-engine', severity: liveRiskCheck.allowed ? 'INFO' : 'WARN', persist: !liveRiskCheck.allowed, persistMinIntervalMs: 3000 });
+  jarvisEventBus.emitEvent('AGENTS:EVALUATED', { symbol, nodes, dqn, confidence, consensus, vetoes, finalAction }, { source: 'agent-suite', severity: vetoes.length ? 'WARN' : 'INFO', persist: false, persistReplay: true });
+  jarvisEventBus.emitEvent('RISK:EVALUATED', { symbol, allowed: liveRiskCheck.allowed, level: liveRiskCheck.level, reason: liveRiskCheck.reason, equity, exposurePct }, { source: 'risk-engine', severity: liveRiskCheck.allowed ? 'INFO' : 'WARN', persist: !liveRiskCheck.allowed, persistReplay: true, persistMinIntervalMs: 0 });
   return { timestamp: Date.now(), symbol, direction, nodes, dqn, meta: agentEvaluation.meta, confidence, consensus, vetoes, finalAction, raw: agentEvaluation };
 }
 
@@ -5397,7 +5442,7 @@ async function getDashboardAutonomousSupervisor(symbol) {
     }
   };
   dashboardSupervisorCache.ts = now; dashboardSupervisorCache.key = key; dashboardSupervisorCache.data = result;
-  jarvisEventBus.emitEvent('SUPERVISOR:EVALUATED', { symbol: key, recommendation: action, confidence, consensusPct, hardBlock, conflicts, decisionPath: result.explanations.decisionPath }, { source: 'autonomous-supervisor', severity: hardBlock ? 'HIGH' : conflicts.length ? 'WARN' : 'INFO', persist: hardBlock || conflicts.length > 0, persistMinIntervalMs: 3000 });
+  jarvisEventBus.emitEvent('SUPERVISOR:EVALUATED', { symbol: key, recommendation: action, confidence, consensusPct, hardBlock, conflicts, decisionPath: result.explanations.decisionPath }, { source: 'autonomous-supervisor', severity: hardBlock ? 'HIGH' : conflicts.length ? 'WARN' : 'INFO', persist: hardBlock || conflicts.length > 0, persistReplay: true, persistMinIntervalMs: 0 });
   return result;
 }
 
@@ -5521,7 +5566,7 @@ async function getDashboardExecutionPortfolio(symbol) {
     { key:'exit', label:'EXIT', status: positions.some(p => p.symbol === symbol) ? 'MONITORING' : 'WAITING', timestamp: null }
   ];
   const executionSnapshot = { mode: readiness.execution?.paperOnly ? 'PAPER / SHADOW' : (readiness.execution?.liveOrders ? 'LIVE' : 'LOCKED'), ready: Boolean(risk.allowed && !isPaused && Date.now() >= kucoinCircuitOpenUntil), killSwitch: safetyController.isActive('kill-switch') || isPaused, circuitBreaker: Date.now() < kucoinCircuitOpenUntil, reconciliation: readiness.checks?.reconciliationHealthy !== false, lifecycle: stages.map(s => ({ key: s.key, status: s.status })) };
-  jarvisEventBus.emitEvent('EXECUTION:STATE', { symbol, ...executionSnapshot }, { source: 'execution-governance', severity: executionSnapshot.ready ? 'INFO' : 'WARN', persist: true, persistMinIntervalMs: 3000 });
+  jarvisEventBus.emitEvent('EXECUTION:STATE', { symbol, ...executionSnapshot }, { source: 'execution-governance', severity: executionSnapshot.ready ? 'INFO' : 'WARN', persist: true, persistReplay: true, persistMinIntervalMs: 0 });
   jarvisEventBus.emitEvent('PORTFOLIO:SNAPSHOT', { symbol, equity, grossExposureUSD: gross, longNotionalUSD: longNotional, shortNotionalUSD: shortNotional, unrealizedPnL, openPositions: positions.length, maxConcentrationPct: maxConcentration }, { source: 'portfolio', persist: false });
   return {
     timestamp: now,
@@ -5606,6 +5651,38 @@ const jarvisHistoricalReplay = new MarketDataReplay({
   dir: process.env.MARKET_DATA_DIR || './data/market-replay',
   speed: 0,
   logger: console
+});
+
+app.get('/api/dashboard/coin-timeline', async (req, res) => {
+  try {
+    const now = Date.now();
+    const fromTs = Number.isFinite(Number(req.query.from)) ? Number(req.query.from) : now - 24 * 60 * 60 * 1000;
+    const toTs = Number.isFinite(Number(req.query.to)) ? Number(req.query.to) : now;
+    const symbol = String(req.query.symbol || dashboardScanUniverse[0] || 'BTC-USDT').toUpperCase();
+    const limit = Math.min(300, Math.max(10, Number(req.query.limit || 120)));
+    const events = [];
+    await jarvisHistoricalReplay.run({ fromTs, toTs, onEvent: async e => {
+      if (String(e.symbol || '').toUpperCase() === symbol) events.push(e);
+    }});
+    const timeline = buildCoinTimeline(events, symbol).slice(-limit);
+    const scans = timeline.length;
+    const decisions = timeline.filter(x => x.decision).length;
+    const passes = timeline.filter(x => String(x.snapshot?.gateStatus || '').toUpperCase() === 'PASS').length;
+    const rejects = scans - passes;
+    const reactions = timeline.map(x => Number(x.directedReactionPct)).filter(Number.isFinite);
+    const avgReaction = reactions.length ? reactions.reduce((a,b)=>a+b,0)/reactions.length : null;
+    const positiveReactionRate = reactions.length ? reactions.filter(x=>x>0).length/reactions.length*100 : null;
+    res.setHeader('Cache-Control','no-store');
+    res.json({
+      timestamp: now, mode: 'READ_ONLY_COIN_FORENSICS', symbol,
+      range: { from: fromTs, to: toTs },
+      summary: { scans, decisions, passes, rejects, avgDirectedReactionPct: avgReaction, positiveReactionRate },
+      timeline
+    });
+  } catch (err) {
+    logger.warn(`[Dashboard Coin Timeline] ${err.message}`);
+    res.status(500).json({ error: 'COIN_TIMELINE_FAILED', message: err.message });
+  }
 });
 
 app.get('/api/dashboard/historical', async (req, res) => {
