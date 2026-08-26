@@ -261,4 +261,4 @@ setTimeout(()=>{initRouter();loadAdaptiveRouter()},5000);setInterval(()=>{if(doc
 <script>
 function initCounterfactual(){const sel=document.getElementById('cfSymbol');if(!sel)return;for(const c of (window.scanRows||[]).map(x=>x.symbol).filter(Boolean)){if(![...sel.options].some(o=>o.value===c)){const o=document.createElement('option');o.value=c;o.textContent=c;sel.appendChild(o)}}}
 setTimeout(()=>{initCounterfactual();loadCounterfactual()},6000);setInterval(()=>{if(document.getElementById('intelConsole')?.classList.contains('open'))loadCounterfactual()},10000);
-</script></body></html>
+<script>window.addEventListener('load',()=>setTimeout(()=>toggleIntel(true),350));</script></body></html>
