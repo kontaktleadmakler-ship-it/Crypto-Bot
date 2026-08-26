@@ -66,6 +66,7 @@ const { MonteCarloEngine } = require('./monte-carlo-engine');
 const { analyze: analyzeRegimeIntelligence } = require('./jarvis-regime-intelligence');
 const { route: adaptiveStrategyRoute } = require('./adaptive-strategy-router');
 const { compare: counterfactualCompare } = require('./counterfactual-decision-engine');
+const { MarketDataReplay } = require('./market-data-replay.js');
 
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
@@ -5184,7 +5185,14 @@ async function getDashboardData(symbol) {
 }
 
 app.get('/dashboard', (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
   res.sendFile(require('node:path').join(__dirname, 'dashboard.html'));
+});
+
+app.get('/api/dashboard/build', (req, res) => {
+  res.json({ build: 'JARVIS-UNIFIED-COMMAND-CENTER-6.6-CONSOLIDATED', runtime: 'v25', dashboard: 'unified', timestamp: Date.now(), modules: ['live-market','agent-neural-layer','supervisor','execution','portfolio','rl-learning','event-bus','historical-replay','walk-forward-oos','monte-carlo','attribution','regime-intelligence','adaptive-router','counterfactual'] });
 });
 
 app.get('/api/dashboard/live', async (req, res) => {
