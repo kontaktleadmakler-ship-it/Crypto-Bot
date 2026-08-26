@@ -584,7 +584,7 @@ const config = {
   GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
   GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-3.7-flash',
 
-  LOCK_ACQUIRE_RETRIES: parseInt(process.env.LOCK_ACQUIRE_RETRIES, 10) || 8,
+  LOCK_ACQUIRE_RETRIES: parseInt(process.env.LOCK_ACQUIRE_RETRIES, 10) || 30,
   LOCK_ACQUIRE_RETRY_DELAY_MS: parseInt(process.env.LOCK_ACQUIRE_RETRY_DELAY_MS, 10) || 5000,
   LOCK_STALE_AFTER_MS: parseInt(process.env.LOCK_STALE_AFTER_MS, 10) || 90 * 1000,
 
@@ -925,7 +925,7 @@ const auditTrail = new AuditTrail();
 auditTrail.append({ event: 'RUNTIME_START', version: '25.0.0-institutional-hardening', mode: 'PAPER_SHADOW' });
 
 const jarvisEventBus = new JarvisEventBus({ maxEvents: Number(process.env.JARVIS_EVENT_BUFFER_SIZE || 1000), auditTrail, logger, replayDir: process.env.MARKET_DATA_DIR || './data/market-replay' });
-jarvisEventBus.emitEvent('SYSTEM:READY', { version: '25.0.0', mode: 'PAPER_SHADOW' }, { source: 'runtime', persist: true, persistMinIntervalMs: 60000 });
+jarvisEventBus.emitEvent('SYSTEM:READY', { version: '25.0.0', dashboardBuild: 'JARVIS-6.14-REAL-BOT-LINK', mode: 'PAPER_SHADOW' }, { source: 'runtime', persist: true, persistMinIntervalMs: 60000 });
 const llmEngine = new GeminiLLMEngine({ apiKey: config.GEMINI_API_KEY, model: config.GEMINI_MODEL, enabled: config.AI_LLM_ENABLED, cooldownMs: config.AI_LLM_COOLDOWN_MS, logger });
 
 let isModelTrained = false;
@@ -1237,7 +1237,15 @@ async function acquireInstanceLock() {
         return instanceId;
       }
       if (attempt < config.LOCK_ACQUIRE_RETRIES) {
-        logger.warn(`[INSTANCE-LOCK] busy; retry ${attempt}/${config.LOCK_ACQUIRE_RETRIES}`);
+        let ownerInfo = '';
+        try {
+          const lockDoc = await lockCollection.findOne({ _id: 'instanceLock' });
+          if (lockDoc?.instanceId) {
+            const ageMs = lockDoc.lastSeen ? Math.max(0, Date.now() - new Date(lockDoc.lastSeen).getTime()) : null;
+            ownerInfo = ` owner=${lockDoc.instanceId} ageMs=${ageMs ?? 'unknown'} staleAfterMs=${config.LOCK_STALE_AFTER_MS}`;
+          }
+        } catch (_) {}
+        logger.warn(`[INSTANCE-LOCK] busy; retry ${attempt}/${config.LOCK_ACQUIRE_RETRIES}${ownerInfo}`);
         await sleep(config.LOCK_ACQUIRE_RETRY_DELAY_MS);
       }
     }
@@ -5523,11 +5531,16 @@ app.get('/api/dashboard/supervisor', async (req, res) => {
 app.get('/api/dashboard/connection', (req, res) => {
   const rows = dashboardLiveScannerRows();
   res.setHeader('Cache-Control','no-store');
+  const newestTs = rows.reduce((max, r) => Math.max(max, Number(r?.eventTs || 0)), 0);
+  const ageMs = newestTs ? Math.max(0, Date.now() - newestTs) : null;
+  const live = rows.length > 0 && ageMs !== null && ageMs <= Math.max(15000, Number(config.LOCK_STALE_AFTER_MS || 90000));
   res.json({
-    connected: true,
-    source: 'PRODUCTION_SCANNER_EVENT_BUS',
+    connected: live,
+    source: live ? 'PRODUCTION_SCANNER_EVENT_BUS' : 'WAITING_FOR_PRODUCTION_SCANNER',
     eventBus: jarvisEventBus.snapshot(),
     scanner: { ...dashboardScanState, universe: dashboardScanUniverse, lastLiveScanCounter: dashboardLastLiveScanCounter },
+    lastEventTs: newestTs || null,
+    ageMs,
     liveCoins: rows.map(r => ({ symbol:r.symbol, eventTs:r.eventTs, ageMs:Math.max(0,Date.now()-Number(r.eventTs||Date.now())), scanStatus:r.scanStatus||'EVALUATED' }))
   });
 });
@@ -5702,6 +5715,12 @@ app.get('/api/dashboard/events/stream', (req, res) => {
   const send = event => { if (!symbol || event.symbol === symbol || !event.symbol) res.write(`event: jarvis\ndata: ${JSON.stringify(event)}\n\n`); };
   jarvisEventBus.on('event', send);
   res.write(`event: ready\ndata: ${JSON.stringify({ timestamp: Date.now(), bus: jarvisEventBus.snapshot() })}\n\n`);
+  // Reconcile immediately with the bot's current in-memory event buffer. This
+  // prevents a dashboard opened between scans from appearing disconnected.
+  try {
+    const replay = jarvisEventBus.recent({ limit: 200, symbol, types: null }).reverse();
+    for (const event of replay) send(event);
+  } catch (_) {}
   const heartbeat = setInterval(() => res.write(`: heartbeat ${Date.now()}\n\n`), 15000);
   req.on('close', () => { clearInterval(heartbeat); jarvisEventBus.off('event', send); });
 });
