@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>JARVIS 6.9 // Neural Command Center</title>
+<title>JARVIS 6.11 // Neural Brain Command Center</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Orbitron:wght@500;600;700;800&display=swap" rel="stylesheet">
@@ -17,12 +17,25 @@
 .brain-panel{padding:8px;display:flex;flex-direction:column}.brain-head{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr;gap:6px;margin-bottom:5px}.stat{border:1px solid #10384b;border-radius:5px;padding:5px 7px;background:#091421}.stat label{display:block;font-size:7px;color:var(--muted)}.stat b{font-size:11px}.brain{position:relative;flex:1;min-height:0;border-radius:7px;background:radial-gradient(circle at 50% 50%,#00f0ff0b,transparent 50%),linear-gradient(135deg,#07101d,#071421);overflow:hidden}.brain svg{width:100%;height:100%;display:block}.brain-glow{filter:drop-shadow(0 0 7px #00f0ff77)}.brain-outline{fill:#07182a;stroke:#386c9a;stroke-width:2;opacity:.9}.brain-inner{fill:none;stroke:#6f55ff66;stroke-width:1.2}.conn{fill:none;stroke:#00d9ff88;stroke-width:1.1;stroke-dasharray:3 4;animation:flow 2s linear infinite}.conn.goodline{stroke:#00ff88aa}.conn.badline{stroke:#ff3366aa}.conn.goldline{stroke:#ffd700aa}@keyframes flow{to{stroke-dashoffset:-35}}.node{fill:#081827;stroke:var(--cyan);stroke-width:1.6}.node.goodnode{stroke:var(--green)}.node.goldnode{stroke:var(--gold)}.node.badnode{stroke:var(--red)}.nodeText{fill:#d8f9ff;font:700 11px 'JetBrains Mono';text-anchor:middle}.nodeSub{fill:#7095a8;font:8px 'JetBrains Mono';text-anchor:middle}.inputNode{fill:#08131e;stroke:#2780a0}.outNode{fill:#061d18;stroke:var(--green)}.outBad{fill:#210a14;stroke:var(--red)}.decisionCore{fill:#082a24;stroke:var(--green);stroke-width:2.4}.brain-caption{position:absolute;left:12px;bottom:8px;color:#496f83;font-size:8px}.legend{position:absolute;right:10px;top:8px;font-size:8px;display:grid;gap:3px}.legend i{display:inline-block;width:18px;height:2px;margin-right:5px;vertical-align:middle}.lcyan{background:var(--cyan)}.lgreen{background:var(--green)}.lgold{background:var(--gold)}.lred{background:var(--red)}
 .outcome-panel{display:grid;grid-template-columns:1fr 235px;gap:8px}.chartwrap{min-height:0}.chartwrap canvas{width:100%!important;height:150px!important}.outcome-stats{display:grid;grid-template-columns:1fr 1fr;gap:6px}.obox{border:1px solid #10394b;border-radius:5px;padding:7px;background:#08131e}.obox span{font-size:7px;color:var(--muted);display:block}.obox b{font-size:13px}.timeline{display:grid;gap:6px;overflow:auto;max-height:calc(100% - 24px)}.event{display:grid;grid-template-columns:9px 60px 1fr;gap:7px;align-items:start;font-size:8px}.event .rail{width:7px;height:7px;border-radius:50%;background:var(--cyan);box-shadow:0 0 7px #00f0ff88;margin-top:3px}.event.good .rail{background:var(--green);box-shadow:0 0 7px #00ff8888}.event.bad .rail{background:var(--red);box-shadow:0 0 7px #ff336688}.event .etype{color:var(--cyan);font-weight:700}.event .desc{color:#9fc0ce}.event .time{color:#6a8d9d}.forensic-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-bottom:7px}.fstat{border:1px solid #10384b;border-radius:5px;padding:5px}.fstat span{display:block;font-size:7px;color:var(--muted)}.fstat b{font-size:11px}.router{display:grid;grid-template-columns:1fr 1fr;gap:5px}.route{border:1px solid #10384b;border-radius:5px;padding:6px;background:#09131e}.route span{display:block;color:var(--muted);font-size:7px}.route b{font-size:10px}.radar{height:90px}.footer{display:flex;align-items:center;justify-content:space-between;padding:0 12px;font-size:8px;color:#557c90}.footer nav{display:flex;gap:4px}.footer button{background:#091522;border:1px solid #10384b;color:#6f9aac;border-radius:4px;padding:5px 9px;font:8px 'JetBrains Mono';cursor:pointer}.footer button.active{color:#fff;border-color:var(--cyan);box-shadow:0 0 8px #00f0ff33}.flash{animation:flash .6s}@keyframes flash{50%{box-shadow:0 0 25px #00f0ff55,inset 0 0 25px #00f0ff22}}
 @media(max-width:1150px){.main{grid-template-columns:250px minmax(450px,1fr) 290px}.header{grid-template-columns:220px 1fr 420px}.header-metrics{gap:8px}.coin-title{font-size:18px}}
+
+/* JARVIS 6.11 // 3D NEURAL BRAIN OVERDRIVE */
+.brain-panel{background:radial-gradient(circle at 50% 48%,#071b2b 0%,#07101a 48%,#050a12 100%)}
+.brain{isolation:isolate;min-height:0;position:relative;border:1px solid #0e4258;background:radial-gradient(circle at 50% 45%,rgba(0,240,255,.12),transparent 35%),radial-gradient(circle at 50% 50%,#071a2a 0%,#040a12 74%);box-shadow:inset 0 0 55px rgba(0,240,255,.08),0 0 28px rgba(0,240,255,.08);overflow:hidden}
+.brain canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+.brain-hud{position:absolute;inset:0;pointer-events:none;font-size:7px;letter-spacing:1px;color:#5d899b;text-transform:uppercase}
+.brain-hud .tl{position:absolute;left:9px;top:8px}.brain-hud .tr{position:absolute;right:9px;top:8px;text-align:right}.brain-hud .bl{position:absolute;left:9px;bottom:8px}.brain-hud .br{position:absolute;right:9px;bottom:8px;text-align:right}
+.brain-hud strong{color:var(--cyan);font-size:8px}.brain-hud .goldtxt{color:var(--gold)}.brain-hud .greentxt{color:var(--green)}.brain-hud .redtxt{color:var(--red)}
+.brain-vignette{position:absolute;inset:0;pointer-events:none;background:radial-gradient(ellipse at center,transparent 43%,rgba(0,0,0,.38) 100%);z-index:3}
+.brain-scan{position:absolute;left:0;right:0;height:1px;top:-5px;background:linear-gradient(90deg,transparent,var(--cyan),transparent);box-shadow:0 0 12px var(--cyan);opacity:.45;z-index:4;animation:brainScan 4.2s linear infinite}
+@keyframes brainScan{to{top:105%}}
+.brain-chip{position:absolute;z-index:5;left:50%;top:50%;transform:translate(-50%,-50%);padding:5px 9px;border:1px solid rgba(0,240,255,.35);background:rgba(3,12,20,.68);backdrop-filter:blur(3px);font:700 8px Orbitron;color:var(--cyan);letter-spacing:2px;text-shadow:0 0 9px rgba(0,240,255,.8);box-shadow:0 0 22px rgba(0,240,255,.12)}
+.brain-decision-list{position:absolute;right:10px;top:32px;z-index:5;width:150px;display:grid;gap:4px;pointer-events:none}.brain-decision-item{padding:4px 6px;border:1px solid rgba(0,240,255,.16);background:rgba(4,11,18,.68);font-size:6px;color:#7899a8;backdrop-filter:blur(3px)}.brain-decision-item b{color:#d9f9ff}.brain-decision-item.good{border-color:rgba(0,255,136,.3)}.brain-decision-item.bad{border-color:rgba(255,51,102,.3)}
 </style>
 </head>
 <body>
 <div class="app">
 <header class="header">
-  <div><div class="brand">◉ JARVIS <span style="color:var(--cyan)">6.9</span></div><small>NEURAL COMMAND CENTER</small></div>
+  <div><div class="brand">◉ JARVIS <span style="color:var(--cyan)">6.11</span></div><small>NEURAL COMMAND CENTER</small></div>
   <div class="center-title"><div class="coin-title">► <span id="heroSymbol">BTC-USDT</span> ◄</div><div id="heroSub" style="font-size:8px;color:var(--muted);margin-top:3px">LIVE KUCOIN FUTURES // DECISION → OUTCOME GRAPH</div></div>
   <div class="header-metrics">
     <div class="metric"><span>LIVE SYSTEM</span><b class="online"><i class="dot"></i> ONLINE</b></div>
@@ -59,7 +72,7 @@
 <footer class="footer"><span id="footerStatus">JARVIS // LIVE MARKET DATA → NEURAL DECISION → OUTCOME FORENSICS</span><nav><button class="active">COMMAND</button><button onclick="focusPanel('marketRows')">MARKET</button><button onclick="focusPanel('brain')">NEURAL</button><button onclick="focusPanel('timeline')">FORENSICS</button><button onclick="focusPanel('outcomeChart')">OUTCOMES</button></nav><span id="lastUpdate">—</span></footer>
 </div>
 <script>
-const state={symbol:'BTC-USDT',market:[],scan:null,intel:null,agents:null,portfolio:null,timeline:[],router:null,regime:null,events:0};
+const state={symbol:'BTC-USDT',market:[],scan:null,intel:null,agents:null,portfolio:null,timeline:[],router:null,regime:null,events:0,liveSource:null};
 let outcomeChart=null;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
@@ -69,28 +82,181 @@ const colorClass=v=>Number(v)>0?'good':Number(v)<0?'bad':'warn';
 async function api(path){const r=await fetch(path,{cache:'no-store'});if(!r.ok)throw new Error(`${r.status} ${path}`);return r.json()}
 function focusPanel(id){$(id)?.scrollIntoView?.({behavior:'smooth',block:'nearest'});$(id)?.classList.add('flash');setTimeout(()=>$(id)?.classList.remove('flash'),700)}
 function formatPrice(v){const x=Number(v);if(!Number.isFinite(x))return '—';if(x>=1000)return x.toLocaleString(undefined,{maximumFractionDigits:2});if(x>=1)return x.toFixed(4);return x.toFixed(6)}
-function renderMarket(){const rows=state.market||[];$('marketRows').innerHTML=rows.map(r=>{const ch=Number(r.change||0);const flow=Number(r.bidAskRatio||1);const gate=r.tech===false?'VETO':(r.tech===true?'PASS':'—');const bars=Math.max(1,Math.min(5,Math.round(Math.abs(ch)*1.5)+1));return `<tr><td class="sym">${esc(r.symbol)}</td><td>${formatPrice(r.price)}</td><td class="${colorClass(ch)}">${pct(ch)}</td><td>${n(r.rsi,1)}</td><td class="bars">${'▮'.repeat(bars)}<span style="color:${flow>1.05?'var(--green)':flow<.95?'var(--red)':'var(--cyan)'}"> ${n(flow,2)}</span></td><td class="signal ${gate==='PASS'?'good':gate==='VETO'?'bad':''}">${gate}</td></tr>`}).join('')||'<tr><td colspan="6">WAITING FOR SCANNER MARKET DATA…</td></tr>';$('scanState').textContent=state.scan?.isScanning?'SCANNING':'LIVE';}
+function renderMarket(){const rows=state.market||[];$('marketRows').innerHTML=rows.map(r=>{const ch=Number(r.change||0);const flow=Number(r.bidAskRatio||1);const gate=r.tech===false?'VETO':(r.tech===true?'PASS':'—');const bars=Math.max(1,Math.min(5,Math.round(Math.abs(ch)*1.5)+1));return `<tr><td class="sym">${esc(r.symbol)}</td><td>${formatPrice(r.price)}</td><td class="${colorClass(ch)}">${pct(ch)}</td><td>${n(r.rsi,1)}</td><td class="bars">${'▮'.repeat(bars)}<span style="color:${flow>1.05?'var(--green)':flow<.95?'var(--red)':'var(--cyan)'}"> ${n(flow,2)}</span></td><td class="signal ${gate==='PASS'?'good':gate==='VETO'?'bad':''}">${gate}</td></tr>`}).join('')||'<tr><td colspan="6">WAITING FOR SCANNER MARKET DATA…</td></tr>';$('scanState').textContent=state.scan?.isScanning?'SCANNING':(state.liveSource==='PRODUCTION_SCANNER'?'LIVE SCANNER':'WAITING');}
 function renderHeat(){const rows=state.market||[];$('heatmap').innerHTML=rows.map(r=>{const ch=Number(r.change||0);const c=ch>.15?'heatpos':ch<-.15?'heatneg':'heatneu';return `<div class="heatcell ${c}" title="${esc(r.symbol)} · Price ${formatPrice(r.price)} · RSI ${n(r.rsi,1)}"><b>${esc(r.symbol?.replace('-USDT',''))}</b><span class="${colorClass(ch)}">${pct(ch)}</span></div>`}).join('')||'<div style="color:var(--muted);font-size:8px">NO MARKET DATA</div>';}
-function renderAgents(){const nodes=state.agents?.nodes||state.intel?.agents?.nodes||[];const names=nodes.length?nodes.map(x=>({name:x.name||x.agent||x.id,score:Number(x.score??x.confidence??x.value??0),status:x.status||x.decision||'—'})):[];const fallback=[['TECHNICAL',state.intel?.current?.technical?.allowed?84:45],['SENTIMENT',state.intel?.current?.sentiment?.allowed?76:42],['LIQUIDITY',70],['RISK',state.intel?.current?.risk?.allowed?88:35],['DQN',85],['SUPERVISOR',state.intel?.readiness?.ready?91:62]];const list=names.length?names.map(x=>[String(x.name).toUpperCase(),x.score]):fallback;$('agentMini').innerHTML=list.slice(0,8).map(([name,score])=>`<div class="agent-row"><span>${esc(name).slice(0,17)}</span><div class="bar"><i style="width:${Math.max(0,Math.min(100,score))}%"></i></div><b>${n(score,0)}%</b></div>`).join('');}
+function renderAgents(){const nodes=state.agents?.nodes||state.intel?.agents?.nodes||[];const names=nodes.length?nodes.map(x=>({name:x.name||x.agent||x.id,score:Number(x.score??x.confidence??x.value??0),status:x.status||x.decision||'—'})):[];const fallback=[['TECHNICAL',state.intel?.current?.technical?.allowed?84:45],['SENTIMENT',state.intel?.current?.sentiment?.allowed?76:42],['LIQUIDITY',Number(state.intel?.current?.market?.orderBook?.bidAskRatio||1)*50],['RISK',state.intel?.current?.risk?.allowed?88:35],['DQN',Number(state.intel?.current?.dqn?.confidence||state.intel?.current?.dqn?.score||50)],['SUPERVISOR',Number(state.intel?.current?.meta?.confidence||state.intel?.current?.supervisor?.confidence||50)]];const list=names.length?names.map(x=>[String(x.name).toUpperCase(),x.score]):fallback;$('agentMini').innerHTML=list.slice(0,8).map(([name,score])=>`<div class="agent-row"><span>${esc(name).slice(0,17)}</span><div class="bar"><i style="width:${Math.max(0,Math.min(100,score))}%"></i></div><b>${n(score,0)}%</b></div>`).join('');}
 function brainNode(x,y,r,label,sub,cls=''){return `<g><circle cx="${x}" cy="${y}" r="${r}" class="node ${cls}"/><text x="${x}" y="${y-2}" class="nodeText">${esc(label)}</text><text x="${x}" y="${y+11}" class="nodeSub">${esc(sub)}</text></g>`}
 function brainLine(x1,y1,x2,y2,cls=''){const mx=(x1+x2)/2;return `<path d="M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}" class="conn ${cls}"/>`}
-function renderBrain(){const cur=state.intel?.current||{};const d=cur.decision||{};const tech=cur.technical||{}, sent=cur.sentiment||{}, risk=cur.risk||{};const tscore=tech.allowed?84:35, sscore=sent.allowed?76:38, rscore=risk.allowed?88:32;const action=String(d.action||'—').toUpperCase();const positive=state.timeline?.[state.timeline.length-1]?.outcomeQuality==='POSITIVE';const W=900,H=480;let svg=`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" class="brain-glow"><defs><radialGradient id="bg"><stop stop-color="#102a42"/><stop offset="1" stop-color="#07101b"/></radialGradient></defs><rect width="100%" height="100%" fill="url(#bg)"/><g opacity=".5">`;
-svg+=brainLine(120,75,315,160)+brainLine(120,145,315,190)+brainLine(120,215,315,220)+brainLine(120,285,315,250)+brainLine(120,355,315,285)+brainLine(120,425,315,320);svg+=brainLine(315,160,450,245,'goldline')+brainLine(315,190,450,245)+brainLine(315,220,450,245)+brainLine(315,250,450,245,'goldline')+brainLine(315,285,450,245)+brainLine(315,320,450,245);svg+=brainLine(450,245,600,130,'goodline')+brainLine(450,245,600,200)+brainLine(450,245,600,270,'goldline')+brainLine(450,245,600,340)+brainLine(450,245,600,410,'goodline');svg+=`</g>`;
-svg+=`<path d="M275 75 C235 105 215 180 240 255 C220 330 270 405 360 425 C430 440 470 420 500 375 C555 415 650 395 675 315 C700 230 680 145 620 95 C565 48 505 80 460 100 C400 55 325 55 275 75Z" class="brain-outline"/>`;
-for(let i=0;i<12;i++){const x=290+(i%4)*88+(i%2)*10,y=115+Math.floor(i/4)*90;svg+=`<path d="M${x} ${y} C ${x+35} ${y-30}, ${x+55} ${y+35}, ${x+88} ${y}" class="brain-inner"/>`}
-svg+=brainNode(120,75,32,'PRICE',formatPrice(cur.market?.price||0));svg+=brainNode(120,145,32,'RSI',n(tech.rsi,1));svg+=brainNode(120,215,32,'ADX',n(cur.adx||27,1));svg+=brainNode(120,285,32,'OI',pct(cur.market?.contract?.openInterestChangePct||cur.market?.oiDeltaPct||0));svg+=brainNode(120,355,32,'FUNDING',n(cur.sentiment?.fundingRate||0,4));svg+=brainNode(120,425,32,'VOLUME',cur.market?.volume24h?((Number(cur.market.volume24h)/1e6).toFixed(1)+'M'):'—');
-svg+=brainNode(315,160,45,'TECHNICAL',`${n(tscore,0)}%`,tech.allowed?'goodnode':'badnode');svg+=brainNode(315,245,45,'LIQUIDITY',`${n(Number(cur.market?.orderBook?.bidAskRatio||1)*50,0)}%`);svg+=brainNode(315,330,45,'SENTIMENT',`${n(sscore,0)}%`,sent.allowed?'goodnode':'badnode');svg+=brainNode(450,245,55,'DECISION',`${action} · ${n(d.confidence,0)}%`,'decisionCore');svg+=brainNode(600,130,45,'RISK',`${n(rscore,0)}%`,risk.allowed?'goodnode':'badnode');svg+=brainNode(600,200,45,'DQN','85%','goldnode');svg+=brainNode(600,270,45,'SUPERVISOR',state.regime?.phase||'LIVE');
-const outs=[['+1 SCAN',state.timeline?.at(-1)?.outcomes?.plus1Scan?.directedReactionPct],['+3 SCAN',state.timeline?.at(-1)?.outcomes?.plus3Scan?.directedReactionPct],['+5 SCAN',state.timeline?.at(-1)?.outcomes?.plus5Scan?.directedReactionPct],['+10 SCAN',state.timeline?.at(-1)?.outcomes?.plus10Scan?.directedReactionPct],['FINAL',state.timeline?.at(-1)?.outcomes?.plus10Scan?.directedReactionPct]];outs.forEach((o,i)=>{const y=110+i*78;const val=o[1];svg+=brainNode(785,y,38,o[0],val==null?'PENDING':pct(val),val==null?'':'outNode');svg+=brainLine(655,270,747,y,val==null?'':'goodline')});svg+=`<text x="450" y="465" class="nodeSub">DECISION PATH → OBSERVED OUTCOME • NO SYNTHETIC RESULTS</text></svg>`;$('brain').innerHTML=svg;$('nodes').textContent=String(7+6+outs.length);$('connections').textContent=String(24+outs.length*2);$('decisions').textContent=state.timeline?.length||state.intel?.replay?.length||'—';$('accuracy').textContent=state.portfolio?.learning?.winRate?`${n(state.portfolio.learning.winRate,1)}%`:'—';}
+let brain3dStarted=false;
+let brain3dData={symbol:'—',action:'STANDBY',confidence:0,regime:'—',timeline:[],inputs:{}};
+function renderBrain(){
+  const cur=state.intel?.current||{};
+  const d=cur.decision||{};
+  const tech=cur.technical||{}, sent=cur.sentiment||{}, risk=cur.risk||{};
+  const action=String(d.action||'REJECT').toUpperCase();
+  const t=Array.isArray(state.timeline)?state.timeline:[];
+  const latest=t[t.length-1]||{};
+  const inputs={
+    PRICE:cur.market?.price,
+    RSI:tech.rsi,
+    ADX:cur.adx||cur.technical?.adx,
+    OI:cur.market?.contract?.openInterestChangePct??cur.market?.oiDeltaPct,
+    FUNDING:sent.fundingRate,
+    VOLUME:cur.market?.volume24h
+  };
+  brain3dData={
+    symbol:state.symbol||'—',action,confidence:Number(d.confidence||0),
+    regime:state.regime?.currentRegime||state.regime?.phase||cur.marketPhase||'—',
+    timeline:t.slice(-12),inputs
+  };
+  const brain=$('brain');
+  if(!brain3dStarted){
+    brain.innerHTML='<canvas id="brain3dCanvas"></canvas><div class="brain-scan"></div><div class="brain-vignette"></div><div class="brain-chip">NEURAL CORE // LIVE</div><div class="brain-hud"><div class="tl">ORIGIN <strong id="brainOrigin">LIVE SCAN</strong></div><div class="tr">REGIME <strong id="brainRegime">—</strong><br>CONFIDENCE <strong id="brainConfidence">—</strong></div><div class="bl">GRAPH <strong id="brainGraph">3D / DECISION LINKED</strong></div><div class="br">OUTCOME <strong id="brainOutcome">PENDING</strong></div></div><div class="brain-decision-list" id="brainDecisionList"></div>';
+    brain3dStarted=true;
+    startBrain3D();
+  }
+  $('brainRegime').textContent=brain3dData.regime;
+  $('brainConfidence').textContent=n(brain3dData.confidence,1)+'%';
+  const oq=latest.outcomeQuality||'PENDING';
+  const bo=$('brainOutcome');bo.textContent=oq;bo.className=oq==='POSITIVE'?'greentxt':oq==='NEGATIVE'?'redtxt':'goldtxt';
+  const list=$('brainDecisionList');
+  if(list){
+    list.innerHTML=brain3dData.timeline.slice(-4).reverse().map(x=>{
+      const q=x.outcomeQuality||'PENDING';
+      const r=x.outcomes?.plus10Scan?.directedReactionPct;
+      return `<div class="brain-decision-item ${q==='POSITIVE'?'good':q==='NEGATIVE'?'bad':''}"><b>${esc(x.action||'REJECT')}</b> · ${n(x.confidence,0)}% · ${new Date(x.scanTs||Date.now()).toLocaleTimeString()}<br>OUTCOME +10: ${r==null?'PENDING':pct(r)}</div>`;
+    }).join('');
+  }
+}
+function startBrain3D(){
+  const canvas=$('brain3dCanvas');if(!canvas)return;
+  const ctx=canvas.getContext('2d');
+  let W=0,H=0,dpr=1,t0=performance.now(),particles=[],links=[],brainPts=[];
+  const resize=()=>{const r=canvas.getBoundingClientRect();dpr=Math.min(2,window.devicePixelRatio||1);W=Math.max(320,r.width);H=Math.max(220,r.height);canvas.width=Math.round(W*dpr);canvas.height=Math.round(H*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);buildBrain();};
+  function buildBrain(){
+    brainPts=[];links=[];particles=[];
+    const n=150;
+    for(let i=0;i<n;i++){
+      const u=i/(n-1), theta=u*Math.PI*2*5.3, phi=Math.acos(1-2*((i%37)+.5)/37);
+      const hemi=i%2===0?-1:1;
+      const x=hemi*(82+26*Math.abs(Math.sin(theta*1.7)))*Math.sin(phi)*Math.cos(theta);
+      const y=118*Math.cos(phi)*(.82+.16*Math.sin(theta*2.1)**2);
+      const z=hemi*32*Math.sin(phi)*Math.sin(theta);
+      brainPts.push({x,y,z,seed:Math.random(),hemi});
+    }
+    for(let i=0;i<brainPts.length;i++){
+      let nearest=[];
+      for(let j=0;j<brainPts.length;j++)if(i!==j){const a=brainPts[i],b=brainPts[j];const dx=a.x-b.x,dy=a.y-b.y,dz=a.z-b.z;nearest.push([dx*dx+dy*dy+dz*dz,j]);}
+      nearest.sort((a,b)=>a[0]-b[0]);for(let k=0;k<2;k++){const j=nearest[k][1];if(i<j)links.push([i,j]);}
+    }
+  }
+  function project(p,rot){
+    let x=p.x*Math.cos(rot)-p.z*Math.sin(rot);let z=p.x*Math.sin(rot)+p.z*Math.cos(rot);
+    const yaw=.28;const x2=x*Math.cos(yaw)-z*Math.sin(yaw);z=x*Math.sin(yaw)+z*Math.cos(yaw);
+    const depth=1/(1+(z+70)/430);return {x:W/2+x2*1.55,y:H/2+p.y*0.88,scale:.72+depth*.52,z,depth};
+  }
+  function brainShape(rot){
+    const pts=[];for(let i=0;i<80;i++){const a=(i/79)*Math.PI*2;const l=project({x:-155*Math.cos(a)*(.86+.08*Math.sin(a*3)**2),y:145*Math.sin(a),z:22*Math.sin(a*2)},rot);const rr=project({x:155*Math.cos(a)*(.86+.08*Math.sin(a*3)**2),y:145*Math.sin(a),z:22*Math.sin(a*2)},rot);pts.push([l,rr]);}
+    ctx.save();ctx.beginPath();pts.forEach((p,i)=>{if(i===0)ctx.moveTo(p[0].x,p[0].y);else ctx.lineTo(p[0].x,p[0].y)});pts.forEach((p,i)=>{const q=pts[pts.length-1-i][1];ctx.lineTo(q.x,q.y)});ctx.closePath();ctx.fillStyle='rgba(2,17,29,.62)';ctx.shadowBlur=32;ctx.shadowColor='rgba(0,240,255,.22)';ctx.fill();ctx.shadowBlur=0;ctx.strokeStyle='rgba(0,240,255,.28)';ctx.lineWidth=1.2;ctx.stroke();ctx.restore();
+    ctx.save();ctx.setLineDash([2,5]);ctx.strokeStyle='rgba(111,85,255,.28)';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(W/2,H/2-128);ctx.bezierCurveTo(W/2-20,H/2-45,W/2+20,H/2+45,W/2,H/2+128);ctx.stroke();ctx.restore();
+  }
+  function chain(){
+    const cx=W/2,cy=H/2;
+    const latest=brain3dData.timeline[brain3dData.timeline.length-1]||{};
+    const reaction=latest.outcomes?.plus10Scan?.directedReactionPct;
+    const decision={x:cx,y:cy};
+    const src=[-220,-145,-72,72,145,220].map((x,i)=>({x:cx+x,y:cy+(i-2.5)*30}));
+    const outs=[-120,-40,40,120].map(y=>({x:cx+245,y:cy+y}));
+    const col=brain3dData.action.includes('BUY')||brain3dData.action.includes('LONG')?'#00ff88':brain3dData.action.includes('SELL')||brain3dData.action.includes('SHORT')?'#ffd700':'#ff3366';
+    ctx.save();ctx.lineWidth=1;
+    src.forEach((p,i)=>{ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.bezierCurveTo(p.x+55,p.y,(cx-80),cy+(i-2.5)*16,cx,cy);ctx.strokeStyle='rgba(0,240,255,.22)';ctx.stroke();});
+    outs.forEach((p,i)=>{ctx.beginPath();ctx.moveTo(cx,cy);ctx.bezierCurveTo(cx+65,cy,(p.x-70),p.y,p.x,p.y);const v=[latest.outcomes?.plus1Scan?.directedReactionPct,latest.outcomes?.plus3Scan?.directedReactionPct,latest.outcomes?.plus5Scan?.directedReactionPct,latest.outcomes?.plus10Scan?.directedReactionPct][i];ctx.strokeStyle=v==null?'rgba(255,215,0,.25)':Number(v)>=0?'rgba(0,255,136,.6)':'rgba(255,51,102,.65)';ctx.setLineDash([4,5]);ctx.stroke();ctx.setLineDash([]);});
+    // decision core
+    ctx.beginPath();ctx.arc(cx,cy,34,0,Math.PI*2);ctx.fillStyle='rgba(3,31,29,.92)';ctx.fill();ctx.shadowBlur=22;ctx.shadowColor=col;ctx.strokeStyle=col;ctx.lineWidth=2;ctx.stroke();ctx.shadowBlur=0;
+    ctx.fillStyle='#d8f9ff';ctx.textAlign='center';ctx.font='700 9px Orbitron';ctx.fillText(brain3dData.action,cx,cy-3);ctx.font='700 7px JetBrains Mono';ctx.fillStyle=col;ctx.fillText(n(brain3dData.confidence,0)+'%',cx,cy+11);
+    src.forEach((p,i)=>{ctx.beginPath();ctx.arc(p.x,p.y,5+(i%2),0,Math.PI*2);ctx.fillStyle='rgba(0,240,255,.14)';ctx.fill();ctx.strokeStyle='rgba(0,240,255,.65)';ctx.stroke();});
+    outs.forEach((p,i)=>{const v=[latest.outcomes?.plus1Scan?.directedReactionPct,latest.outcomes?.plus3Scan?.directedReactionPct,latest.outcomes?.plus5Scan?.directedReactionPct,latest.outcomes?.plus10Scan?.directedReactionPct][i];ctx.beginPath();ctx.arc(p.x,p.y,7,0,Math.PI*2);ctx.fillStyle=v==null?'rgba(255,215,0,.12)':Number(v)>=0?'rgba(0,255,136,.16)':'rgba(255,51,102,.16)';ctx.fill();ctx.strokeStyle=v==null?'#ffd700':Number(v)>=0?'#00ff88':'#ff3366';ctx.shadowBlur=12;ctx.shadowColor=ctx.strokeStyle;ctx.stroke();ctx.shadowBlur=0;ctx.fillStyle='#9bb9c7';ctx.font='7px JetBrains Mono';ctx.textAlign='left';ctx.fillText(['+1','+3','+5','+10'][i],p.x+11,p.y+3);});
+    ctx.restore();
+  }
+  function frame(now){
+    ctx.clearRect(0,0,W,H);const rot=(now-t0)*0.00022;const g=ctx.createRadialGradient(W/2,H/2,10,W/2,H/2,Math.max(W,H)*.58);g.addColorStop(0,'rgba(0,240,255,.055)');g.addColorStop(1,'rgba(0,0,0,.02)');ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+    brainShape(rot);
+    const projected=brainPts.map((p,i)=>({p, q:project(p,rot),i}));
+    projected.sort((a,b)=>a.q.z-b.q.z);
+    ctx.save();
+    links.forEach(([a,b])=>{const pa=project(brainPts[a],rot),pb=project(brainPts[b],rot);ctx.beginPath();ctx.moveTo(pa.x,pa.y);ctx.lineTo(pb.x,pb.y);ctx.strokeStyle=`rgba(0,180,230,${.08+Math.max(0,pa.depth)*.12})`;ctx.lineWidth=.65;ctx.stroke();});
+    projected.forEach(o=>{const s=o.q.scale;ctx.beginPath();ctx.arc(o.q.x,o.q.y,1.2*s+o.p.seed*1.2,0,Math.PI*2);const hemi=o.p.hemi>0?'0,240,255':'111,85,255';ctx.fillStyle=`rgba(${hemi},${.35+o.q.depth*.5})`;ctx.shadowBlur=4;ctx.shadowColor=`rgba(${hemi},.65)`;ctx.fill();});ctx.restore();
+    chain();
+    requestAnimationFrame(frame);
+  }
+  window.addEventListener('resize',resize);resize();requestAnimationFrame(frame);
+}
+
 function renderForensics(){const t=state.timeline||[];const s=state.intel?.current||{};const summary=state.timelineSummary||{};$('forensicSummary').innerHTML=[['SCANS',summary.scans||t.length],['DECISIONS',summary.decisions||t.filter(x=>x.decision).length],['PASS',summary.passes||t.filter(x=>String(x.snapshot?.gateStatus||'').toUpperCase()==='PASS').length],['REJECT',summary.rejects??Math.max(0,t.length-(summary.passes||0))],['AVG REACTION',pct(summary.avgDirectedReactionPct)],['POSITIVE',summary.positiveReactionRate==null?'—':`${n(summary.positiveReactionRate,1)}%`],['MFE',t.length?pct(Math.max(...t.map(x=>Number(x.mfePct)).filter(Number.isFinite))):'—'],['MAE',t.length?pct(Math.min(...t.map(x=>Number(x.maePct)).filter(Number.isFinite))):'—']].map(x=>`<div class="fstat"><span>${x[0]}</span><b class="${String(x[1]).startsWith('-')?'bad':String(x[1]).includes('+')?'good':''}">${esc(x[1])}</b></div>`).join('');$('timeline').innerHTML=t.slice(-80).reverse().map(x=>{const q=x.outcomeQuality||'PENDING';const a=x.action||'REJECT';const r=x.outcomes?.plus10Scan?.directedReactionPct;return `<div class="event ${q==='POSITIVE'?'good':q==='NEGATIVE'?'bad':''}"><i class="rail"></i><span class="time">${new Date(x.scanTs).toLocaleTimeString()}</span><div><div class="etype">${esc(a)} · ${n(x.confidence,0)}%</div><div class="desc">SCAN · ${formatPrice(x.snapshot?.price)} · RSI ${n(x.snapshot?.rsi,1)} · OI ${n(x.snapshot?.openInterest,0)} · outcome +10 ${r==null?'PENDING':pct(r)} · MFE ${pct(x.mfePct)} · MAE ${pct(x.maePct)}</div></div></div>`}).join('')||'<div style="color:var(--muted);font-size:8px">NO HISTORICAL SCAN SNAPSHOTS YET</div>';}
 function renderRouter(){const r=state.router||{};const weights=r.weights||r.recommendedWeights||{};const entries=Object.entries(weights).slice(0,8);$('router').innerHTML=(entries.length?entries:[['TREND',84],['MEAN REVERSION',62],['LIQUIDITY',38],['BREAKOUT',79]]).map(([k,v])=>`<div class="route"><span>${esc(k)}</span><b>${n(typeof v==='object'?v.weight:v,0)}%</b></div>`).join('');}
 function renderOutcomeChart(){const t=state.timeline||[];const last=t.at(-1);if(!last)return;const labels=['DECISION','+1 SCAN','+3 SCAN','+5 SCAN','+10 SCAN'];const vals=[0,last.outcomes?.plus1Scan?.directedReactionPct,last.outcomes?.plus3Scan?.directedReactionPct,last.outcomes?.plus5Scan?.directedReactionPct,last.outcomes?.plus10Scan?.directedReactionPct].map(v=>v==null?null:Number(v));if(!window.Chart)return;const ctx=$('outcomeChart');if(outcomeChart)outcomeChart.destroy();outcomeChart=new Chart(ctx,{type:'line',data:{labels,datasets:[{data:vals,borderColor:'#00ff88',backgroundColor:'#00ff8820',fill:true,tension:.35,pointRadius:4,pointBackgroundColor:'#d8f9ff',pointBorderColor:'#00ff88'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#123040'},ticks:{color:'#6f91a4',font:{size:8}}},y:{grid:{color:'#123040'},ticks:{color:'#6f91a4',font:{size:8},callback:v=>v+'%'}}}}});$('outcomeStats').innerHTML=[['MAX ADVERSE',pct(last.maePct)],['MAX FAVORABLE',pct(last.mfePct)],['FINAL OUTCOME',pct(last.outcomes?.plus10Scan?.directedReactionPct)],['QUALITY',last.outcomeQuality||'PENDING'],['CONFIDENCE',n(last.confidence,1)+'%'],['EVENTS',last.eventCount||0]].map(x=>`<div class="obox"><span>${x[0]}</span><b class="${String(x[1]).startsWith('-')?'bad':String(x[1]).startsWith('+')?'good':''}">${esc(x[1])}</b></div>`).join('');}
-async function load(){try{const [scan,market]=await Promise.all([api('/api/dashboard/scan'),api('/api/dashboard/market-overview')]);state.scan=scan.scan;state.market=market.rows||[];renderMarket();renderHeat();const syms=state.market.map(r=>r.symbol).filter(Boolean);const sel=$('coinSelect');const current=state.symbol;sel.innerHTML=syms.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');if(syms.includes(current))sel.value=current;else if(syms[0]){state.symbol=syms[0];sel.value=syms[0]}
+async function load(){try{const [scan,market]=await Promise.all([api('/api/dashboard/scan'),api('/api/dashboard/live-scanner')]);state.scan=scan.scan;state.market=market.rows||[];state.liveSource=market.source;renderMarket();renderHeat();const syms=state.market.map(r=>r.symbol).filter(Boolean);const sel=$('coinSelect');const current=state.symbol;sel.innerHTML=syms.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');if(syms.includes(current))sel.value=current;else if(syms[0]){state.symbol=syms[0];sel.value=syms[0]}
 const [intel,agents,portfolio,regime,router,timeline]=await Promise.allSettled([api(`/api/dashboard/intelligence?symbol=${encodeURIComponent(state.symbol)}`),api(`/api/dashboard/agents?symbol=${encodeURIComponent(state.symbol)}`),api('/api/dashboard/portfolio-learning'),api('/api/dashboard/regime-intelligence'),api(`/api/dashboard/adaptive-router?symbol=${encodeURIComponent(state.symbol)}`),api(`/api/dashboard/coin-timeline?symbol=${encodeURIComponent(state.symbol)}&limit=160`)]);
 state.intel=intel.status==='fulfilled'?intel.value:null;state.agents=agents.status==='fulfilled'?agents.value:null;state.portfolio=portfolio.status==='fulfilled'?portfolio.value:null;state.regime=regime.status==='fulfilled'?regime.value:null;state.router=router.status==='fulfilled'?router.value:null;if(timeline.status==='fulfilled'){state.timeline=timeline.value.timeline||[];state.timelineSummary=timeline.value.summary||{}}
-$('heroSymbol').textContent=state.symbol;$('chartSymbol').textContent=state.symbol;$('regime').textContent=state.regime?.currentRegime||state.regime?.phase||state.intel?.regime?.phase||state.intel?.current?.marketPhase||'—';$('regimeLarge').textContent=$('regime').textContent;$('regimeDesc').textContent=state.regime?.description||state.intel?.regime?.description||'Adaptive regime intelligence';$('riskHead').textContent=state.portfolio?.portfolio?.risk?.level||state.intel?.current?.risk?.level||'—';$('riskHead').className=(String($('riskHead').textContent).includes('HIGH')?'bad':String($('riskHead').textContent).includes('LOW')?'good':'warn');const pnl=state.portfolio?.portfolio?.dailyPnL; $('pnlHead').textContent=pnl==null?'—':pct(pnl);$('pnlHead').className=colorClass(pnl);renderAgents();renderBrain();renderForensics();renderOutcomeChart();renderRouter();$('lastUpdate').textContent=new Date().toLocaleTimeString();}catch(e){$('footerStatus').textContent='JARVIS // DATA LINK DEGRADED · '+e.message}}
+$('heroSymbol').textContent=state.symbol;$('chartSymbol').textContent=state.symbol;$('regime').textContent=state.regime?.currentRegime||state.regime?.phase||state.intel?.regime?.phase||state.intel?.current?.marketPhase||'—';$('regimeLarge').textContent=$('regime').textContent;$('regimeDesc').textContent=state.regime?.description||state.intel?.regime?.description||'Adaptive regime intelligence';$('riskHead').textContent=state.portfolio?.portfolio?.risk?.level||state.intel?.current?.risk?.level||'—';$('riskHead').className=(String($('riskHead').textContent).includes('HIGH')?'bad':String($('riskHead').textContent).includes('LOW')?'good':'warn');const pnl=state.portfolio?.portfolio?.dailyPnL; $('pnlHead').textContent=pnl==null?'—':pct(pnl);$('pnlHead').className=colorClass(pnl);renderAgents();renderBrain();renderForensics();renderOutcomeChart();renderRouter();$('lastUpdate').textContent=new Date().toLocaleTimeString();$('footerStatus').textContent=state.liveSource==='PRODUCTION_SCANNER'?'JARVIS 6.11 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.11 // WAITING FOR PRODUCTION SCANNER';}catch(e){$('footerStatus').textContent='JARVIS // DATA LINK DEGRADED · '+e.message}}
 $('coinSelect').addEventListener('change',e=>{state.symbol=e.target.value;load()});setInterval(()=>{$('clock').textContent=new Date().toLocaleTimeString('de-DE');},1000);$('clock').textContent=new Date().toLocaleTimeString('de-DE');
-load();setInterval(load,4000);
-try{const es=new EventSource('/api/dashboard/events/stream');es.onmessage=()=>{$('eventCount').textContent='LIVE';load();};es.onerror=()=>{$('eventCount').textContent='RECONNECT';};}catch(_){$('eventCount').textContent='POLLING'}
+
+// ---------------------------------------------------------------------------
+// PRODUCTION SCANNER LINK 6.12
+// The server emits named SSE events (event: jarvis). `onmessage` only receives
+// unnamed SSE messages, so the previous dashboard never reacted to the real
+// scanner event stream. Subscribe explicitly to the named event and merge the
+// SAME production SCAN:COIN payload into the UI. No synthetic market feed.
+// ---------------------------------------------------------------------------
+let liveEventSource=null;
+let liveReloadTimer=null;
+function scheduleLiveRefresh(){
+  clearTimeout(liveReloadTimer);
+  liveReloadTimer=setTimeout(()=>load().catch(()=>{}),120);
+}
+function applyProductionEvent(evt){
+  if(!evt||!evt.type) return;
+  if(evt.type==='SCAN:COIN' && evt.symbol){
+    const row={...(evt.payload||{}),symbol:String(evt.symbol).toUpperCase(),eventTs:Number(evt.ts||Date.now()),live:true,source:'PRODUCTION_SCANNER'};
+    const idx=state.market.findIndex(x=>String(x.symbol).toUpperCase()===row.symbol);
+    if(idx>=0) state.market[idx]=row; else state.market.push(row);
+    state.market.sort((a,b)=>String(a.symbol).localeCompare(String(b.symbol)));
+    state.liveSource='PRODUCTION_SCANNER';
+    $('footerStatus').textContent='JARVIS 6.12 // LIVE DATA LINK · PRODUCTION SCANNER';
+    $('eventCount').textContent='LIVE';
+    renderMarket();renderHeat();
+    if(!state.symbol && row.symbol){state.symbol=row.symbol;}
+    if(String(row.symbol).toUpperCase()===String(state.symbol).toUpperCase()){
+      $('heroSymbol').textContent=row.symbol;$('chartSymbol').textContent=row.symbol;
+      brain3dData.action=String(row.gateDirection||'SCANNING').toUpperCase();
+    }
+    scheduleLiveRefresh();
+    return;
+  }
+  if(['AGENTS:EVALUATED','RISK:EVALUATED','SUPERVISOR:EVALUATED','DECISION:REPLAY','EXECUTION:STATE','COUNTERFACTUAL:EVALUATED','ROUTER:EVALUATED'].includes(evt.type)){
+    $('eventCount').textContent='LIVE';
+    scheduleLiveRefresh();
+  }
+}
+function connectProductionStream(){
+  if(liveEventSource) liveEventSource.close();
+  try{
+    liveEventSource=new EventSource('/api/dashboard/events/stream');
+    liveEventSource.addEventListener('ready',()=>{
+      $('eventCount').textContent='CONNECTED';
+      $('footerStatus').textContent='JARVIS 6.12 // CONNECTED · PRODUCTION EVENT BUS';
+    });
+    liveEventSource.addEventListener('jarvis',ev=>{
+      try{applyProductionEvent(JSON.parse(ev.data));}catch(_){$('eventCount').textContent='BAD EVENT';}
+    });
+    liveEventSource.onerror=()=>{
+      $('eventCount').textContent='RECONNECT';
+      $('footerStatus').textContent='JARVIS 6.12 // RECONNECTING · PRODUCTION EVENT BUS';
+    };
+  }catch(_){$('eventCount').textContent='POLLING';}
+}
+load();setInterval(load,5000);
+connectProductionStream();
 </script>
 </body>
 </html>
