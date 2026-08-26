@@ -2,6 +2,8 @@
 
 const { EventEmitter } = require('node:events');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 
 /**
  * JARVIS Event Bus
@@ -10,12 +12,14 @@ const crypto = require('node:crypto');
  * The bus never submits orders and never changes trading state.
  */
 class JarvisEventBus extends EventEmitter {
-  constructor({ maxEvents = 1000, auditTrail = null, logger = null } = {}) {
+  constructor({ maxEvents = 1000, auditTrail = null, logger = null, replayDir = null } = {}) {
     super();
     this.maxEvents = Math.max(100, Number(maxEvents) || 1000);
     this.events = [];
     this.auditTrail = auditTrail;
     this.logger = logger;
+    this.replayDir = replayDir ? path.resolve(replayDir) : null;
+    if (this.replayDir) fs.mkdirSync(this.replayDir, { recursive: true });
     this.lastPersisted = new Map();
   }
 
@@ -32,6 +36,16 @@ class JarvisEventBus extends EventEmitter {
     this.events.unshift(event);
     if (this.events.length > this.maxEvents) this.events.length = this.maxEvents;
     this.emit('event', event);
+
+    if (options.persistReplay && this.replayDir) {
+      try {
+        const day = new Date(event.ts).toISOString().slice(0, 10);
+        const file = path.join(this.replayDir, `${day}.jsonl`);
+        fs.appendFileSync(file, JSON.stringify(event) + '\n', 'utf8');
+      } catch (err) {
+        this.logger?.warn?.(`[JARVIS EventBus] replay append failed: ${err.message}`);
+      }
+    }
 
     if (options.persist && this.auditTrail?.append) {
       const key = `${event.type}:${event.symbol || ''}`;
