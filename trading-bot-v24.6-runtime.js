@@ -3409,9 +3409,10 @@ async function scanMarket() {
         // evaluation is persisted with its complete observable market state.
         // This is the canonical bridge between the live scanner and Historical
         // Intelligence: the same snapshot shown live is replayable later.
-        jarvisEventBus.emitEvent('SCAN:COIN', {
+        dashboardRecordProductionScanCoin({
           symbol,
           scanCounter: scanCounter + 1,
+          scanStatus: 'EVALUATED',
           price: Number(currentPrice || 0),
           changePct: Number(((currentPrice - (closes15m[Math.max(0, closes15m.length - 4)] || currentPrice)) / Math.max(1e-12, (closes15m[Math.max(0, closes15m.length - 4)] || currentPrice))) * 100),
           rsi: Number(rsi || 0),
@@ -3447,7 +3448,7 @@ async function scanMarket() {
           gateReason: direction ? null : (primaryFail || 'NO_DIRECTION'),
           marketPhase: currentMarketPhase,
           timestamp: Date.now()
-        }, { source: 'scanner', severity: direction ? 'INFO' : 'WARN', persist: true, persistReplay: true, persistMinIntervalMs: 0 });
+        }, direction ? 'INFO' : 'WARN');
 
         if (direction !== null) {
           if (direction === 'LONG' && orderFlowEval.pressure === 'BEARISH_DOMINANT' && orderFlowEval.score < 35) {
@@ -4854,6 +4855,47 @@ const dashboardMarketOverviewCache = { ts: 0, data: null };
 const dashboardPortfolioLearningCache = { ts: 0, data: null };
 const dashboardOiHistory = new Map();
 const dashboardDecisionReplay = [];
+
+// ---------------------------------------------------------------------------
+// LIVE SCANNER BRIDGE 6.10
+// The dashboard consumes the SAME SCAN:COIN events emitted by the production
+// scanner. No second synthetic market scanner is used for the live matrix.
+// ---------------------------------------------------------------------------
+const dashboardLiveCoinSnapshots = new Map();
+let dashboardLastLiveScanCounter = 0;
+jarvisEventBus.on('event', (event) => {
+  if (!event || event.type !== 'SCAN:COIN' || !event.symbol) return;
+  const payload = event.payload || {};
+  dashboardLiveCoinSnapshots.set(String(event.symbol).toUpperCase(), {
+    ...payload,
+    symbol: String(event.symbol).toUpperCase(),
+    eventTs: Number(event.ts || Date.now()),
+    source: 'production-scanner'
+  });
+  dashboardLastLiveScanCounter = Math.max(dashboardLastLiveScanCounter, Number(payload.scanCounter || 0));
+});
+
+function dashboardRecordProductionScanCoin(snapshot, severity = 'INFO') {
+  if (!snapshot || !snapshot.symbol) return null;
+  const event = jarvisEventBus.emitEvent('SCAN:COIN', snapshot, {
+    source: 'scanner',
+    severity,
+    persist: true,
+    persistReplay: true,
+    persistMinIntervalMs: 0
+  });
+  return event;
+}
+
+function dashboardLiveScannerRows() {
+  const symbols = dashboardScanUniverse.length
+    ? dashboardScanUniverse
+    : [...dashboardLiveCoinSnapshots.keys()];
+  return symbols.map(symbol => dashboardLiveCoinSnapshots.get(String(symbol).toUpperCase()))
+    .filter(Boolean)
+    .sort((a,b) => symbols.indexOf(a.symbol) - symbols.indexOf(b.symbol));
+}
+
 const DASHBOARD_REPLAY_MAX = 240;
 
 function pushDashboardReplay(snapshot) {
@@ -5003,54 +5045,60 @@ function dashboardFlowPressure(row, book) {
 
 async function getDashboardMarketOverview() {
   const now = Date.now();
-  if (dashboardMarketOverviewCache.data && now - dashboardMarketOverviewCache.ts < 2400) return dashboardMarketOverviewCache.data;
-  const matrix = await getDashboardScanMatrix();
-  const rows = [];
-  await asyncPool(4, matrix.rows || [], async (base) => {
-    try {
-      const [book, contract] = await Promise.all([fetchOrderBookMetrics(base.symbol), fetchFuturesData(base.symbol)]);
-      const oi = Number(contract?.openInterest || 0);
-      const prevOi = dashboardOiHistory.get(base.symbol);
-      const oiDeltaPct = prevOi > 0 ? ((oi - prevOi) / prevOi) * 100 : 0;
-      dashboardOiHistory.set(base.symbol, oi);
-      const funding = Number(contract?.fundingRate || 0);
-      const whalePressure = dashboardFlowPressure(base, book);
-      const flow = Number(book?.bidAskRatio || 1);
-      rows.push({
-        ...base,
-        fundingRate: funding,
-        openInterest: oi,
-        oiDeltaPct,
-        spreadPct: Number(book?.spreadPct || 0),
-        bidAskRatio: flow,
-        bidVolume: Number(book?.bidVolume || 0),
-        askVolume: Number(book?.askVolume || 0),
-        whalePressure,
-        // KuCoin REST adapter in this bot does not expose a liquidation tape.
-        // This is explicitly a derived pressure proxy, not a claimed liquidation feed.
-        liquidationPressure: Math.round(Math.min(100, Math.abs(Number(base.change || 0)) * 10 + Math.abs(oiDeltaPct) * 8 + whalePressure * .35)),
-        volumeIntensity: Math.round(Math.min(100, Math.abs(Number(base.change || 0)) * 12 + Math.log10(Math.max(1, Number(base.volume24h || 0))) * 5)),
-        timestamp: now
-      });
-    } catch (_) {
-      rows.push({ ...base, fundingRate: 0, openInterest: 0, oiDeltaPct: 0, spreadPct: 0, bidAskRatio: 1, bidVolume: 0, askVolume: 0, whalePressure: 0, liquidationPressure: 0, volumeIntensity: 0, timestamp: now });
-    }
-  });
-  rows.sort((a,b) => (matrix.rows || []).findIndex(x=>x.symbol===a.symbol) - (matrix.rows || []).findIndex(x=>x.symbol===b.symbol));
-  const data = { timestamp: now, scan: matrix.scan, rows, market: {
-    total: rows.length,
-    fundingAvg: rows.length ? rows.reduce((a,r)=>a+Number(r.fundingRate||0),0)/rows.length : 0,
-    oiTotal: rows.reduce((a,r)=>a+Number(r.openInterest||0),0),
-    volumeTotal: rows.reduce((a,r)=>a+Number(r.volume24h||0),0),
-    bullish: rows.filter(r=>r.trend==='BULL').length,
-    bearish: rows.filter(r=>r.trend==='BEAR').length,
-    whaleAlerts: rows.filter(r=>Number(r.whalePressure)>=65).length,
-    liquidationAlerts: rows.filter(r=>Number(r.liquidationPressure)>=65).length
-  }};
-  dashboardMarketOverviewCache.ts = now;
-  dashboardMarketOverviewCache.data = data;
-  return data;
+  const liveRows = dashboardLiveScannerRows();
+  // The live dashboard is intentionally sourced from the production scanner.
+  // If a scan has not yet produced snapshots, report WAITING instead of
+  // inventing a parallel market universe.
+  if (liveRows.length) {
+    const rows = liveRows.map(r => ({
+      ...r,
+      price: Number(r.price || 0),
+      change: Number(r.changePct || 0),
+      rsi: Number(r.rsi || 0),
+      macd: Number(r.macdHistogram || 0),
+      ma20: Number(r.ma20 || 0),
+      ma50: Number(r.ma50 || 0),
+      trend: String(r.trend1h || '').includes('BULL') ? 'BULL' : String(r.trend1h || '').includes('BEAR') ? 'BEAR' : 'FLAT',
+      tech: Number(r.rsi || 0) >= 25 && Number(r.rsi || 0) <= 75,
+      volume24h: Number(r.volume24h || 0),
+      fundingRate: Number(r.fundingRate || 0),
+      openInterest: Number(r.openInterest || 0),
+      oiDeltaPct: Number(r.oiDeltaPct || 0),
+      spreadPct: Number(r.orderBook?.spreadPct || 0),
+      bidAskRatio: Number(r.orderBook?.bidAskRatio || 1),
+      bidVolume: Number(r.orderBook?.bidVolume || 0),
+      askVolume: Number(r.orderBook?.askVolume || 0),
+      whalePressure: Number(r.whalePressure || 0),
+      liquidationPressure: Number(r.liquidationPressure || 0),
+      volumeIntensity: Number(r.volumeIntensity || 0),
+      scanCounter: Number(r.scanCounter || 0),
+      gateStatus: r.gateStatus || '—',
+      gateDirection: r.gateDirection || null,
+      gateReason: r.gateReason || null,
+      marketPhase: r.marketPhase || currentMarketPhase,
+      ageMs: Math.max(0, now - Number(r.eventTs || r.timestamp || now)),
+      live: true
+    }));
+    return {
+      timestamp: now,
+      source: 'PRODUCTION_SCANNER',
+      scan: { ...dashboardScanState, universe: dashboardScanUniverse, lastLiveScanCounter: dashboardLastLiveScanCounter },
+      rows,
+      market: {
+        total: rows.length,
+        fundingAvg: rows.length ? rows.reduce((a,r)=>a+Number(r.fundingRate||0),0)/rows.length : 0,
+        oiTotal: rows.reduce((a,r)=>a+Number(r.openInterest||0),0),
+        volumeTotal: rows.reduce((a,r)=>a+Number(r.volume24h||0),0),
+        bullish: rows.filter(r=>r.trend==='BULL').length,
+        bearish: rows.filter(r=>r.trend==='BEAR').length,
+        whaleAlerts: rows.filter(r=>Number(r.whalePressure)>=65).length,
+        liquidationAlerts: rows.filter(r=>Number(r.liquidationPressure)>=65).length
+      }
+    };
+  }
+  return { timestamp: now, source: 'PRODUCTION_SCANNER_WAITING', scan: { ...dashboardScanState, universe: dashboardScanUniverse }, rows: [], market: { total: 0, fundingAvg: 0, oiTotal: 0, volumeTotal: 0, bullish: 0, bearish: 0, whaleAlerts: 0, liquidationAlerts: 0 } };
 }
+
 
 function dashboardSma(values, period) {
   if (!values?.length) return 0;
@@ -5237,7 +5285,7 @@ app.get('/dashboard', (req, res) => {
 });
 
 app.get('/api/dashboard/build', (req, res) => {
-  res.json({ build: 'JARVIS-NEURAL-BRAIN-6.9', runtime: 'v25', dashboard: 'unified', timestamp: Date.now(), modules: ['live-market','agent-neural-layer','supervisor','execution','portfolio','rl-learning','event-bus','historical-replay','walk-forward-oos','monte-carlo','attribution','regime-intelligence','adaptive-router','counterfactual','coin-forensics-outcomes','mfe-mae-forward-horizons'] });
+  res.json({ build: 'JARVIS-NEURAL-BRAIN-6.12-PRODUCTION-LINK', runtime: 'v25', dashboard: 'unified', timestamp: Date.now(), modules: ['live-market','agent-neural-layer','supervisor','execution','portfolio','rl-learning','event-bus','historical-replay','walk-forward-oos','monte-carlo','attribution','regime-intelligence','adaptive-router','counterfactual','coin-forensics-outcomes','mfe-mae-forward-horizons','production-scanner-live-bridge','scan-history-api','3d-neural-brain','decision-to-outcome-graph'] });
 });
 
 app.get('/api/dashboard/live', async (req, res) => {
@@ -5472,6 +5520,27 @@ app.get('/api/dashboard/supervisor', async (req, res) => {
   }
 });
 
+app.get('/api/dashboard/connection', (req, res) => {
+  const rows = dashboardLiveScannerRows();
+  res.setHeader('Cache-Control','no-store');
+  res.json({
+    connected: true,
+    source: 'PRODUCTION_SCANNER_EVENT_BUS',
+    eventBus: jarvisEventBus.snapshot(),
+    scanner: { ...dashboardScanState, universe: dashboardScanUniverse, lastLiveScanCounter: dashboardLastLiveScanCounter },
+    liveCoins: rows.map(r => ({ symbol:r.symbol, eventTs:r.eventTs, ageMs:Math.max(0,Date.now()-Number(r.eventTs||Date.now())), scanStatus:r.scanStatus||'EVALUATED' }))
+  });
+});
+
+app.get('/api/dashboard/live-scanner', (req, res) => {
+  const rows = dashboardLiveScannerRows().map(r => ({
+    ...r, ageMs: Math.max(0, Date.now() - Number(r.eventTs || r.timestamp || Date.now())),
+    live: true
+  }));
+  res.setHeader('Cache-Control','no-store');
+  res.json({ timestamp: Date.now(), source: 'PRODUCTION_SCANNER', scan: { ...dashboardScanState, universe: dashboardScanUniverse, lastLiveScanCounter: dashboardLastLiveScanCounter }, rows });
+});
+
 app.get('/api/dashboard/market-overview', async (req, res) => {
   try {
     const data = await getDashboardMarketOverview();
@@ -5682,6 +5751,29 @@ app.get('/api/dashboard/coin-timeline', async (req, res) => {
   } catch (err) {
     logger.warn(`[Dashboard Coin Timeline] ${err.message}`);
     res.status(500).json({ error: 'COIN_TIMELINE_FAILED', message: err.message });
+  }
+});
+
+app.get('/api/dashboard/scan-history', async (req, res) => {
+  try {
+    const now = Date.now();
+    const fromTs = Number.isFinite(Number(req.query.from)) ? Number(req.query.from) : now - 24 * 60 * 60 * 1000;
+    const toTs = Number.isFinite(Number(req.query.to)) ? Number(req.query.to) : now;
+    const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : null;
+    const limit = Math.min(5000, Math.max(1, Number(req.query.limit || 1000)));
+    const events = [];
+    await jarvisHistoricalReplay.run({ fromTs, toTs, onEvent: async e => {
+      if (e.type !== 'SCAN:COIN') return;
+      if (symbol && String(e.symbol || '').toUpperCase() !== symbol) return;
+      events.push(e);
+    }});
+    events.sort((a,b) => Number(a.ts||0)-Number(b.ts||0));
+    const limited = events.slice(-limit);
+    res.setHeader('Cache-Control','no-store');
+    res.json({ timestamp: now, source:'PRODUCTION_SCANNER_HISTORY', range:{from:fromTs,to:toTs}, symbol, count:limited.length, events:limited });
+  } catch (err) {
+    logger.warn(`[Dashboard Scan History] ${err.message}`);
+    res.status(500).json({ error:'SCAN_HISTORY_FAILED', message:err.message });
   }
 });
 
