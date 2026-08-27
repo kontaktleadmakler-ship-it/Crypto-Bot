@@ -1,6 +1,6 @@
 {
   "name": "crypto-bot-institutional",
-  "version": "25.0.9",
+  "version": "25.0.10",
   "private": true,
   "description": "Signal/Paper/Shadow institutional trading platform with fail-closed production gates and JARVIS live scanner dashboard bridge",
   "scripts": {
@@ -9,7 +9,7 @@
     "test:b10": "node tests/b10.test.js",
     "test:b11": "node tests/b11.test.js",
     "test:v24": "node institutional-self-test.js",
-    "start": "node trading-bot-v25.js",
+    "start": "node --check trading-bot-v24.6-runtime.js && node --check trading-bot-v25.js && node trading-bot-v25.js",
     "check": "node --check ml-engine.js && node --check ml-history-recovery.js && node --check trading-bot-v24.6-runtime.js && node --check trading-bot-v25.js && node --check rl-engine.js && node --check execution-simulator.js && node --check execution-interface.js && node --check risk-engine.js && node --check data-validator.js && node --check model-registry.js && node --check walk-forward-engine.js && node --check institutional-core/intrabar-execution.js && node --check institutional-core/live-execution-gate.js && node --check institutional-core/portfolio-ledger.js && node --check institutional-core/readiness-gate.js && node --check institutional-core/safety-controller.js",
     "test:dqn-hotfix": "node tests/dqn-hotfix-source.test.js",
     "test:institutional": "node tests/institutional-hardening.test.js",
