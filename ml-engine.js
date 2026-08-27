@@ -378,7 +378,7 @@ class TensorFlowSignalModel {
               validationData: [vx, vy],
               shuffle: false,
               verbose: 0,
-              callbacks: tf.callbacks.earlyStopping({ monitor: 'val_loss', patience: 6, restoreBestWeights: true })
+              callbacks: tf.callbacks.earlyStopping({ monitor: 'val_loss', patience: 6, restoreBestWeights: false })
             });
           } catch (fitErr) {
             lastFitError = fitErr;
