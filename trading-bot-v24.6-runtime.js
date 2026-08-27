@@ -19,7 +19,7 @@ const __dirname = path.dirname(__filename);
 
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - v25.0.9 INSTITUTIONAL EDITION
+ * TRADING SIGNAL BOT - v25.0.7 INSTITUTIONAL EDITION
  * (Mit adaptivem TensorFlow.js ML, Deep Q-Network Agent, globaler Telegram-Queue,
  *  State-Persistenz, Hurst-Exponent, Marktphasen-Logging & Dynamic Filter Control)
  * ============================================================================
@@ -1022,20 +1022,29 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
     throw new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
   }
 
+  // Market-data callers may explicitly disable retries. Retrying a timed-out
+  // public request 3x turns a 5s network problem into ~22s and starves the
+  // scanner. The scanner uses retryCount=0 and relies on the next scan cycle.
+  const effectiveRetries = Number.isInteger(options.retryCount)
+    ? Math.max(0, options.retryCount)
+    : retries;
+  const requestOptions = { ...options };
+  delete requestOptions.retryCount;
+
   await apiRateLimiter.checkLimit();
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  for (let attempt = 0; attempt <= effectiveRetries; attempt++) {
     try {
       const startTime = Date.now();
-      const response = await axios.get(url, { timeout: options.timeout || 5000, ...options });
+      const response = await axios.get(url, { timeout: requestOptions.timeout || 5000, ...requestOptions });
       apiLatencyStats.record('kucoin', Date.now() - startTime);
       kucoinErrorCount = 0;
       return response;
     } catch (error) {
-      if (error.response && error.response.status === 429 && attempt < retries) {
+      if (error.response && error.response.status === 429 && attempt < effectiveRetries) {
         await sleep(backoffMs * Math.pow(2, attempt));
         continue;
       }
-      if (attempt === retries) {
+      if (attempt === effectiveRetries) {
         kucoinErrorCount++;
         if (kucoinErrorCount >= KUCOIN_CIRCUIT_THRESHOLD) {
           kucoinCircuitOpenUntil = Date.now() + KUCOIN_CIRCUIT_COOLDOWN_MS;
@@ -2358,8 +2367,19 @@ logger.info('🧪 Phase-B Execution aktiv | PaperOnly + Idempotency + Reconcilia
 const FUTURES_GRANULARITY_MINUTES = { '1d': 1440, '4h': 240, '1h': 60, '15m': 15, '5m': 5, '1m': 1 };
 
 async function fetchKucoinKlines(symbol, timeframe = '15m', limit = 100) {
-  try { return await exchangeAdapter.getKlines(symbol, timeframe, limit); }
-  catch (e) { logger.warn(`[ExchangeAdapter] Klines ${symbol}/${timeframe}: ${e.message}`); return null; }
+  const started = Date.now();
+  try {
+    const result = await exchangeAdapter.getKlines(symbol, timeframe, limit);
+    if (!result || result.length < 20) {
+      logger.warn(`[MARKET-DATA] Klines unavailable ${symbol}/${timeframe} rows=${result?.length || 0} latencyMs=${Date.now() - started}`);
+      return null;
+    }
+    return result;
+  } catch (e) {
+    const code = e?.code || e?.response?.status || 'ERR';
+    logger.warn(`[MARKET-DATA] Klines FAILED ${symbol}/${timeframe} code=${code} latencyMs=${Date.now() - started}: ${e.message}`);
+    return null;
+  }
 }
 
 const ONE_HOUR_MS = 3600000, FOUR_HOUR_MS = 14400000;
@@ -2677,7 +2697,7 @@ async function checkRiskLevels() {
 }
 
 function formatScanStatsReport(stats) {
-  const lines = [`🔎 <b>SCAN-DIAGNOSE v25.0.9 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
+  const lines = [`🔎 <b>SCAN-DIAGNOSE v25.0.7 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
   lines.push(`Coins geprüft: ${stats.total} | Signale gesendet: ${stats.signalsSent}`);
   if (stats.avgSignalScore !== undefined) lines.push(`Ø Signal-Score: ${stats.avgSignalScore}/100`);
   lines.push(`Marktphase: ${currentMarketPhase}`);
@@ -3180,20 +3200,6 @@ async function getBitcoinTrend() {
   return calculateEMA(closes, 20) > calculateEMA(closes, 50) ? 'BULLISH' : 'BEARISH';
 }
 
-async function withScanTimeout(promise, timeoutMs, label = 'scan-task') {
-  let timer;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`SCAN_TIMEOUT:${label}:${timeoutMs}ms`)), timeoutMs);
-      })
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
 async function asyncPool(concurrency, items, iteratorFn) {
   const results = [];
   const executing = [];
@@ -3201,7 +3207,7 @@ async function asyncPool(concurrency, items, iteratorFn) {
     const p = Promise.resolve().then(() => iteratorFn(item));
     results.push(p);
     if (concurrency <= items.length) {
-      const e = p.then(() => executing.splice(executing.indexOf(e), 1), () => executing.splice(executing.indexOf(e), 1));
+      const e = p.then(() => executing.splice(executing.indexOf(e), 1));
       executing.push(e);
       if (executing.length >= concurrency) await Promise.race(executing);
     }
@@ -3316,7 +3322,8 @@ function createEmptyScanStats() {
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0
+    timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0,
+    marketDataErrors: 0, marketDataTimeouts: 0, lastProgressAt: 0
   };
 }
 
@@ -3351,7 +3358,7 @@ async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v25.1.0 (mit DQN)...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v25.1.1 (mit DQN)...`);
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
@@ -3457,21 +3464,9 @@ async function scanMarket() {
 
     let signalsSent = 0;
 
-    const scanStartedAt = Date.now();
-    const scanSymbolTimeoutMs = Math.max(5000, Number(process.env.SCAN_SYMBOL_TIMEOUT_MS || 20000));
-    const scanProgressEvery = Math.max(10, Number(process.env.SCAN_PROGRESS_EVERY || 25));
-    let lastScanProgressLog = 0;
-
-    await asyncPool(Math.max(1, Number(config.SCAN_CONCURRENCY || 5)), dynamicWatchlist, async (symbol) => {
+    await asyncPool(config.SCAN_CONCURRENCY, dynamicWatchlist, async (symbol) => {
       scanStats.total++;
       dashboardScanState.checked = scanStats.total;
-
-      if (scanStats.total === 1 || scanStats.total - lastScanProgressLog >= scanProgressEvery) {
-        lastScanProgressLog = scanStats.total;
-        logger.info(`[SCAN-PROGRESS] ${scanStats.total}/${dynamicWatchlist.length} started | evaluated=${scanStats.marketDataEvaluated} signals=${scanStats.signalsSent} elapsedMs=${Date.now() - scanStartedAt}`);
-      }
-
-      const scanTask = async () => {
 
       if (activeTrades.has(symbol)) { 
         scanStats.skippedActiveTrade++; 
@@ -3542,8 +3537,12 @@ async function scanMarket() {
           if (raw4h) raw4h = raw4h.filter(c => c.time + FOUR_HOUR_MS <= Date.now());
         }
 
-        const futuresData = await fetchFuturesData(symbol).catch(() => null);
-        const orderBookMetrics = await fetchOrderBookMetrics(symbol).catch(() => null);
+        // These two public requests are independent; do them in parallel so
+        // one symbol cannot spend two sequential network round-trips here.
+        const [futuresData, orderBookMetrics] = await Promise.all([
+          fetchFuturesData(symbol).catch(() => null),
+          fetchOrderBookMetrics(symbol).catch(() => null)
+        ]);
         if (!orderBookMetrics?.valid) {
           scanStats.orderBookBlocked = (scanStats.orderBookBlocked || 0) + 1;
           return;
@@ -4014,19 +4013,9 @@ async function scanMarket() {
             await sendTelegramAlert(signalText);
           }
         }
-        } catch (e) {
-          scanStats.runtimeErrors++;
-          if (String(e?.message || '').startsWith('SCAN_TIMEOUT:')) scanStats.scanTimeouts = (scanStats.scanTimeouts || 0) + 1;
-          logger.error(`[SCAN ERROR] ${symbol}: ${e.message}`);
-        }
-      };
-
-      try {
-        await withScanTimeout(scanTask(), scanSymbolTimeoutMs, symbol);
       } catch (e) {
         scanStats.runtimeErrors++;
-        scanStats.scanTimeouts = (scanStats.scanTimeouts || 0) + 1;
-        logger.warn(`[SCAN TIMEOUT] ${symbol} exceeded ${scanSymbolTimeoutMs}ms`);
+        logger.error(`[SCAN ERROR] ${symbol}: ${e.message}`);
       }
     });
 
@@ -4039,7 +4028,7 @@ async function scanMarket() {
     }
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
-    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} scanTimeouts=${scanStats.scanTimeouts || 0} durationMs=${Date.now() - scanStartedAt}`);
+    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors}`);
 
     if (marketPhaseLogsCollection && isDbConnected) {
       await marketPhaseLogsCollection.insertOne({
@@ -4103,7 +4092,7 @@ async function handleTelegramCommand(chatId, text) {
   const args = parts.slice(1);
 
   // ==========================================
-  // 🤖 AI / AGENT CONTROL CENTER (v25.0.9)
+  // 🤖 AI / AGENT CONTROL CENTER (v25.0.7)
   // Advisory controls only: hard RiskEngine/Paper safety gates remain authoritative.
   // ==========================================
   const agentAlias = (name) => {
@@ -4121,7 +4110,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/commands' || command === '/aicommands') {
     await sendTelegramReply(chatId,
-      `<b>🤖 AI CONTROL CENTER v25.0.9</b>\n━━━━━━━━━━━━━━━━━━\n` +
+      `<b>🤖 AI CONTROL CENTER v25.0.7</b>\n━━━━━━━━━━━━━━━━━━\n` +
       `<b>Agents</b>\n/agents /agents_status /agent &lt;name&gt;\n/agent_on &lt;name&gt; /agent_off &lt;name&gt;\n/agents_on /agents_off /agent_weights\n` +
       `<b>LLM</b>\n/llm /llm_status /llm_on /llm_off /llm_test\n` +
       `<b>Analyse</b>\n/signals /top_signals /anomalies /regime /signal &lt;symbol&gt;\n/explain &lt;symbol&gt; /confluence &lt;symbol&gt; /risk\n` +
@@ -4258,7 +4247,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
-      `<b>🤖 TRADING BOT v25.0.9 - INSTITUTIONAL PAPER/SHADOW</b>\n` +
+      `<b>🤖 TRADING BOT v25.0.7 - INSTITUTIONAL PAPER/SHADOW</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
       `<b>⚙️ DYNAMISCHE FILTER-STEUERUNG:</b>\n` +
       `/filters - Zeigt alle Indikator-Status & Werte an\n` +
@@ -4773,7 +4762,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/retrain') {
     await sendTelegramReply(chatId, '🧠 <i>Starte manuelles KI-Training (TensorFlow.js & DQN Agent)...</i>');
-    const res = await runMLTrainingSafely(true, 'telegram');
+    const res = await trainSignalMLModel(true);
     const dqnStats = dqnAgent.getStats();
     if (res.trained) {
       await sendTelegramReply(chatId, `🟢 <b>KI & DQN Training erfolgreich!</b>\nSamples: ${res.samples} | DQN Epsilon: ${dqnStats.epsilon}`);
@@ -4885,7 +4874,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v25.0.9 INSTITUTIONAL EDITION</b>`);
+    lines.push(`🤖 <b>BOT STATUS v25.0.7 INSTITUTIONAL EDITION</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
@@ -5059,7 +5048,7 @@ app.use((req, res, next) => {
 });
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v25.0.9 Institutional Edition | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v25.0.7 Institutional Edition | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 
@@ -6440,26 +6429,6 @@ cronJobs.push(cron.schedule('59 23 * * *', async () => {
 }, { timezone: 'UTC' }));
 
 let lastMLTrainingAttemptAt = 0;
-let mlTrainingInProgress = false;
-
-async function runMLTrainingSafely(force = false, source = 'unknown') {
-  if (mlTrainingInProgress) {
-    logger.info(`🧠 [TensorFlow.js ML] Training übersprungen: bereits aktiv source=${source}`);
-    return { trained: false, skipped: true, reason: 'training-in-progress' };
-  }
-  // Never let scheduled ML work contend with the market scanner.
-  if (isScanning) {
-    logger.info(`🧠 [TensorFlow.js ML] Training verschoben: Scan aktiv source=${source}`);
-    return { trained: false, skipped: true, reason: 'scan-in-progress' };
-  }
-  mlTrainingInProgress = true;
-  try {
-    return await trainSignalMLModel(force);
-  } finally {
-    mlTrainingInProgress = false;
-  }
-}
-
 cronJobs.push(cron.schedule('0 * * * *', async () => {
   try {
     const intervalMs = Math.max(1, Number(config.ML_RETRAIN_HOURS || 6)) * 60 * 60 * 1000;
@@ -6468,14 +6437,10 @@ cronJobs.push(cron.schedule('0 * * * *', async () => {
     // versuchen. Das verhindert, dass ein temporärer DB-/Datenzustand das Lernen
     // für bis zu 6 Stunden blockiert.
     if (!isModelTrained || due) {
-      if (isScanning) {
-        logger.info('🧠 [TensorFlow.js ML] Geplantes Training verschoben: Scanner hat Priorität.');
-        return;
-      }
       lastMLTrainingAttemptAt = Date.now();
       await loadFuturesContractSpecs();
-      const result = await runMLTrainingSafely(!isModelTrained, 'cron');
-      if (!result.trained && !result.skipped) logger.warn(`🧠 [TensorFlow.js ML] Kein neues Modell: ${result.reason}`);
+      const result = await trainSignalMLModel(!isModelTrained);
+      if (!result.trained) logger.warn(`🧠 [TensorFlow.js ML] Kein neues Modell: ${result.reason}`);
     }
   } catch (e) {
     logger.error(`[ML CRON ERROR] ${e.message}\n${e.stack}`);
@@ -6658,12 +6623,12 @@ process.on('unhandledRejection', async (reason) => {
 // 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v25.0.9 Institutional Edition (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
+  logger.info('🚀 Starte Trading Bot v25.0.7 Institutional Edition (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
   await loadSignalMLModel();
-  if (!isModelTrained) await runMLTrainingSafely(true, 'startup');
+  if (!isModelTrained) await trainSignalMLModel(true);
   await registerTelegramCommands();
   pollTelegramUpdates();
 

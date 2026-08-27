@@ -50,6 +50,8 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     this.getFuturesSymbol = getFuturesSymbol;
     this.parseFloatSafe = parseFloatSafe;
     this.config = config || {};
+    this.marketDataTimeoutMs = Number(this.config.KUCOIN_MARKET_DATA_TIMEOUT_MS || 7000);
+    this.marketDataRetries = Number.isInteger(Number(this.config.KUCOIN_MARKET_DATA_RETRIES)) ? Number(this.config.KUCOIN_MARKET_DATA_RETRIES) : 0;
     this.granularityMinutes = { '1d': 1440, '4h': 240, '1h': 60, '15m': 15, '5m': 5, '1m': 1 };
   }
 
@@ -67,7 +69,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
   async healthCheck() {
     const started = Date.now();
     const url = 'https://api-futures.kucoin.com/api/v1/contracts/active';
-    const res = await this.futuresRequest(url, { timeout: 5000 });
+    const res = await this.futuresRequest(url, { timeout: this.marketDataTimeoutMs, retryCount: this.marketDataRetries });
     if (res?.data?.code !== '200000' || !Array.isArray(res.data.data)) {
       throw new Error('KuCoin Futures health check returned invalid response');
     }
@@ -84,7 +86,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     const from = now - (limit + 10) * timeframeMs;
     const to = now;
     const url = `https://api-futures.kucoin.com/api/v1/kline/query?symbol=${futuresSymbol}&granularity=${granularity}&from=${from}&to=${to}`;
-    const res = await this.futuresRequest(url, { timeout: 5000 });
+    const res = await this.futuresRequest(url, { timeout: this.marketDataTimeoutMs, retryCount: this.marketDataRetries });
     if (res?.data?.code !== '200000' || !Array.isArray(res.data.data)) return null;
 
     const context = `${futuresSymbol}/${timeframe}`;
@@ -108,7 +110,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     const futuresSymbol = this.getFuturesSymbol(symbol);
     if (!futuresSymbol) return null;
     const url = `https://api-futures.kucoin.com/api/v1/ticker?symbol=${futuresSymbol}`;
-    const res = await this.futuresRequest(url, { timeout: 4000 });
+    const res = await this.futuresRequest(url, { timeout: Math.min(this.marketDataTimeoutMs, 4000), retryCount: this.marketDataRetries });
     if (res?.data?.code === '200000' && res.data.data?.price != null) {
       return this.parseFloatSafe(res.data.data.price, 'tickerPrice', futuresSymbol);
     }
@@ -119,7 +121,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     const futuresSymbol = this.getFuturesSymbol(symbol);
     if (!futuresSymbol) return null;
     const url = `https://api-futures.kucoin.com/api/v1/mark-price/${futuresSymbol}/current`;
-    const res = await this.futuresRequest(url, { timeout: 4000 });
+    const res = await this.futuresRequest(url, { timeout: Math.min(this.marketDataTimeoutMs, 4000), retryCount: this.marketDataRetries });
     if (res?.data?.code === '200000' && res.data.data?.value != null) {
       return this.parseFloatSafe(res.data.data.value, 'markPrice', futuresSymbol);
     }
@@ -130,7 +132,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     const futuresSymbol = this.getFuturesSymbol(symbol);
     if (!futuresSymbol) return null;
     const url = `https://api-futures.kucoin.com/api/v1/contracts/${futuresSymbol}`;
-    const res = await this.futuresRequest(url, { timeout: 4000 });
+    const res = await this.futuresRequest(url, { timeout: Math.min(this.marketDataTimeoutMs, 4000), retryCount: this.marketDataRetries });
     if (res?.data?.code !== '200000' || !res.data.data) return null;
     const oi = this.parseFloatSafe(res.data.data.openInterestVal ?? res.data.data.openInterest, 'openInterest', symbol);
     const funding = this.parseFloatSafe(res.data.data.fundingFeeRate, 'fundingRate', symbol);
@@ -141,7 +143,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     const futuresSymbol = this.getFuturesSymbol(symbol);
     if (!futuresSymbol) return null;
     const url = `https://api-futures.kucoin.com/api/v1/level2/snapshot?symbol=${futuresSymbol}`;
-    const res = await this.futuresRequest(url, { timeout: 3000 });
+    const res = await this.futuresRequest(url, { timeout: Math.min(this.marketDataTimeoutMs, 3000), retryCount: this.marketDataRetries });
     if (res?.data?.code !== '200000' || !res.data.data) return null;
     const bids = res.data.data.bids || [];
     const asks = res.data.data.asks || [];
@@ -165,7 +167,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
 
   async getActiveContracts() {
     const url = 'https://api-futures.kucoin.com/api/v1/contracts/active';
-    const res = await this.futuresRequest(url, { timeout: 8000 });
+    const res = await this.futuresRequest(url, { timeout: Math.max(this.marketDataTimeoutMs, 8000), retryCount: this.marketDataRetries });
     if (res?.data?.code !== '200000' || !Array.isArray(res.data.data)) return [];
     return res.data.data;
   }
