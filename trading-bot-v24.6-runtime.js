@@ -3180,6 +3180,20 @@ async function getBitcoinTrend() {
   return calculateEMA(closes, 20) > calculateEMA(closes, 50) ? 'BULLISH' : 'BEARISH';
 }
 
+async function withScanTimeout(promise, timeoutMs, label = 'scan-task') {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`SCAN_TIMEOUT:${label}:${timeoutMs}ms`)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function asyncPool(concurrency, items, iteratorFn) {
   const results = [];
   const executing = [];
@@ -3187,7 +3201,7 @@ async function asyncPool(concurrency, items, iteratorFn) {
     const p = Promise.resolve().then(() => iteratorFn(item));
     results.push(p);
     if (concurrency <= items.length) {
-      const e = p.then(() => executing.splice(executing.indexOf(e), 1));
+      const e = p.then(() => executing.splice(executing.indexOf(e), 1), () => executing.splice(executing.indexOf(e), 1));
       executing.push(e);
       if (executing.length >= concurrency) await Promise.race(executing);
     }
@@ -3337,7 +3351,7 @@ async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v25.0.9 (mit DQN)...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v25.1.0 (mit DQN)...`);
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
@@ -3443,9 +3457,21 @@ async function scanMarket() {
 
     let signalsSent = 0;
 
-    await asyncPool(config.SCAN_CONCURRENCY, dynamicWatchlist, async (symbol) => {
+    const scanStartedAt = Date.now();
+    const scanSymbolTimeoutMs = Math.max(5000, Number(process.env.SCAN_SYMBOL_TIMEOUT_MS || 20000));
+    const scanProgressEvery = Math.max(10, Number(process.env.SCAN_PROGRESS_EVERY || 25));
+    let lastScanProgressLog = 0;
+
+    await asyncPool(Math.max(1, Number(config.SCAN_CONCURRENCY || 5)), dynamicWatchlist, async (symbol) => {
       scanStats.total++;
       dashboardScanState.checked = scanStats.total;
+
+      if (scanStats.total === 1 || scanStats.total - lastScanProgressLog >= scanProgressEvery) {
+        lastScanProgressLog = scanStats.total;
+        logger.info(`[SCAN-PROGRESS] ${scanStats.total}/${dynamicWatchlist.length} started | evaluated=${scanStats.marketDataEvaluated} signals=${scanStats.signalsSent} elapsedMs=${Date.now() - scanStartedAt}`);
+      }
+
+      const scanTask = async () => {
 
       if (activeTrades.has(symbol)) { 
         scanStats.skippedActiveTrade++; 
@@ -3988,9 +4014,19 @@ async function scanMarket() {
             await sendTelegramAlert(signalText);
           }
         }
+        } catch (e) {
+          scanStats.runtimeErrors++;
+          if (String(e?.message || '').startsWith('SCAN_TIMEOUT:')) scanStats.scanTimeouts = (scanStats.scanTimeouts || 0) + 1;
+          logger.error(`[SCAN ERROR] ${symbol}: ${e.message}`);
+        }
+      };
+
+      try {
+        await withScanTimeout(scanTask(), scanSymbolTimeoutMs, symbol);
       } catch (e) {
         scanStats.runtimeErrors++;
-        logger.error(`[SCAN ERROR] ${symbol}: ${e.message}`);
+        scanStats.scanTimeouts = (scanStats.scanTimeouts || 0) + 1;
+        logger.warn(`[SCAN TIMEOUT] ${symbol} exceeded ${scanSymbolTimeoutMs}ms`);
       }
     });
 
@@ -4003,7 +4039,7 @@ async function scanMarket() {
     }
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
-    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors}`);
+    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} scanTimeouts=${scanStats.scanTimeouts || 0} durationMs=${Date.now() - scanStartedAt}`);
 
     if (marketPhaseLogsCollection && isDbConnected) {
       await marketPhaseLogsCollection.insertOne({
