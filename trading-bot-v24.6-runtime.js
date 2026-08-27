@@ -592,7 +592,7 @@ const config = {
   // those cases, so staleness detection (not graceful release) is the only
   // backstop. A multi-minute default here just turns every hard-kill into
   // several minutes of avoidable downtime on every redeploy.
-  LOCK_STALE_AFTER_MS: parseInt(process.env.LOCK_STALE_AFTER_MS, 10) || 45 * 1000,
+  LOCK_STALE_AFTER_MS: parseInt(process.env.LOCK_STALE_AFTER_MS, 10) || 30 * 1000,
   LOCK_HEARTBEAT_INTERVAL_MS: parseInt(process.env.LOCK_HEARTBEAT_INTERVAL_MS, 10) || 5000,
 
   FUNDING_INTERVAL_HOURS: parseFloat(process.env.FUNDING_INTERVAL_HOURS) || 8,
@@ -1132,7 +1132,25 @@ async function recoverHistoricalMLDataOnStartup() {
       db.collection('executionEvents').find({}).sort({ createdAt: 1, sequence: 1 }).limit(Math.max(recoveryLimit * 5, 10000)).toArray()
     ]);
 
-    const paperIndex = indexPaperOrders(orders);
+    // In paper mode the adapter is the authoritative in-memory/recovered
+    // execution ledger. Render restarts can temporarily have an empty
+    // `paperOrders` collection while the adapter has already restored its
+    // 23+ fills from its durable state. Include those exact orders in ML
+    // recovery instead of treating the historical entry price as lost.
+    const adapterOrders = typeof paperExecutionAdapter?.getOrders === 'function'
+      ? paperExecutionAdapter.getOrders()
+      : [];
+    const mergedPaperOrders = [...orders];
+    const seenPaperOrderIds = new Set(mergedPaperOrders.map(o => String(o?.orderId || o?._id || '')));
+    for (const order of adapterOrders) {
+      const id = String(order?.orderId || order?._id || '');
+      if (id && !seenPaperOrderIds.has(id)) {
+        mergedPaperOrders.push(order);
+        seenPaperOrderIds.add(id);
+      }
+    }
+
+    const paperIndex = indexPaperOrders(mergedPaperOrders);
     const intentIndex = indexExecutionIntents(intents);
     const eventIndex = indexExecutionEvents(events);
 
@@ -1193,87 +1211,114 @@ async function recoverHistoricalMLDataOnStartup() {
 }
 
 let currentInstanceId = null;
+let currentLockToken = null;
+let lockHeartbeatInterval = null;
+let lockHeartbeatInFlight = false;
+let lockHeartbeatFailures = 0;
+let lockLastHeartbeatAt = 0;
 
-async function tryAcquireLockOnce(instanceId) {
+function createInstanceLockIdentity() {
+  // Never use a static Render env var as the actual lease owner. If two
+  // processes share INSTANCE_ID, the old implementation allowed both to
+  // satisfy `{ instanceId }` and therefore both to acquire the singleton.
+  // Keep the configured value as a human-readable prefix, but make every
+  // process/boot unique with pid + timestamp + UUID.
+  const prefix = String(process.env.INSTANCE_ID || 'primary').replace(/[^a-zA-Z0-9._:-]/g, '_');
+  return `${prefix}-${process.pid}-${Date.now()}-${crypto.randomUUID()}`;
+}
+
+async function tryAcquireLockOnce(instanceId, lockToken) {
   const now = new Date();
   const staleBefore = new Date(now.getTime() - config.LOCK_STALE_AFTER_MS);
 
-  // Ensure the singleton document exists, then atomically claim it only if
-  // it is already ours or the previous owner has stopped heartbeating.
-  try {
-    await lockCollection.updateOne(
-      { _id: 'instanceLock' },
-      { $setOnInsert: { instanceId: null, lastSeen: new Date(0) } },
-      { upsert: true }
-    );
-  } catch (e) {
-    throw e;
-  }
+  // Ensure the singleton document exists. The actual claim below remains a
+  // single atomic MongoDB operation, so two starters cannot both win.
+  await lockCollection.updateOne(
+    { _id: 'instanceLock' },
+    {
+      $setOnInsert: {
+        instanceId: null,
+        lockToken: null,
+        lastSeen: new Date(0),
+        acquiredAt: null,
+        heartbeatCount: 0
+      }
+    },
+    { upsert: true }
+  );
 
   const result = await lockCollection.findOneAndUpdate(
     {
       _id: 'instanceLock',
       $or: [
+        { instanceId: null },
         { instanceId },
         { lastSeen: { $lt: staleBefore } }
       ]
     },
     {
-      $set: { instanceId, lastSeen: now }
+      $set: {
+        instanceId,
+        lockToken,
+        lastSeen: now,
+        acquiredAt: now
+      },
+      $inc: { heartbeatCount: 1 }
     },
     { returnDocument: 'after' }
   );
 
   const doc = result?.value || result;
-  return doc?.instanceId === instanceId;
+  return doc?.instanceId === instanceId && doc?.lockToken === lockToken;
 }
 
 async function acquireInstanceLock() {
-  const instanceId = process.env.INSTANCE_ID || `primary-${process.pid}-${Date.now()}`;
+  const instanceId = createInstanceLockIdentity();
+  const lockToken = crypto.randomUUID();
+
   try {
-    // The retry budget must comfortably outlast LOCK_STALE_AFTER_MS: only once
-    // the previous owner's lease is provably stale can this instance take over.
-    // A fixed retry-count budget shorter than the staleness window (e.g. the
-    // historical 30 * 2000ms = 60s budget against a 300s staleness window) can
-    // never succeed after an unclean shutdown (SIGKILL/OOM/crash) of the
-    // previous owner, causing an infinite deploy crash-loop. Derive the budget
-    // from the actual staleness window plus a safety margin instead of relying
-    // on two independently-configured constants staying in sync.
-    const minWaitMs = config.LOCK_STALE_AFTER_MS + (3 * config.LOCK_ACQUIRE_RETRY_DELAY_MS);
-    const configuredWaitMs = config.LOCK_ACQUIRE_RETRIES * config.LOCK_ACQUIRE_RETRY_DELAY_MS;
+    // Always wait long enough for a genuinely dead owner's lease to expire.
+    // This prevents the old 30*2s-style retry budget from giving up before a
+    // stale lease can be reclaimed.
+    const retryDelay = Math.max(250, config.LOCK_ACQUIRE_RETRY_DELAY_MS);
+    const minWaitMs = config.LOCK_STALE_AFTER_MS + (3 * retryDelay);
+    const configuredWaitMs = config.LOCK_ACQUIRE_RETRIES * retryDelay;
     const totalWaitMs = Math.max(minWaitMs, configuredWaitMs);
-    const maxAttempts = Math.max(config.LOCK_ACQUIRE_RETRIES, Math.ceil(totalWaitMs / config.LOCK_ACQUIRE_RETRY_DELAY_MS));
+    const maxAttempts = Math.max(config.LOCK_ACQUIRE_RETRIES, Math.ceil(totalWaitMs / retryDelay));
     const deadline = Date.now() + totalWaitMs;
 
+    logger.info(`[INSTANCE-LOCK] attempting owner=${instanceId} staleAfterMs=${config.LOCK_STALE_AFTER_MS} heartbeatMs=${config.LOCK_HEARTBEAT_INTERVAL_MS}`);
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const acquired = await tryAcquireLockOnce(instanceId);
+      const acquired = await tryAcquireLockOnce(instanceId, lockToken);
       if (acquired) {
         currentInstanceId = instanceId;
-        // Start the heartbeat immediately after ownership is acquired.
-        // Startup/reconciliation can take longer than the lease window; the
-        // old implementation only started heartbeating after execution-core
-        // initialization, which could make a healthy startup look stale.
-        startLockHeartbeat(instanceId);
-        logger.info(`[INSTANCE-LOCK] acquired owner=${instanceId} attempt=${attempt}`);
+        currentLockToken = lockToken;
+        lockLastHeartbeatAt = Date.now();
+        lockHeartbeatFailures = 0;
+        startLockHeartbeat(instanceId, lockToken);
+        logger.info(`[INSTANCE-LOCK] acquired owner=${instanceId} attempt=${attempt} token=${lockToken.slice(0, 8)}`);
         return instanceId;
       }
-      if (Date.now() < deadline) {
-        let ownerInfo = '';
-        try {
-          const lockDoc = await lockCollection.findOne({ _id: 'instanceLock' });
-          if (lockDoc?.instanceId) {
-            const ageMs = lockDoc.lastSeen ? Math.max(0, Date.now() - new Date(lockDoc.lastSeen).getTime()) : null;
-            ownerInfo = ` owner=${lockDoc.instanceId} ageMs=${ageMs ?? 'unknown'} staleAfterMs=${config.LOCK_STALE_AFTER_MS}`;
-          }
-        } catch (_) {}
-        const remainingMs = Math.max(0, deadline - Date.now());
-        logger.warn(`[INSTANCE-LOCK] busy; retry ${attempt}/${maxAttempts} remainingMs=${remainingMs}${ownerInfo}`);
-        await sleep(config.LOCK_ACQUIRE_RETRY_DELAY_MS);
-      } else {
-        break;
-      }
+
+      if (Date.now() >= deadline) break;
+
+      let ownerInfo = '';
+      try {
+        const lockDoc = await lockCollection.findOne({ _id: 'instanceLock' });
+        if (lockDoc?.instanceId) {
+          const ageMs = lockDoc.lastSeen ? Math.max(0, Date.now() - new Date(lockDoc.lastSeen).getTime()) : null;
+          const remainingLeaseMs = ageMs === null ? null : Math.max(0, config.LOCK_STALE_AFTER_MS - ageMs);
+          ownerInfo = ` owner=${lockDoc.instanceId} ageMs=${ageMs ?? 'unknown'} remainingLeaseMs=${remainingLeaseMs ?? 'unknown'} staleAfterMs=${config.LOCK_STALE_AFTER_MS}`;
+        }
+      } catch (_) {}
+
+      const remainingMs = Math.max(0, deadline - Date.now());
+      logger.warn(`[INSTANCE-LOCK] busy; retry ${attempt}/${maxAttempts} remainingMs=${remainingMs}${ownerInfo}`);
+      await sleep(Math.min(retryDelay, remainingMs));
     }
-    logger.error('🔴 Konnte Instance-Lock nicht erwerben – beende Prozess.');
+
+    logger.error(`[INSTANCE-LOCK] acquisition timeout after ${totalWaitMs}ms; owner=${instanceId}`);
     await sendTelegramAlert('🚨 <b>Instance-Lock fehlgeschlagen!</b> Bot wird beendet.');
     process.exit(1);
   } catch (e) {
@@ -1284,17 +1329,79 @@ async function acquireInstanceLock() {
 }
 
 async function releaseInstanceLock() {
-  if (!lockCollection || !isDbConnected || !currentInstanceId) return;
-  try { await lockCollection.updateOne({ _id: 'instanceLock', instanceId: currentInstanceId }, { $set: { instanceId: null, lastSeen: new Date(0) } }); } catch (e) {}
+  if (!lockCollection || !isDbConnected || !currentInstanceId || !currentLockToken) return;
+  try {
+    const result = await lockCollection.updateOne(
+      { _id: 'instanceLock', instanceId: currentInstanceId, lockToken: currentLockToken },
+      {
+        $set: {
+          instanceId: null,
+          lockToken: null,
+          lastSeen: new Date(0),
+          releasedAt: new Date()
+        }
+      }
+    );
+    if (result.modifiedCount === 1) {
+      logger.info(`[INSTANCE-LOCK] released owner=${currentInstanceId}`);
+    } else {
+      logger.warn(`[INSTANCE-LOCK] release skipped: ownership already changed owner=${currentInstanceId}`);
+    }
+  } catch (e) {
+    logger.warn?.(`[INSTANCE-LOCK] release failed: ${e.message}`);
+  } finally {
+    currentInstanceId = null;
+    currentLockToken = null;
+  }
 }
 
-let lockHeartbeatInterval = null;
-function startLockHeartbeat(instanceId) {
-  if (lockHeartbeatInterval) return;
+function startLockHeartbeat(instanceId, lockToken) {
+  if (lockHeartbeatInterval) clearInterval(lockHeartbeatInterval);
+
   lockHeartbeatInterval = setInterval(async () => {
-    if (!isDbConnected || !lockCollection) return;
-    try { await lockCollection.updateOne({ _id: 'instanceLock', instanceId }, { $set: { lastSeen: new Date() } }); } catch (e) {}
+    if (lockHeartbeatInFlight || !isDbConnected || !lockCollection) return;
+    lockHeartbeatInFlight = true;
+
+    try {
+      const now = new Date();
+      const result = await lockCollection.updateOne(
+        { _id: 'instanceLock', instanceId, lockToken },
+        {
+          $set: { lastSeen: now, heartbeatAt: now },
+          $inc: { heartbeatCount: 1 }
+        }
+      );
+
+      if (result.modifiedCount !== 1) {
+        lockHeartbeatFailures++;
+        logger.error(`[INSTANCE-LOCK] OWNERSHIP LOST owner=${instanceId} token=${lockToken.slice(0, 8)} failures=${lockHeartbeatFailures}`);
+        clearInterval(lockHeartbeatInterval);
+        lockHeartbeatInterval = null;
+        executionCoreReady = false;
+        isPaused = true;
+        return;
+      }
+
+      lockHeartbeatFailures = 0;
+      lockLastHeartbeatAt = Date.now();
+    } catch (e) {
+      lockHeartbeatFailures++;
+      const heartbeatAgeMs = Date.now() - lockLastHeartbeatAt;
+      logger.warn(`[INSTANCE-LOCK] heartbeat failed ${lockHeartbeatFailures}: ${e.message} ageMs=${heartbeatAgeMs}`);
+
+      // Fail closed before the lease could become stale. The separate
+      // execution fencing lease also pauses execution if it cannot renew.
+      if (heartbeatAgeMs >= Math.max(10000, Math.floor(config.LOCK_STALE_AFTER_MS / 2))) {
+        executionCoreReady = false;
+        isPaused = true;
+        logger.error(`[INSTANCE-LOCK] heartbeat unhealthy for ${heartbeatAgeMs}ms; trading paused fail-closed`);
+      }
+    } finally {
+      lockHeartbeatInFlight = false;
+    }
   }, config.LOCK_HEARTBEAT_INTERVAL_MS);
+
+  lockHeartbeatInterval.unref?.();
 }
 
 async function loadPersistedFilterState() {

@@ -161,24 +161,46 @@ class TensorFlowSignalModel {
   }
 
   featuresFromTrade(trade) {
-    // Neue Trades verwenden den echten Signalpreis. Ältere Trades besitzen
-    // dieses Feld ggf. noch nicht; sie dürfen deshalb nicht die komplette
-    // Trainingsmenge unbrauchbar machen. Für Legacy-Daten fällt das Modell
-    // kontrolliert auf den Fill-Preis `entry` zurück. Neue Trades bleiben
-    // weiterhin leak-frei, weil signalPriceAtEntry beim Signal gespeichert wird.
-    const signalPrice = Number(trade.signalPriceAtEntry);
-    const fillPrice = Number(trade.entry);
+    // Neue Trades verwenden den echten Signalpreis. Legacy-Trades besitzen
+    // dieses Feld ggf. noch nicht. Ein Preis ist für das Feature-Set aber
+    // NICHT grundsätzlich erforderlich: wenn die bereits gespeicherten
+    // Prozentwerte vorhanden sind, können wir die Zeile leak-frei trainieren.
+    // Nur dort, wo ein Rohwert erst über den Entry-Preis normalisiert werden
+    // müsste, verlangen wir einen belastbaren Preis.
+    const signalPrice = Number(trade?.signalPriceAtEntry);
+    const fillPrice = Number(trade?.entry);
+    const legacyPrice = Number(
+      trade?.entryPrice ?? trade?.paperEntryPrice ?? trade?.executionEntryPrice ??
+      trade?.avgFillPrice ?? trade?.fillPrice
+    );
     const currentPrice = Number.isFinite(signalPrice) && signalPrice > 0
       ? signalPrice
-      : (Number.isFinite(fillPrice) && fillPrice > 0 ? fillPrice : NaN);
-    if (!Number.isFinite(currentPrice) || currentPrice <= 0) return null;
-    const atrPct = trade.atrPctAtEntry != null
-      ? finite(trade.atrPctAtEntry, 0)
-      : (currentPrice > 0 && trade.atrAtEntry ? (finite(trade.atrAtEntry) / currentPrice) * 100 : 0);
+      : (Number.isFinite(fillPrice) && fillPrice > 0
+        ? fillPrice
+        : (Number.isFinite(legacyPrice) && legacyPrice > 0 ? legacyPrice : NaN));
 
-    const macdHistogramPct = trade.macdHistogramPctAtEntry != null
+    const hasAtrPct = trade?.atrPctAtEntry != null && Number.isFinite(Number(trade.atrPctAtEntry));
+    const hasMacdPct = trade?.macdHistogramPctAtEntry != null && Number.isFinite(Number(trade.macdHistogramPctAtEntry));
+
+    // Wenn nur bereits normalisierte Entry-Features vorliegen, darf die Zeile
+    // auch ohne Entry-Preis verwendet werden. Das verhindert, dass alte,
+    // ansonsten vollständige Datensätze fälschlich komplett verworfen werden.
+    const needsPriceForDerivedFeature =
+      (!hasAtrPct && Number.isFinite(Number(trade?.atrAtEntry)) && Number(trade.atrAtEntry) !== 0) ||
+      (!hasMacdPct && Number.isFinite(Number(trade?.macdHistogramAtEntry)) && Number(trade.macdHistogramAtEntry) !== 0);
+    if (!Number.isFinite(currentPrice) && needsPriceForDerivedFeature) return null;
+
+    const atrPct = hasAtrPct
+      ? finite(trade.atrPctAtEntry, 0)
+      : (Number.isFinite(currentPrice) && currentPrice > 0 && trade?.atrAtEntry
+        ? (finite(trade.atrAtEntry) / currentPrice) * 100
+        : 0);
+
+    const macdHistogramPct = hasMacdPct
       ? finite(trade.macdHistogramPctAtEntry, 0)
-      : (currentPrice > 0 ? (finite(trade.macdHistogramAtEntry, 0) / currentPrice) * 100 : 0);
+      : (Number.isFinite(currentPrice) && currentPrice > 0
+        ? (finite(trade.macdHistogramAtEntry, 0) / currentPrice) * 100
+        : 0);
 
     const pocDistancePct = trade.pocDistancePctAtEntry != null
       ? finite(trade.pocDistancePctAtEntry, 0)
@@ -260,18 +282,37 @@ class TensorFlowSignalModel {
         return { trained: false, reason: 'not-enough-data', samples: trades.length };
       }
 
-      const dataset = trades
-        .map(trade => ({
-          trade,
-          features: this.featuresFromTrade(trade),
-          label: finite(trade.pnlUSD, 0) > 0 ? 1 : 0
-        }))
+      const mapped = trades.map(trade => ({
+        trade,
+        features: this.featuresFromTrade(trade),
+        label: finite(trade.pnlUSD, 0) > 0 ? 1 : 0
+      }));
+      const dataset = mapped
         .filter(item => Array.isArray(item.features) && item.features.length === FEATURE_NAMES.length && item.features.every(Number.isFinite));
 
       if (dataset.length < this.minSamples) {
         const invalid = trades.length - dataset.length;
-        this.logger.warn(`🧠 [TensorFlow.js] Zu wenige valide Trainingszeilen: valid=${dataset.length}/${this.minSamples}, invalid=${invalid}`);
-        return { trained: false, reason: 'not-enough-valid-data', samples: dataset.length, rawSamples: trades.length, invalidSamples: invalid, legacyEntryFallback: legacyWithoutSignalPrice };
+        const invalidReasons = {
+          missingPriceForDerivedFeatures: 0,
+          invalidFeatureVector: 0,
+          missingPnl: 0
+        };
+        for (const item of mapped) {
+          const t = item.trade || {};
+          if (!Number.isFinite(Number(t.pnlUSD))) invalidReasons.missingPnl++;
+          if (!item.features) {
+            const hasPrice = [t.signalPriceAtEntry, t.entry, t.entryPrice, t.paperEntryPrice, t.executionEntryPrice, t.avgFillPrice, t.fillPrice]
+              .some(v => Number.isFinite(Number(v)) && Number(v) > 0);
+            const hasAtrPct = t.atrPctAtEntry != null && Number.isFinite(Number(t.atrPctAtEntry));
+            const hasRawAtr = Number.isFinite(Number(t.atrAtEntry)) && Number(t.atrAtEntry) !== 0;
+            const hasMacdPct = t.macdHistogramPctAtEntry != null && Number.isFinite(Number(t.macdHistogramPctAtEntry));
+            const hasRawMacd = Number.isFinite(Number(t.macdHistogramAtEntry)) && Number(t.macdHistogramAtEntry) !== 0;
+            if (!hasPrice && ((!hasAtrPct && hasRawAtr) || (!hasMacdPct && hasRawMacd))) invalidReasons.missingPriceForDerivedFeatures++;
+            else invalidReasons.invalidFeatureVector++;
+          }
+        }
+        this.logger.warn(`🧠 [TensorFlow.js] Zu wenige valide Trainingszeilen: valid=${dataset.length}/${this.minSamples}, invalid=${invalid} reasons=${JSON.stringify(invalidReasons)}`);
+        return { trained: false, reason: 'not-enough-valid-data', samples: dataset.length, rawSamples: trades.length, invalidSamples: invalid, invalidReasons, legacyEntryFallback: legacyWithoutSignalPrice };
       }
 
       const positives = dataset.filter(x => x.label === 1).length;
