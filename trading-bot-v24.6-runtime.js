@@ -519,35 +519,103 @@ const TELEGRAM_COMMANDS_V24_6 = [
 
 async function registerTelegramCommands() {
   const token = configTelegram.botToken || config.TELEGRAM_BOT_TOKEN;
-  if (!token) return false;
-  const endpoint = `https://api.telegram.org/bot${token}/setMyCommands`;
-  try {
-    // Global command list.
-    await axios.post(endpoint, { commands: TELEGRAM_COMMANDS_V24_6 }, { timeout: 10000 });
 
-    // Telegram supports a per-chat scope. Register it for every configured
-    // authorized chat so the command menu is guaranteed to appear there.
+  if (!token) {
+    logger.warn('[TELEGRAM] Command-Menü übersprungen: TELEGRAM_BOT_TOKEN fehlt');
+    return false;
+  }
+
+  const endpoint = `https://api.telegram.org/bot${token}/setMyCommands`;
+
+  try {
+    // Globales Command-Menü
+    const globalResponse = await axios.post(
+      endpoint,
+      {
+        commands: TELEGRAM_COMMANDS_V24_6
+      },
+      {
+        timeout: 10000
+      }
+    );
+
+    if (!globalResponse.data?.ok) {
+      throw new Error(
+        `Telegram setMyCommands failed: ${JSON.stringify(globalResponse.data)}`
+      );
+    }
+
+    // Zusätzlich für konfigurierte Chats registrieren.
     const chatIds = String(configTelegram.chatId || '')
-      .split(',').map(id => id.trim()).filter(Boolean);
+      .split(',')
+      .map(id => id.trim())
+      .filter(Boolean);
+
     for (const chatId of chatIds) {
-      if (!/^-?\d+$/.test(chatId)) continue;
+      if (!/^-?\d+$/.test(chatId)) {
+        logger.warn(
+          `[TELEGRAM] Ungültige Chat-ID für Command-Menü: ${chatId}`
+        );
+        continue;
+      }
+
       try {
-        await axios.post(endpoint, {
-          commands: TELEGRAM_COMMANDS_V24_6,
-          scope: { type: 'chat', chat_id: Number(chatId) }
-        }, { timeout: 10000 });
+        const chatResponse = await axios.post(
+          endpoint,
+          {
+            commands: TELEGRAM_COMMANDS_V24_6,
+            scope: {
+              type: 'chat',
+              chat_id: Number(chatId)
+            }
+          },
+          {
+            timeout: 10000
+          }
+        );
+
+        if (!chatResponse.data?.ok) {
+          logger.warn(
+            `[TELEGRAM] setMyCommands für Chat ${chatId} abgelehnt: ` +
+            `${JSON.stringify(chatResponse.data)}`
+          );
+        }
       } catch (chatErr) {
-        logger.warn(`⚠️ Telegram Command-Menü für Chat ${chatId} konnte nicht registriert werden: ${chatErr.message}`);
+        const status = chatErr.response?.status ?? 'unknown';
+        const data = chatErr.response?.data
+          ? JSON.stringify(chatErr.response.data)
+          : 'no-response-data';
+
+        logger.warn(
+          `[TELEGRAM] Command-Menü für Chat ${chatId} fehlgeschlagen ` +
+          `(HTTP ${status}): ${chatErr.message || 'unknown error'} | ${data}`
+        );
       }
     }
-    logger.info(`🤖 Telegram AI-Agent Command-Menü registriert (${TELEGRAM_COMMANDS_V24_6.length} Commands).`);
+
+    logger.info(
+      `🤖 Telegram Command-Menü registriert ` +
+      `(${TELEGRAM_COMMANDS_V24_6.length} Commands).`
+    );
+
     return true;
+
   } catch (e) {
-    logger.error(`❌ Telegram Command-Menü Registrierung fehlgeschlagen: ${e.message}`);
+    const status = e.response?.status ?? 'unknown';
+    const data = e.response?.data
+      ? JSON.stringify(e.response.data)
+      : 'no-response-data';
+
+    logger.error(
+      `❌ Telegram Command-Menü Registrierung fehlgeschlagen ` +
+      `(HTTP ${status}): ${e.message || 'unknown error'} | ${data}`
+    );
+
+    // Telegram-API-Fehler sollen den Trading-Bot NICHT stoppen.
+    // Command-Menü ist Komfortfunktion, kein Trading-/Risk-Gate.
     return false;
   }
 }
-
 // ==========================================
 // 6. KORRELATIONS-GRUPPEN
 // ==========================================
