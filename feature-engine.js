@@ -1,6 +1,6 @@
 'use strict';
 
-const { calculateEMA } = require('./indicators-safe');
+const { calculateEMA } = require('./src/indicators');
 
 function clamp(v, min, max) { return Math.max(min, Math.min(max, Number(v) || 0)); }
 function finite(v, d = 0) { const n = Number(v); return Number.isFinite(n) ? n : d; }

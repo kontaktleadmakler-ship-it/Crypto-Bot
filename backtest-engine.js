@@ -1,6 +1,8 @@
 'use strict';
 
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 const tf = require('@tensorflow/tfjs-node');
 const { TensorFlowSignalModel, FEATURE_NAMES } = require('./ml-engine');
 
@@ -10,123 +12,40 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function finite(v, f = 0) { const n = Number(v); return Number.isFinite(n) ? n : f; }
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
-function calculateEMA(prices, period) {
-  if (!prices || prices.length < period) return 0;
-  const k = 2 / (period + 1);
-  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
-  return ema;
-}
-function calculateEMASeries(values, period) {
-  if (!values || values.length < period) return [];
-  const out = new Array(values.length).fill(null);
-  const k = 2 / (period + 1);
-  let ema = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  out[period - 1] = ema;
-  for (let i = period; i < values.length; i++) { ema = values[i] * k + ema * (1 - k); out[i] = ema; }
-  return out;
-}
-function calculateRSI(prices, period = 14) {
-  if (!prices || prices.length < period + 1) return 50;
-  let gains = 0, losses = 0;
-  for (let i = 1; i <= period; i++) { const d = prices[i] - prices[i - 1]; if (d >= 0) gains += d; else losses -= d; }
-  let avgGain = gains / period, avgLoss = losses / period;
-  for (let i = period + 1; i < prices.length; i++) { const d = prices[i] - prices[i - 1]; const g = Math.max(d, 0), l = Math.max(-d, 0); avgGain = (avgGain * (period - 1) + g) / period; avgLoss = (avgLoss * (period - 1) + l) / period; }
-  if (avgLoss === 0) return 100;
-  return 100 - 100 / (1 + avgGain / avgLoss);
-}
-function calculateATR(candles, period = 14) {
-  if (!candles || candles.length < period + 1) return 0;
-  const trs = [];
-  for (let i = 1; i < candles.length; i++) {
-    const c = candles[i], p = candles[i - 1];
-    trs.push(Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)));
-  }
-  let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < trs.length; i++) atr = (atr * (period - 1) + trs[i]) / period;
-  return atr;
-}
-function calculateADX(candles, period = 14) {
-  if (!candles || candles.length < period * 2) return 0;
-  const trs = [], plus = [], minus = [];
-  for (let i = 1; i < candles.length; i++) {
-    const c = candles[i], p = candles[i - 1];
-    trs.push(Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)));
-    const up = c.high - p.high, down = p.low - c.low;
-    plus.push(up > down && up > 0 ? up : 0);
-    minus.push(down > up && down > 0 ? down : 0);
-  }
-  let tr = trs.slice(0, period).reduce((a,b)=>a+b,0), p = plus.slice(0,period).reduce((a,b)=>a+b,0), m = minus.slice(0,period).reduce((a,b)=>a+b,0);
-  const dx = [];
-  for (let i = period; i < trs.length; i++) {
-    tr = tr - tr / period + trs[i]; p = p - p / period + plus[i]; m = m - m / period + minus[i];
-    const pdi = tr ? 100 * p / tr : 0, mdi = tr ? 100 * m / tr : 0;
-    dx.push((pdi + mdi) ? 100 * Math.abs(pdi - mdi) / (pdi + mdi) : 0);
-  }
-  if (dx.length < period) return 0;
-  let adx = dx.slice(0, period).reduce((a,b)=>a+b,0) / period;
-  for (let i = period; i < dx.length; i++) adx = (adx * (period - 1) + dx[i]) / period;
-  return adx;
-}
-function calculateHurstExponent(prices) {
-  if (!prices || prices.length < 50) return 0.5;
-  const returns = [];
-  for (let i = 1; i < prices.length; i++) returns.push(Math.log(prices[i] / prices[i - 1]));
-  const sizes = [8, 16, 32].filter(s => s < returns.length / 2);
-  if (sizes.length < 2) return 0.5;
-  const points = [];
-  for (const size of sizes) {
-    const rs = [];
-    for (let i = 0; i + size <= returns.length; i += size) {
-      const seg = returns.slice(i, i + size), mean = seg.reduce((a,b)=>a+b,0)/seg.length;
-      let cum = 0, max = -Infinity, min = Infinity, variance = 0;
-      for (const r of seg) { cum += r - mean; max = Math.max(max,cum); min=Math.min(min,cum); variance += Math.pow(r-mean,2); }
-      const sd = Math.sqrt(variance / seg.length); if (sd > 0 && max > min) rs.push((max-min)/sd);
-    }
-    if (rs.length) points.push([Math.log(size), Math.log(rs.reduce((a,b)=>a+b,0)/rs.length)]);
-  }
-  if (points.length < 2) return 0.5;
-  const mx = points.reduce((a,p)=>a+p[0],0)/points.length, my=points.reduce((a,p)=>a+p[1],0)/points.length;
-  const num=points.reduce((a,p)=>a+(p[0]-mx)*(p[1]-my),0), den=points.reduce((a,p)=>a+Math.pow(p[0]-mx,2),0);
-  return clamp(den ? num/den : 0.5, 0, 1);
-}
-function calculateMACD(closes) {
-  if (!closes || closes.length < 35) return { macd:0, signal:0, histogram:0 };
-  const e12=calculateEMASeries(closes,12), e26=calculateEMASeries(closes,26), macd=[];
-  for(let i=0;i<closes.length;i++) if(e12[i]!=null&&e26[i]!=null) macd.push(e12[i]-e26[i]);
-  if(macd.length<9) return {macd:macd.at(-1)||0,signal:0,histogram:macd.at(-1)||0};
-  const sig=calculateEMASeries(macd,9), line=macd.at(-1), signal=sig.at(-1)||0;
-  return {macd:line,signal,histogram:line-signal};
-}
+const {
+  calculateEMA, calculateEMASeries, calculateRSI, calculateATR, calculateADX,
+  calculateHurstExponent, calculateMACD, calculateVWAP, calculateVolumeProfilePOC,
+  calculateRelativeVolume, checkSwingBreakOfStructure, calculateChoppinessIndex,
+  findSwingStop, aggregate, trend
+} = require('./src/indicators');
+const { lastBarIndexAtOrBefore } = require('./backtest-time-utils');
+
+
+
+
+
+
+
+
 // Punkt 8 - VWAP-Konsistenz: Berechnung lebt jetzt ausschließlich in
 // ./vwap-calculator.js und wird von Live-Bot und Backtest-Engine gemeinsam
 // genutzt, damit beide bei identischen Eingabedaten bitgenau dasselbe Ergebnis
 // liefern.
-const { calculateVWAP } = require('./vwap-calculator');
-function calculatePOC(candles, lookback=30,binsCount=20){
-  if(!candles||candles.length<lookback)return null; const s=candles.slice(-lookback), min=Math.min(...s.map(c=>c.low)), max=Math.max(...s.map(c=>c.high));
-  const step=(max-min)/binsCount;if(!step)return min; const bins=new Array(binsCount).fill(0);
-  for(const c of s){const avg=(c.high+c.low+c.close)/3;bins[Math.min(Math.floor((avg-min)/step),binsCount-1)]+=c.volume;}
-  let bi=0,mv=0;bins.forEach((v,i)=>{if(v>mv){mv=v;bi=i;}});return min+(bi+0.5)*step;
-}
-function relativeVolume(candles,lookback=20){if(!candles||candles.length<lookback+1)return 1;const cur=candles.at(-1).volume, prev=candles.slice(-lookback-1,-1),avg=prev.reduce((a,c)=>a+c.volume,0)/prev.length;return avg?cur/avg:1;}
-function bos(candles,lookback=10){if(candles.length<lookback+2)return {bosBullish:false,bosBearish:false};const c=candles.at(-1),p=candles.slice(-lookback-2,-2);const hi=Math.max(...p.map(x=>x.close)),lo=Math.min(...p.map(x=>x.close));return {bosBullish:c.close>hi,bosBearish:c.close<lo};}
-function choppiness(candles,period=14){if(candles.length<period+1)return 0;const s=candles.slice(-period-1), trs=[];for(let i=1;i<s.length;i++)trs.push(Math.max(s[i].high-s[i].low,Math.abs(s[i].high-s[i-1].close),Math.abs(s[i].low-s[i-1].close)));const sum=trs.reduce((a,b)=>a+b,0), hi=Math.max(...s.slice(1).map(c=>c.high)),lo=Math.min(...s.slice(1).map(c=>c.low));return sum>0&&hi>lo?100*Math.log10(sum/(hi-lo))/Math.log10(period):0;}
+
+
+
+
 // NOTE: `time` is now the OPEN time of the first constituent 15m bar (matches
 // exchange candle convention), not the last bar's time. This is required so
 // callers can test "is this HTF candle fully closed yet?" via
 // `htfCandle.time + timeframeMs <= currentBar.time` (see runBacktest below).
-function aggregate(candles, periods){const out=[];for(let i=periods-1;i<candles.length;i+=periods){const s=candles.slice(i-periods+1,i+1);out.push({time:s[0].time,open:s[0].open,high:Math.max(...s.map(c=>c.high)),low:Math.min(...s.map(c=>c.low)),close:s.at(-1).close,volume:s.reduce((a,c)=>a+c.volume,0)});}return out;}
+
 
 // Finds the most recent swing high/low over `lookback` bars (excluding the
 // current bar) to use as a structure-based stop reference instead of a rigid
 // ATR multiple.
-function findSwingStop(candles, direction, lookback=10){
-  if(!candles||candles.length<lookback+1) return null;
-  const sample=candles.slice(-lookback-1,-1); // exclude current forming bar
-  return direction==='LONG' ? Math.min(...sample.map(c=>c.low)) : Math.max(...sample.map(c=>c.high));
-}
-function trend(candles, fast, slow){if(!candles||candles.length<slow)return 'NEUTRAL';return calculateEMA(candles.map(c=>c.close),fast)>calculateEMA(candles.map(c=>c.close),slow)?'BULLISH':'BEARISH';}
+
+
 function detectMarketPhase(btcTrend, btcADX, btcVolatility){if(btcADX>=25&&btcVolatility<0.03)return 'TRENDING';if(btcVolatility>=0.03)return 'VOLATILE';return btcTrend==='BULLISH'||btcTrend==='BEARISH'?'TRENDING':'RANGING';}
 function adaptiveConfig(phase, base){const m=phase==='VOLATILE'?{adx:1.15,atr:0.3,tp1:-0.1,vol:1.15}:phase==='TRENDING'?{adx:0.9,atr:0,tp1:0,vol:0.95}:{adx:1.05,atr:0.15,tp1:-0.05,vol:1.05};return {adx:base.ADX_MIN*m.adx,atr:base.ATR_STOP_MULT+m.atr,tp1:base.TP1_MULT+m.tp1,vol:base.MIN_RELATIVE_VOLUME*m.vol};}
 function signalScore(p){let s=Math.min(p.adx/50,1)*30;const opt=p.direction==='LONG'?55:45;s+=Math.max(0,1-Math.abs(p.rsi-opt)/30)*20;s+=Math.min(p.relativeVolume/2,1)*20;if(p.trend1h===(p.direction==='LONG'?'BULLISH':'BEARISH'))s+=15;if(p.trend4h===(p.direction==='LONG'?'BULLISH':'BEARISH'))s+=15;return Math.round(Math.min(s,100));}
@@ -214,7 +133,7 @@ function applySlippage(price,direction,pct,side='entry',cfg={}){const spread=Num
 function fee(notional,pct,cfg={}){const taker=Number(cfg.BACKTEST_TAKER_FEE_PERCENT ?? pct ?? 0);return Math.abs(notional)*taker/100;}
 function buildConfig(env={}){const n=(k,d)=>env[k]!==undefined?Number(env[k]):d;const b=(k,d)=>env[k]!==undefined?env[k]!=='false':d;return {CAPITAL_USD:n('CAPITAL_USD',10000),RISK_PERCENT:n('RISK_PERCENT',0.75),MAX_CONCURRENT_TRADES:n('MAX_CONCURRENT_TRADES',3),MAX_SAME_DIRECTION:n('MAX_SAME_DIRECTION',2),MAX_DAILY_LOSS_USD:n('MAX_DAILY_LOSS_USD',250),MAX_EXPOSURE_RATIO:n('MAX_EXPOSURE_RATIO',0.6),LEVERAGE:n('LEVERAGE',3),ATR_STOP_MULT:n('ATR_STOP_MULT',2.3),TP1_MULT:n('TP1_MULT',1.3),TP2_MULT:n('TP2_MULT',2.5),MAX_HOLD_HOURS:n('MAX_HOLD_HOURS',4),ABSOLUTE_MAX_HOLD_HOURS:n('ABSOLUTE_MAX_HOLD_HOURS',24),TRAILING_STOP_ENABLED:b('TRAILING_STOP_ENABLED',true),TRAILING_ATR_MULT:n('TRAILING_ATR_MULT',2.2),TP1_CLOSE_PERCENT:n('TP1_CLOSE_PERCENT',60),SLIPPAGE_PERCENT:n('SLIPPAGE_PERCENT',0.10),FEE_PERCENT:n('FEE_PERCENT',0.1),BACKTEST_SPREAD_PERCENT:n('BACKTEST_SPREAD_PERCENT',0.0),BACKTEST_TAKER_FEE_PERCENT:n('BACKTEST_TAKER_FEE_PERCENT',n('FEE_PERCENT',0.1)),BACKTEST_MAKER_FEE_PERCENT:n('BACKTEST_MAKER_FEE_PERCENT',n('FEE_PERCENT',0.1)),MAX_CHOP_INDEX:n('MAX_CHOP_INDEX',61.8),MIN_HURST_EXPONENT:n('MIN_HURST_EXPONENT',0.52),ADX_MIN:n('ADX_MIN',20),RSI_LONG_MIN:n('RSI_LONG_MIN',48),RSI_LONG_MAX:n('RSI_LONG_MAX',68),RSI_SHORT_MIN:n('RSI_SHORT_MIN',32),RSI_SHORT_MAX:n('RSI_SHORT_MAX',52),MIN_RELATIVE_VOLUME:n('MIN_RELATIVE_VOLUME',1.2),MIN_GATE_SCORE:n('MIN_GATE_SCORE',55),MIN_RRR:n('MIN_RRR',1.5),SWING_LOOKBACK:n('SWING_LOOKBACK',10),BOS_LOOKBACK:n('BOS_LOOKBACK',10),TREND_EMA_FAST_15M:n('TREND_EMA_FAST_15M',20),TREND_EMA_SLOW_15M:n('TREND_EMA_SLOW_15M',50),REQUIRE_4H_TREND:b('REQUIRE_4H_TREND',true),ALLOW_COUNTER_BTC_TREND:b('ALLOW_COUNTER_BTC_TREND',false),ENABLE_SHORT_SIGNALS:b('ENABLE_SHORT_SIGNALS',true),ML_MIN_PREDICTION_PROBABILITY:n('ML_MIN_PREDICTION_PROBABILITY',0.55),ML_ENABLED:b('ML_ENABLED',true),ML_MIN_TRAINING_SAMPLES:n('ML_MIN_TRAINING_SAMPLES',40),ML_EPOCHS:n('ML_EPOCHS',50),ML_BATCH_SIZE:n('ML_BATCH_SIZE',32),BACKTEST_STARTING_CAPITAL:n('BACKTEST_STARTING_CAPITAL',n('CAPITAL_USD',10000)),BACKTEST_MAX_TRAIN_TRADES:n('BACKTEST_MAX_TRAIN_TRADES',1000),BACKTEST_RETRAIN_EVERY_SIGNALS:n('BACKTEST_RETRAIN_EVERY_SIGNALS',25),BACKTEST_TRAIN_DAYS:n('BACKTEST_TRAIN_DAYS',30),BACKTEST_TEST_DAYS:n('BACKTEST_TEST_DAYS',7),BACKTEST_PURGE_DAYS:n('BACKTEST_PURGE_DAYS',1),BACKTEST_EMBARGO_DAYS:n('BACKTEST_EMBARGO_DAYS',1),BACKTEST_WARMUP_BARS:n('BACKTEST_WARMUP_BARS',300),BACKTEST_USE_ML:b('BACKTEST_USE_ML',true),REQUIRE_FUNDING_HISTORY:b('REQUIRE_FUNDING_HISTORY',true),HYPERPARAM_SEARCH_SAMPLES:n('HYPERPARAM_SEARCH_SAMPLES',60)};}
 
-function buildSnapshot(candles15, candles1h, candles4h, btcCandles, cfg){const closes15=candles15.map(c=>c.close),price=closes15.at(-1),t4=trend(candles4h,20,50),t1=trend(candles1h,20,50),t15=trend(candles15,cfg.TREND_EMA_FAST_15M,cfg.TREND_EMA_SLOW_15M),btc=trend(btcCandles,20,50),adx=calculateADX(candles15,14),hurst=calculateHurstExponent(closes15),rsi=calculateRSI(closes15,14),atr=calculateATR(candles15,14),poc=calculatePOC(candles15,30),vwap=calculateVWAP(candles15),macd=calculateMACD(closes15),b=bos(candles15,cfg.BOS_LOOKBACK),rv=relativeVolume(candles15,20),chop=choppiness(candles15,14),phase=detectMarketPhase(btc,calculateADX(btcCandles,14),btcCandles.at(-1)?.close?atr/candles15.at(-1).close:0),adaptive=adaptiveConfig(phase,cfg);return {price,trend4h:t4,trend1h:t1,trend15m:t15,btcTrend:btc,adx,hurst,rsi,atr,poc,vwap,macd,bosBullish:b.bosBullish,bosBearish:b.bosBearish,relativeVolume:rv,chop,marketPhase:phase,adaptive};}
+function buildSnapshot(candles15, candles1h, candles4h, btcCandles, cfg){const closes15=candles15.map(c=>c.close),price=closes15.at(-1),t4=trend(candles4h,20,50),t1=trend(candles1h,20,50),t15=trend(candles15,cfg.TREND_EMA_FAST_15M,cfg.TREND_EMA_SLOW_15M),btc=trend(btcCandles,20,50),adx=calculateADX(candles15,14),hurst=calculateHurstExponent(closes15),rsi=calculateRSI(closes15,14),atr=calculateATR(candles15,14),poc=calculateVolumeProfilePOC(candles15,30),vwap=calculateVWAP(candles15),macd=calculateMACD(closes15),b=checkSwingBreakOfStructure(candles15,cfg.BOS_LOOKBACK),rv=calculateRelativeVolume(candles15,20),chop=calculateChoppinessIndex(candles15,14),phase=detectMarketPhase(btc,calculateADX(btcCandles,14),btcCandles.at(-1)?.close?atr/candles15.at(-1).close:0),adaptive=adaptiveConfig(phase,cfg);return {price,trend4h:t4,trend1h:t1,trend15m:t15,btcTrend:btc,adx,hurst,rsi,atr,poc,vwap,macd,bosBullish:b.bosBullish,bosBearish:b.bosBearish,relativeVolume:rv,chop,marketPhase:phase,adaptive};}
 
 function candidate(snapshot,cfg){const primary=snapshot.trend1h==='BULLISH'?'LONG':'SHORT';let dir=evaluateGates(primary,snapshotForDir(snapshot,primary),cfg)?primary:null;if(!dir&&cfg.ENABLE_SHORT_SIGNALS){const other=primary==='LONG'?'SHORT':'LONG';if(evaluateGates(other,snapshotForDir(snapshot,other),cfg))dir=other;}if(!dir)return null;const p=snapshotForDir(snapshot,dir),score=signalScore(p);return {...p,direction:dir,signalScore:score};}
 function snapshotForDir(s,d){return {...s,direction:d};}
@@ -365,16 +284,27 @@ function metrics(trades,startingCapital){const pnls=trades.map(t=>t.pnlUSD),wins
 
 const ONE_HOUR_MS=3600000, FOUR_HOUR_MS=14400000;
 
-async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.env),useML=cfg.BACKTEST_USE_ML,walkForward=true,logger=console}={}){
+async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.env),useML=cfg.BACKTEST_USE_ML,walkForward=true,logger=console,dataDir=null,btcDataDir=null}={}){
   logger.log(`📥 Lade ${symbol} 15m-Daten für ${days} Tage...`);
   let bars,btc;
   try{
+    const loadLocal = (dir, sym) => {
+      if (!dir) return null;
+      const file = path.join(path.resolve(dir), sym, '15m.json');
+      if (!fs.existsSync(file)) throw new Error(`Lokaler OHLCV-Datensatz fehlt: ${file}`);
+      const payload = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const rows = Array.isArray(payload) ? payload : payload.bars;
+      if (!Array.isArray(rows)) throw new Error(`Ungültiges OHLCV-Format: ${file}`);
+      return rows.map(c=>({time:Number(c.time),open:Number(c.open),high:Number(c.high),low:Number(c.low),close:Number(c.close),volume:Number(c.volume)})).filter(c=>Object.values(c).every(Number.isFinite)).sort((a,b)=>a.time-b.time);
+    };
+    const localBars = loadLocal(dataDir, symbol);
+    const localBtc = loadLocal(btcDataDir || dataDir, 'BTC-USDT');
     [bars,btc]=await Promise.all([
-      fetchKucoinCandles(symbol,'15m',days),
-      symbol==='BTC-USDT'?Promise.resolve([]):fetchKucoinCandles('BTC-USDT','15m',days)
+      localBars || fetchKucoinCandles(symbol,'15m',days),
+      symbol==='BTC-USDT' ? Promise.resolve([]) : (localBtc || fetchKucoinCandles('BTC-USDT','15m',days))
     ]);
   }catch(e){
-    throw new Error(`KuCoin-Datenabruf fehlgeschlagen für ${symbol}: ${e.message}`);
+    throw new Error(`${dataDir ? 'Lokale/KuCoin-Daten' : 'KuCoin-Daten'} fehlgeschlagen für ${symbol}: ${e.message}`);
   }
   if(!bars||bars.length<cfg.BACKTEST_WARMUP_BARS+100)throw new Error(`Zu wenige 15m-Kerzen: ${bars?.length||0}`);
   const btcBars=btc&&btc.length?btc:bars;
@@ -404,7 +334,7 @@ async function runBacktest({symbol='BTC-USDT',days=30,cfg=buildConfig(process.en
     // sees information from HTF candles that haven't finished forming yet.
     const c1=tf1h.filter(c=>c.time+ONE_HOUR_MS<=bar.time);
     const c4=tf4h.filter(c=>c.time+FOUR_HOUR_MS<=bar.time);
-    const bc=btcBars.slice(0,Math.min(btcBars.length,Math.floor(i*btcBars.length/bars.length)+1));const snap=buildSnapshot(c15,c1,c4,bc,cfg);if(!snap.poc||!snap.vwap||!snap.atr)continue;const sig=candidate(snap,cfg);if(!sig)continue;rawCandidates++;
+    const bcEnd = lastBarIndexAtOrBefore(btcBars, bar.time); const bc = bcEnd >= 0 ? btcBars.slice(0, bcEnd + 1) : [];const snap=buildSnapshot(c15,c1,c4,bc,cfg);if(!snap.poc||!snap.vwap||!snap.atr)continue;const sig=candidate(snap,cfg);if(!sig)continue;rawCandidates++;
     const nextIndex=i+1;sig.entry=bars[nextIndex].open;signals++;
     let accepted=true,prob=.5;
     if(useML&&walkForward){

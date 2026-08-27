@@ -83,7 +83,7 @@ PAPER_FILL_RATIO=1
 ## Files
 
 Replace:
-- `trading-bot-v21.1-tfjs.js`
+- `archive/legacy-bot-versions/trading-bot-v21.1-tfjs.js`
 - `data-validator.js`
 - `rl-engine.js`
 - `exchange-adapter.js`

@@ -5,7 +5,7 @@ The repository must deploy the commit containing this package. Verify Render is 
 Expected build:
 - Node.js: >=20 <23
 - Build: `npm install`
-- Start: `node trading-bot-v22.2.1.js`
+- Start: `npm start`
 
 Expected startup log:
 `🚀 Starte Trading Bot v22.2.1 PRO ...`
