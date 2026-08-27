@@ -12,8 +12,8 @@ import { CriticalStateQueue } from './execution-core/critical-state-queue.js';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { JarvisEventBus } from './jarvis-event-bus.js';
 const require = createRequire(import.meta.url);
+const { JarvisEventBus } = require('./jarvis-event-bus.js');
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
