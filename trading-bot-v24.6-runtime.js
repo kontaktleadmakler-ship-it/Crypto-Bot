@@ -3490,6 +3490,41 @@ async function scanMarket() {
     jarvisEventBus.emitEvent('SCAN:START', { scanCounter: scanCounter + 1, universe: dashboardScanUniverse, size: dashboardScanUniverse.length }, { source: 'scanner', persist: true, persistMinIntervalMs: 500 });
     dashboardScanCache.ts = 0;
 
+    // BUGFIX (dashboard blackout, cheap version): the dashboard used to only
+    // receive data for symbols that made it through the full, expensive
+    // per-symbol pipeline (klines + futures + orderbook - up to 5 API calls
+    // each). Forcing that full pipeline to run for every candidate just to
+    // keep the dashboard populated overloaded the KuCoin API and brought
+    // back scan timeouts/hangs. Instead, seed the dashboard for the WHOLE
+    // universe here using data already returned by the single bulk
+    // allTickers call inside getTopKucoinPairs() above - zero extra API
+    // calls. Symbols that go on to pass the trading gates and reach the
+    // full pipeline still get enriched with real indicators afterwards;
+    // this seed is just the baseline so the dashboard is never empty.
+    try {
+      const bulkTickers = exchangeAdapter.getCachedTickerSnapshot ? exchangeAdapter.getCachedTickerSnapshot() : [];
+      if (bulkTickers.length > 0) {
+        const tickerMap = new Map(bulkTickers.map(t => [t.symbol, t]));
+        const nowTs = Date.now();
+        for (const symbol of dynamicWatchlist) {
+          const t = tickerMap.get(symbol);
+          if (!t) continue;
+          const existing = dashboardLiveCoinSnapshots.get(symbol);
+          // Don't clobber a fresher, fully-evaluated snapshot from the same
+          // scan cycle with the cheap baseline.
+          if (existing && existing.scanCounter === scanCounter + 1 && existing.scanStatus === 'EVALUATED') continue;
+          dashboardLiveCoinSnapshots.set(symbol, {
+            symbol, scanCounter: scanCounter + 1, scanStatus: 'LIVE_TICKER',
+            price: t.price, change: t.changePct, changePct: t.changePct,
+            volume24h: t.volume24hUSD, rsi: 0, bidAskRatio: 1, tech: null,
+            eventTs: nowTs, source: 'bulk-ticker-lightweight'
+          });
+        }
+      }
+    } catch (e) {
+      logger.warn(`[Dashboard Seed] ${e.message}`);
+    }
+
     if (dynamicWatchlist.length === 0) {
       logger.warn('⚠️ Watchlist ist leer!');
       isScanning = false;
@@ -3519,6 +3554,11 @@ async function scanMarket() {
       if (signalsSent >= config.MAX_SIGNALS_PER_SCAN) { 
         scanStats.skippedMaxSignals++; 
         return; 
+      }
+
+      if (timeFilterBlocked) {
+        scanStats.timeBlocked++;
+        return;
       }
 
       const preCheck = canOpenNewTrade(activeTrades.size, null);
@@ -3681,19 +3721,6 @@ async function scanMarket() {
           marketPhase: currentMarketPhase,
           timestamp: Date.now()
         }, direction ? 'INFO' : 'WARN');
-
-        // BUGFIX: Time-Filter throttling used to `return` before market
-        // data was ever fetched, so the JARVIS dashboard's live snapshot
-        // (fed by this same per-symbol pass, see dashboardRecordProductionScanCoin
-        // above) stayed completely empty during throttled hours/weekdays -
-        // the dashboard looked disconnected even though the bot itself was
-        // scanning normally. Market data, indicators and the dashboard
-        // snapshot are now always produced; only the final decision to
-        // actually place a signal is withheld while the time filter is active.
-        if (timeFilterBlocked) {
-          scanStats.timeBlocked++;
-          return;
-        }
 
         if (direction !== null) {
           scanStats.postGatePassed++;
