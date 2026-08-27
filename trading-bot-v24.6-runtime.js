@@ -164,26 +164,36 @@ const apiLatencyStats = {
   }
 };
 
+// BUGFIX: the previous implementation reset the whole 60s window and made
+// every caller sleep up to a full windowMs whenever the limit was hit.
+// Under concurrent load, many symbols would all discover the limit within
+// the same tick, each start a ~60s sleep at roughly the same moment, and
+// all wake up together - long past the per-item scan timeout, which made
+// otherwise-fine requests look like they had hung and get killed by the
+// asyncPool timeout instead of completing. This now uses a sliding window
+// and only waits, in short bounded increments, exactly as long as needed
+// for the oldest request to age out - so waits are proportional to actual
+// load and callers are naturally desynchronized instead of piling into one
+// shared sleep.
 const apiRateLimiter = {
-  requests: 0,
-  windowStart: Date.now(),
+  timestamps: [],
   maxRequests: 1800,
   windowMs: 60000,
-  
+
   async checkLimit() {
-    const now = Date.now();
-    if (now - this.windowStart > this.windowMs) {
-      this.requests = 0;
-      this.windowStart = now;
-    }
-    if (this.requests >= this.maxRequests) {
-      const waitMs = this.windowMs - (now - this.windowStart) + 100;
-      logger.warn(`⚠️ API Rate-Limit erreicht (${this.requests}/${this.maxRequests}), warte ${waitMs}ms`);
+    for (;;) {
+      const now = Date.now();
+      while (this.timestamps.length > 0 && now - this.timestamps[0] > this.windowMs) {
+        this.timestamps.shift();
+      }
+      if (this.timestamps.length < this.maxRequests) {
+        this.timestamps.push(now);
+        return;
+      }
+      const waitMs = Math.min(Math.max(this.windowMs - (now - this.timestamps[0]) + 25, 25), 5000);
+      logger.warn(`⚠️ API Rate-Limit erreicht (${this.timestamps.length}/${this.maxRequests}), warte ${waitMs}ms`);
       await sleep(waitMs);
-      this.requests = 0;
-      this.windowStart = Date.now();
     }
-    this.requests++;
   }
 };
 
@@ -574,7 +584,7 @@ const config = {
   ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false',
   MAX_EXPOSURE_RATIO: parseFloat(process.env.MAX_EXPOSURE_RATIO) || 0.6,
   SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 5,
-  SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 45000,
+  SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 75000,
   SCAN_WATCHDOG_MS: parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 300000,
   MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,
   LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3,
