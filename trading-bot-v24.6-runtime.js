@@ -19,7 +19,7 @@ const __dirname = path.dirname(__filename);
 
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - v25.0.5 INSTITUTIONAL EDITION
+ * TRADING SIGNAL BOT - v25.0.9 INSTITUTIONAL EDITION
  * (Mit adaptivem TensorFlow.js ML, Deep Q-Network Agent, globaler Telegram-Queue,
  *  State-Persistenz, Hurst-Exponent, Marktphasen-Logging & Dynamic Filter Control)
  * ============================================================================
@@ -2677,10 +2677,15 @@ async function checkRiskLevels() {
 }
 
 function formatScanStatsReport(stats) {
-  const lines = [`🔎 <b>SCAN-DIAGNOSE v25.0.5 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
+  const lines = [`🔎 <b>SCAN-DIAGNOSE v25.0.9 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
   lines.push(`Coins geprüft: ${stats.total} | Signale gesendet: ${stats.signalsSent}`);
   if (stats.avgSignalScore !== undefined) lines.push(`Ø Signal-Score: ${stats.avgSignalScore}/100`);
-  lines.push(`Marktphase: ${currentMarketPhase}\n`);
+  lines.push(`Marktphase: ${currentMarketPhase}`);
+  lines.push(`<b>Pipeline:</b> geladen ${stats.universeLoaded || 0} → Watchlist ${stats.watchlistReturned || 0} → tradable ${stats.tradableCandidates || 0} → Kandidaten ${stats.total || 0} → Indikatoren ${stats.marketDataEvaluated || 0} → Gate PASS ${stats.gatePassed || 0} → finale Signale ${stats.signalsSent || 0}`);
+  if (stats.filteredNonTradable || stats.runtimeErrors) {
+    lines.push(`Vorfilter: nicht handelbar ${stats.filteredNonTradable || 0} | Runtime-Fehler ${stats.runtimeErrors || 0}`);
+  }
+  lines.push('');
 
   const trendTotal = (stats.trendMismatch1h || 0) + (stats.trendMismatch4h || 0) + (stats.trendMismatch || 0);
   if (trendTotal > 0) {
@@ -2713,6 +2718,12 @@ function formatScanStatsReport(stats) {
   if (stats.spreadTooHigh) reasons.push(`Orderbuch Spread zu hoch: ${stats.spreadTooHigh}`);
   if (stats.cooldownActive) reasons.push(`Signal-Cooldown aktiv: ${stats.cooldownActive}`);
   if (stats.positionTooSmallForLot) reasons.push(`Position zu klein für Min-Lot: ${stats.positionTooSmallForLot}`);
+  if (stats.agentBlocked) reasons.push(`Agent Supervisor: ${stats.agentBlocked}`);
+  if (stats.riskGovernorBlocked) reasons.push(`Risk Governor: ${stats.riskGovernorBlocked}`);
+  if (stats.riskEngineBlocked) reasons.push(`Risk Engine: ${stats.riskEngineBlocked}`);
+  if (stats.reconciliationBlocked) reasons.push(`Reconciliation Gate: ${stats.reconciliationBlocked}`);
+  if (stats.paperExecutionRejected) reasons.push(`Paper Execution abgelehnt: ${stats.paperExecutionRejected}`);
+  if (stats.lowConfluenceScore) reasons.push(`Confluence Score unter Minimum: ${stats.lowConfluenceScore}`);
 
   if (reasons.length > 0) {
     lines.push(`<b>Ausschlussgründe:</b>`);
@@ -3280,6 +3291,9 @@ function evaluateDirectionGates(dir, p, scanStats) {
 function createEmptyScanStats() {
   return {
     total: 0, signalsSent: 0, totalSignalScore: 0, avgSignalScore: 0,
+    universeLoaded: 0, watchlistReturned: 0, tradableCandidates: 0, filteredNonTradable: 0,
+    marketDataEvaluated: 0, gatePassed: 0, gateRejected: 0, postGatePassed: 0,
+    runtimeErrors: 0, paperExecutionRejected: 0,
     skippedActiveTrade: 0, skippedMaxSignals: 0, skippedDbDisconnected: 0,
     skippedMaxConcurrentTrades: 0, skippedDailyLossLimit: 0, skippedMaxSameDirection: 0,
     skippedExposureLimit: 0, skippedMaxDrawdown: 0, missingKlines: 0,
@@ -3323,7 +3337,7 @@ async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v25.0.5 (mit DQN)...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v25.0.9 (mit DQN)...`);
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
@@ -3406,6 +3420,11 @@ async function scanMarket() {
     const dynamicWatchlist = contractSpecsCache.size > 0 
       ? spotWatchlist.filter(isFuturesContractTradable) 
       : spotWatchlist;
+
+    scanStats.universeLoaded = contractSpecsCache.size || 0;
+    scanStats.watchlistReturned = spotWatchlist.length;
+    scanStats.tradableCandidates = dynamicWatchlist.length;
+    scanStats.filteredNonTradable = Math.max(0, spotWatchlist.length - dynamicWatchlist.length);
 
     dashboardScanUniverse = [...dynamicWatchlist];
     dashboardScanState = { scanning: true, startedAt: Date.now(), finishedAt: null, counter: scanCounter + 1, checked: 0, signals: 0 };
@@ -3535,6 +3554,11 @@ async function scanMarket() {
           adaptiveADX, adaptiveVolume
         };
 
+        // Fully reached market-data/indicator stage. This is intentionally
+        // separate from `total`: total counts candidates entering the pool,
+        // while marketDataEvaluated means the symbol reached the strategy gates.
+        scanStats.marketDataEvaluated++;
+
         var direction = null;
         const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
         let primaryFail = evaluateDirectionGates(primaryDir, gateParams, scanStats);
@@ -3555,6 +3579,9 @@ async function scanMarket() {
         } else {
           scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
         }
+
+        if (direction !== null) scanStats.gatePassed++;
+        else scanStats.gateRejected++;
 
         // JARVIS LIVE SCAN SNAPSHOT: every coin that reaches validated market-data
         // evaluation is persisted with its complete observable market state.
@@ -3602,6 +3629,7 @@ async function scanMarket() {
         }, direction ? 'INFO' : 'WARN');
 
         if (direction !== null) {
+          scanStats.postGatePassed++;
           if (direction === 'LONG' && orderFlowEval.pressure === 'BEARISH_DOMINANT' && orderFlowEval.score < 35) {
             scanStats.orderFlowBlocked++;
             return;
@@ -3961,6 +3989,7 @@ async function scanMarket() {
           }
         }
       } catch (e) {
+        scanStats.runtimeErrors++;
         logger.error(`[SCAN ERROR] ${symbol}: ${e.message}`);
       }
     });
@@ -3974,7 +4003,8 @@ async function scanMarket() {
     }
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
-    
+    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors}`);
+
     if (marketPhaseLogsCollection && isDbConnected) {
       await marketPhaseLogsCollection.insertOne({
         timestamp: new Date(),
@@ -4037,7 +4067,7 @@ async function handleTelegramCommand(chatId, text) {
   const args = parts.slice(1);
 
   // ==========================================
-  // 🤖 AI / AGENT CONTROL CENTER (v25.0.5)
+  // 🤖 AI / AGENT CONTROL CENTER (v25.0.9)
   // Advisory controls only: hard RiskEngine/Paper safety gates remain authoritative.
   // ==========================================
   const agentAlias = (name) => {
@@ -4055,7 +4085,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/commands' || command === '/aicommands') {
     await sendTelegramReply(chatId,
-      `<b>🤖 AI CONTROL CENTER v25.0.5</b>\n━━━━━━━━━━━━━━━━━━\n` +
+      `<b>🤖 AI CONTROL CENTER v25.0.9</b>\n━━━━━━━━━━━━━━━━━━\n` +
       `<b>Agents</b>\n/agents /agents_status /agent &lt;name&gt;\n/agent_on &lt;name&gt; /agent_off &lt;name&gt;\n/agents_on /agents_off /agent_weights\n` +
       `<b>LLM</b>\n/llm /llm_status /llm_on /llm_off /llm_test\n` +
       `<b>Analyse</b>\n/signals /top_signals /anomalies /regime /signal &lt;symbol&gt;\n/explain &lt;symbol&gt; /confluence &lt;symbol&gt; /risk\n` +
@@ -4192,7 +4222,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
-      `<b>🤖 TRADING BOT v25.0.5 - INSTITUTIONAL PAPER/SHADOW</b>\n` +
+      `<b>🤖 TRADING BOT v25.0.9 - INSTITUTIONAL PAPER/SHADOW</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
       `<b>⚙️ DYNAMISCHE FILTER-STEUERUNG:</b>\n` +
       `/filters - Zeigt alle Indikator-Status & Werte an\n` +
@@ -4707,7 +4737,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/retrain') {
     await sendTelegramReply(chatId, '🧠 <i>Starte manuelles KI-Training (TensorFlow.js & DQN Agent)...</i>');
-    const res = await trainSignalMLModel(true);
+    const res = await runMLTrainingSafely(true, 'telegram');
     const dqnStats = dqnAgent.getStats();
     if (res.trained) {
       await sendTelegramReply(chatId, `🟢 <b>KI & DQN Training erfolgreich!</b>\nSamples: ${res.samples} | DQN Epsilon: ${dqnStats.epsilon}`);
@@ -4819,7 +4849,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v25.0.5 INSTITUTIONAL EDITION</b>`);
+    lines.push(`🤖 <b>BOT STATUS v25.0.9 INSTITUTIONAL EDITION</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
@@ -4993,7 +5023,7 @@ app.use((req, res, next) => {
 });
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v25.0.5 Institutional Edition | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v25.0.9 Institutional Edition | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 
@@ -6374,6 +6404,26 @@ cronJobs.push(cron.schedule('59 23 * * *', async () => {
 }, { timezone: 'UTC' }));
 
 let lastMLTrainingAttemptAt = 0;
+let mlTrainingInProgress = false;
+
+async function runMLTrainingSafely(force = false, source = 'unknown') {
+  if (mlTrainingInProgress) {
+    logger.info(`🧠 [TensorFlow.js ML] Training übersprungen: bereits aktiv source=${source}`);
+    return { trained: false, skipped: true, reason: 'training-in-progress' };
+  }
+  // Never let scheduled ML work contend with the market scanner.
+  if (isScanning) {
+    logger.info(`🧠 [TensorFlow.js ML] Training verschoben: Scan aktiv source=${source}`);
+    return { trained: false, skipped: true, reason: 'scan-in-progress' };
+  }
+  mlTrainingInProgress = true;
+  try {
+    return await trainSignalMLModel(force);
+  } finally {
+    mlTrainingInProgress = false;
+  }
+}
+
 cronJobs.push(cron.schedule('0 * * * *', async () => {
   try {
     const intervalMs = Math.max(1, Number(config.ML_RETRAIN_HOURS || 6)) * 60 * 60 * 1000;
@@ -6382,10 +6432,14 @@ cronJobs.push(cron.schedule('0 * * * *', async () => {
     // versuchen. Das verhindert, dass ein temporärer DB-/Datenzustand das Lernen
     // für bis zu 6 Stunden blockiert.
     if (!isModelTrained || due) {
+      if (isScanning) {
+        logger.info('🧠 [TensorFlow.js ML] Geplantes Training verschoben: Scanner hat Priorität.');
+        return;
+      }
       lastMLTrainingAttemptAt = Date.now();
       await loadFuturesContractSpecs();
-      const result = await trainSignalMLModel(!isModelTrained);
-      if (!result.trained) logger.warn(`🧠 [TensorFlow.js ML] Kein neues Modell: ${result.reason}`);
+      const result = await runMLTrainingSafely(!isModelTrained, 'cron');
+      if (!result.trained && !result.skipped) logger.warn(`🧠 [TensorFlow.js ML] Kein neues Modell: ${result.reason}`);
     }
   } catch (e) {
     logger.error(`[ML CRON ERROR] ${e.message}\n${e.stack}`);
@@ -6568,12 +6622,12 @@ process.on('unhandledRejection', async (reason) => {
 // 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v25.0.5 Institutional Edition (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
+  logger.info('🚀 Starte Trading Bot v25.0.9 Institutional Edition (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
   await loadSignalMLModel();
-  if (!isModelTrained) await trainSignalMLModel(true);
+  if (!isModelTrained) await runMLTrainingSafely(true, 'startup');
   await registerTelegramCommands();
   pollTelegramUpdates();
 
