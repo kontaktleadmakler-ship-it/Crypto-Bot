@@ -1,25 +1,18 @@
-import { EventEmitter } from 'node:events';
-import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
+'use strict';
+
+const { EventEmitter } = require('node:events');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 
 /**
  * JARVIS Event Bus
  *
- * Central, read-only observability backbone:
- * scan -> agents -> risk -> decision -> execution -> outcome -> RL feedback.
- *
- * IMPORTANT:
- * - Never submits orders.
- * - Never changes trading state.
- * - Keeps a bounded in-memory event buffer.
- * - Optional replay/audit persistence is best-effort and never breaks the
- *   trading/runtime path.
- *
- * ESM-native version for the current package.json ("type": "module").
+ * CommonJS module kept intentionally compatible with the legacy/runtime
+ * modules in this repository. It is observability-only and never places
+ * real orders.
  */
-
-export class JarvisEventBus extends EventEmitter {
+class JarvisEventBus extends EventEmitter {
   constructor({
     maxEvents = 1000,
     auditTrail = null,
@@ -65,7 +58,6 @@ export class JarvisEventBus extends EventEmitter {
     });
 
     this.events.unshift(event);
-
     if (this.events.length > this.maxEvents) {
       this.events.length = this.maxEvents;
     }
@@ -108,7 +100,6 @@ export class JarvisEventBus extends EventEmitter {
       Number(options.persistMinIntervalMs ?? 1000) || 0
     );
     const last = this.lastPersisted.get(key) || 0;
-
     if (event.ts - last < minInterval) return;
 
     try {
@@ -121,7 +112,6 @@ export class JarvisEventBus extends EventEmitter {
         symbol: event.symbol,
         payload: event.payload
       });
-
       this.lastPersisted.set(key, event.ts);
     } catch (err) {
       this.logger?.warn?.(
@@ -130,19 +120,9 @@ export class JarvisEventBus extends EventEmitter {
     }
   }
 
-  recent({
-    limit = 100,
-    since = 0,
-    symbol = null,
-    types = null
-  } = {}) {
-    const normalizedLimit = Math.min(
-      500,
-      Math.max(1, Number(limit) || 100)
-    );
-
+  recent({ limit = 100, since = 0, symbol = null, types = null } = {}) {
+    const normalizedLimit = Math.min(500, Math.max(1, Number(limit) || 100));
     const sinceTs = Number(since) || 0;
-
     const allowed =
       Array.isArray(types) && types.length
         ? new Set(types.map(String))
@@ -186,4 +166,4 @@ export class JarvisEventBus extends EventEmitter {
   }
 }
 
-export default JarvisEventBus;
+module.exports = { JarvisEventBus };
