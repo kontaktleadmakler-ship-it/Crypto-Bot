@@ -56,8 +56,9 @@ function classificationMetrics(probabilities, labels, threshold = 0.5) {
   const recall = tp + fn ? tp / (tp + fn) : 0;
   const specificity = tn + fp ? tn / (tn + fp) : 0;
   const precision = tp + fp ? tp / (tp + fp) : 0;
-  const balancedAccuracy = (recall + specificity) / 2;
-  return { tp, tn, fp, fn, precision, recall, specificity, balancedAccuracy };
+  const predictedPositive = tp + fp;
+  const predictedNegative = tn + fn;
+  return { tp, tn, fp, fn, precision, recall, specificity, balancedAccuracy, predictedPositive, predictedNegative };
 }
 
 function probabilityMetrics(probabilities, labels, bins = 10) {
@@ -120,7 +121,10 @@ class TensorFlowSignalModel {
       modelVersion: null,
       featureCount: FEATURE_NAMES.length,
       featureNames: FEATURE_NAMES,
-      bestHyperparameters: null
+      bestHyperparameters: null,
+      validationLabelCounts: { positive: 0, negative: 0 },
+      validationPredictionCounts: { positive: 0, negative: 0 },
+      validationQuality: 'UNTRAINED'
     };
   }
 
@@ -317,14 +321,19 @@ class TensorFlowSignalModel {
 
       const positives = dataset.filter(x => x.label === 1).length;
       const negatives = dataset.length - positives;
+      const positiveRate = positives / Math.max(1, dataset.length);
+      this.logger.info(`🧠 [TensorFlow.js] Dataset-Qualität: samples=${dataset.length} wins=${positives} losses=${negatives} winRate=${(positiveRate * 100).toFixed(1)}%`);
       if (positives < 5 || negatives < 5) {
         this.logger.warn(`🧠 [TensorFlow.js] Zu wenig Klassenvielfalt: wins=${positives}, losses=${negatives}`);
-        return { trained: false, reason: 'insufficient-class-balance', samples: dataset.length };
+        return { trained: false, reason: 'insufficient-class-balance', samples: dataset.length, positiveSamples: positives, negativeSamples: negatives };
       }
 
       const splitIndex = Math.max(1, Math.floor(dataset.length * 0.80));
       const trainSet = dataset.slice(0, splitIndex);
       const validationSet = dataset.slice(splitIndex);
+      const validationPositiveLabels = validationSet.filter(x => x.label === 1).length;
+      const validationNegativeLabels = validationSet.length - validationPositiveLabels;
+      this.logger.info(`🧠 [TensorFlow.js] Validation-Set: samples=${validationSet.length} wins=${validationPositiveLabels} losses=${validationNegativeLabels}`);
 
       const scaler = this.makeScaler(trainSet.map(x => x.features));
       const xTrain = this.scaleMatrix(trainSet.map(x => x.features), scaler);
@@ -439,6 +448,15 @@ class TensorFlowSignalModel {
       const validationBalancedAccuracy = finite(bestClassification?.balancedAccuracy, 0);
       const validationPrecision = finite(bestClassification?.precision, 0);
       const validationRecall = finite(bestClassification?.recall, 0);
+      const validationPredictedPositive = Number(bestClassification?.predictedPositive || 0);
+      const validationPredictedNegative = Number(bestClassification?.predictedNegative || 0);
+      const validationQuality = validationSet.length < 20
+        ? 'LOW_SAMPLE'
+        : (validationPredictedPositive === 0 || validationPrecision === 0 || validationRecall === 0
+          ? 'WEAK_POSITIVE_DETECTION'
+          : (validationBalancedAccuracy < 0.55 ? 'WEAK_DISCRIMINATION' : 'USABLE_SHADOW_ONLY'));
+
+      this.logger.info(`🧠 [TensorFlow.js] Validation-Diagnose: labels=+${validationPositiveLabels}/-${validationNegativeLabels} predictions=+${validationPredictedPositive}/-${validationPredictedNegative} quality=${validationQuality}`);
 
       const oldAccuracy = finite(this.stats.validationAccuracy, 0);
       if (!force && this.trained && validationAccuracy + 0.02 < oldAccuracy) {
@@ -479,11 +497,14 @@ class TensorFlowSignalModel {
         modelVersion: `tfjs-${Date.now()}`,
         featureCount: FEATURE_NAMES.length,
         featureNames: [...FEATURE_NAMES],
-        bestHyperparameters: bestBestConfig || null
+        bestHyperparameters: bestBestConfig || null,
+        validationLabelCounts: { positive: validationPositiveLabels, negative: validationNegativeLabels },
+        validationPredictionCounts: { positive: validationPredictedPositive, negative: validationPredictedNegative },
+        validationQuality
       };
 
       await this.save();
-      this.logger.info(`🧠 [TensorFlow.js] Getuntes Modell erfolgreich trainiert: ${dataset.length} Trades | Val-Acc ${(validationAccuracy * 100).toFixed(1)}% | Balanced ${(validationBalancedAccuracy * 100).toFixed(1)}% | Precision ${(validationPrecision * 100).toFixed(1)}% | Recall ${(validationRecall * 100).toFixed(1)}% | Brier ${probabilityStats.brierScore.toFixed(4)} | ECE ${probabilityStats.calibrationError.toFixed(4)}`);
+      this.logger.info(`🧠 [TensorFlow.js] Getuntes Modell erfolgreich trainiert: ${dataset.length} Trades | Val-Acc ${(validationAccuracy * 100).toFixed(1)}% | Balanced ${(validationBalancedAccuracy * 100).toFixed(1)}% | Precision ${(validationPrecision * 100).toFixed(1)}% | Recall ${(validationRecall * 100).toFixed(1)}% | Brier ${probabilityStats.brierScore.toFixed(4)} | ECE ${probabilityStats.calibrationError.toFixed(4)} | Quality ${validationQuality}`);
       return { trained: true, ...this.getStats() };
     } catch (e) {
       this.logger.error(`🧠 [TensorFlow.js] Training fehlgeschlagen: ${e.stack || e.message}`);

@@ -19,7 +19,7 @@ const __dirname = path.dirname(__filename);
 
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - v24.6 INSTITUTIONAL EDITION
+ * TRADING SIGNAL BOT - v25.0.5 INSTITUTIONAL EDITION
  * (Mit adaptivem TensorFlow.js ML, Deep Q-Network Agent, globaler Telegram-Queue,
  *  State-Persistenz, Hurst-Exponent, Marktphasen-Logging & Dynamic Filter Control)
  * ============================================================================
@@ -1160,6 +1160,11 @@ async function recoverHistoricalMLDataOnStartup() {
     let unresolved = 0;
     let paperCount = 0;
     let eventCount = 0;
+    let missingSignalOnly = 0;
+    let missingEntryOnly = 0;
+    let missingBoth = 0;
+    const unresolvedReasons = { noExactSource: 0, sourceWithoutUsablePrice: 0 };
+    const adapterOrderCount = adapterOrders.length;
 
     for (const trade of trades) {
       const missingSignalPrice = !(Number.isFinite(Number(trade.signalPriceAtEntry)) && Number(trade.signalPriceAtEntry) > 0);
@@ -1167,6 +1172,9 @@ async function recoverHistoricalMLDataOnStartup() {
       if (!missingSignalPrice && !missingEntry) continue;
 
       eligible++;
+      if (!missingSignalPrice && missingEntry) missingEntryOnly++;
+      else if (missingSignalPrice && !missingEntry) missingSignalOnly++;
+      else if (missingSignalPrice && missingEntry) missingBoth++;
 
       const paperMatch = findExactPaperOrder(trade, paperIndex);
       const executionMatch = paperMatch.order
@@ -1175,12 +1183,14 @@ async function recoverHistoricalMLDataOnStartup() {
 
       if (!paperMatch.order && !executionMatch.event && !executionMatch.intent) {
         unresolved++;
+        unresolvedReasons.noExactSource++;
         continue;
       }
 
       const { patch, reasons } = recoverTrade(trade, paperMatch.order, executionMatch);
       if (!Object.keys(patch).length) {
         unresolved++;
+        unresolvedReasons.sourceWithoutUsablePrice++;
         continue;
       }
 
@@ -1199,14 +1209,16 @@ async function recoverHistoricalMLDataOnStartup() {
     }
 
     logger.info?.(
-      `[ML-RECOVERY] v2 complete scanned=${trades.length} eligible=${eligible} ` +
+      `[ML-RECOVERY] v3 complete scanned=${trades.length} eligible=${eligible} ` +
       `recoverable=${recoverable} updated=${updated} unresolved=${unresolved} ` +
-      `paperOrders=${paperCount} executionEvents=${eventCount}`
+      `paperOrders=${paperCount} executionEvents=${eventCount} adapterOrders=${adapterOrderCount} ` +
+      `missingSignalOnly=${missingSignalOnly} missingEntryOnly=${missingEntryOnly} missingBoth=${missingBoth} ` +
+      `unresolvedReasons=${JSON.stringify(unresolvedReasons)}`
     );
   } catch (err) {
     // Recovery is non-critical to execution safety. If it fails, normal ML
     // training remains fail-closed and the bot continues in its existing mode.
-    logger.warn?.(`[ML-RECOVERY] v2 skipped: ${err.message}`);
+    logger.warn?.(`[ML-RECOVERY] v3 skipped: ${err.message}`);
   }
 }
 
@@ -2665,7 +2677,7 @@ async function checkRiskLevels() {
 }
 
 function formatScanStatsReport(stats) {
-  const lines = [`🔎 <b>SCAN-DIAGNOSE v24.6 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
+  const lines = [`🔎 <b>SCAN-DIAGNOSE v25.0.5 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
   lines.push(`Coins geprüft: ${stats.total} | Signale gesendet: ${stats.signalsSent}`);
   if (stats.avgSignalScore !== undefined) lines.push(`Ø Signal-Score: ${stats.avgSignalScore}/100`);
   lines.push(`Marktphase: ${currentMarketPhase}\n`);
@@ -3311,7 +3323,7 @@ async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v24.6 (mit DQN)...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v25.0.5 (mit DQN)...`);
 
   if (!isDbConnected || isPaused) {
     logger.warn(`⚠️ Scan abgebrochen: DB=${isDbConnected}, Paused=${isPaused}`);
@@ -4025,7 +4037,7 @@ async function handleTelegramCommand(chatId, text) {
   const args = parts.slice(1);
 
   // ==========================================
-  // 🤖 AI / AGENT CONTROL CENTER (v24.6)
+  // 🤖 AI / AGENT CONTROL CENTER (v25.0.5)
   // Advisory controls only: hard RiskEngine/Paper safety gates remain authoritative.
   // ==========================================
   const agentAlias = (name) => {
@@ -4043,7 +4055,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/commands' || command === '/aicommands') {
     await sendTelegramReply(chatId,
-      `<b>🤖 AI CONTROL CENTER v24.6</b>\n━━━━━━━━━━━━━━━━━━\n` +
+      `<b>🤖 AI CONTROL CENTER v25.0.5</b>\n━━━━━━━━━━━━━━━━━━\n` +
       `<b>Agents</b>\n/agents /agents_status /agent &lt;name&gt;\n/agent_on &lt;name&gt; /agent_off &lt;name&gt;\n/agents_on /agents_off /agent_weights\n` +
       `<b>LLM</b>\n/llm /llm_status /llm_on /llm_off /llm_test\n` +
       `<b>Analyse</b>\n/signals /top_signals /anomalies /regime /signal &lt;symbol&gt;\n/explain &lt;symbol&gt; /confluence &lt;symbol&gt; /risk\n` +
@@ -4180,7 +4192,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
-      `<b>🤖 TRADING BOT v24.6 - INSTITUTIONAL PAPER/SHADOW</b>\n` +
+      `<b>🤖 TRADING BOT v25.0.5 - INSTITUTIONAL PAPER/SHADOW</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
       `<b>⚙️ DYNAMISCHE FILTER-STEUERUNG:</b>\n` +
       `/filters - Zeigt alle Indikator-Status & Werte an\n` +
@@ -4807,7 +4819,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v24.6 INSTITUTIONAL EDITION</b>`);
+    lines.push(`🤖 <b>BOT STATUS v25.0.5 INSTITUTIONAL EDITION</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
@@ -4981,7 +4993,7 @@ app.use((req, res, next) => {
 });
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v24.6 Institutional Edition | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v25.0.5 Institutional Edition | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 
@@ -6556,7 +6568,7 @@ process.on('unhandledRejection', async (reason) => {
 // 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v24.6 Institutional Edition (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
+  logger.info('🚀 Starte Trading Bot v25.0.5 Institutional Edition (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
