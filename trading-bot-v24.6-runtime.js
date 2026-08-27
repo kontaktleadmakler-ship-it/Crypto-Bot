@@ -3516,11 +3516,6 @@ async function scanMarket() {
         return;
       }
 
-      if (timeFilterBlocked) {
-        scanStats.timeBlocked++;
-        return;
-      }
-
       if (signalsSent >= config.MAX_SIGNALS_PER_SCAN) { 
         scanStats.skippedMaxSignals++; 
         return; 
@@ -3686,6 +3681,19 @@ async function scanMarket() {
           marketPhase: currentMarketPhase,
           timestamp: Date.now()
         }, direction ? 'INFO' : 'WARN');
+
+        // BUGFIX: Time-Filter throttling used to `return` before market
+        // data was ever fetched, so the JARVIS dashboard's live snapshot
+        // (fed by this same per-symbol pass, see dashboardRecordProductionScanCoin
+        // above) stayed completely empty during throttled hours/weekdays -
+        // the dashboard looked disconnected even though the bot itself was
+        // scanning normally. Market data, indicators and the dashboard
+        // snapshot are now always produced; only the final decision to
+        // actually place a signal is withheld while the time filter is active.
+        if (timeFilterBlocked) {
+          scanStats.timeBlocked++;
+          return;
+        }
 
         if (direction !== null) {
           scanStats.postGatePassed++;
