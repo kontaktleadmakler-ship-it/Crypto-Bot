@@ -822,7 +822,7 @@ client.on('error', (err) => {
 });
 
 let db = null;
-let tradesCollection, closedTradesCollection, botStateCollection, lockCollection, marketPhaseLogsCollection, filterChangeLogCollection;
+let tradesCollection, closedTradesCollection, botStateCollection, lockCollection, marketPhaseLogsCollection, filterChangeLogCollection, dashboardScanHistoryCollection;
 let paperOrdersCollection, executionIdempotencyCollection;
 const activeTrades = new Map();
 // ===== Integrated Execution Core (P1-P4) =====
@@ -1580,6 +1580,7 @@ async function initDatabase() {
     botStateCollection = db.collection('botState');
     lockCollection = db.collection('locks');
     marketPhaseLogsCollection = db.collection('marketPhaseLogs');
+    dashboardScanHistoryCollection = db.collection('dashboardScanHistory');
     filterChangeLogCollection = db.collection('filterChangeLogs');
     paperOrdersCollection = db.collection('paperOrders');
     executionIdempotencyCollection = db.collection('executionIdempotency');
@@ -1634,6 +1635,8 @@ async function initDatabase() {
       await closedTradesCollection.createIndex({ closeTime: -1 });
       await closedTradesCollection.createIndex({ symbol: 1, closeTime: -1 });
       await marketPhaseLogsCollection.createIndex({ timestamp: -1 });
+      await dashboardScanHistoryCollection.createIndex({ ts: -1 });
+      await dashboardScanHistoryCollection.createIndex({ symbol: 1, ts: -1 });
       await filterChangeLogCollection.createIndex({ timestamp: -1 });
       await paperOrdersCollection.createIndex({ symbol: 1, simulatedAt: -1 });
       await executionIdempotencyCollection.createIndex({ createdAt: 1 }, { expireAfterSeconds: 7 * 24 * 3600 });
@@ -5116,6 +5119,9 @@ jarvisEventBus.on('event', (event) => {
 
 function dashboardRecordProductionScanCoin(snapshot, severity = 'INFO') {
   if (!snapshot || !snapshot.symbol) return null;
+
+  // The EventBus remains the live transport, while MongoDB is the durable
+  // history. Render's local filesystem is not a reliable long-term store.
   const event = jarvisEventBus.emitEvent('SCAN:COIN', snapshot, {
     source: 'scanner',
     severity,
@@ -5123,6 +5129,24 @@ function dashboardRecordProductionScanCoin(snapshot, severity = 'INFO') {
     persistReplay: true,
     persistMinIntervalMs: 0
   });
+
+  if (dashboardScanHistoryCollection && isDbConnected) {
+    const doc = {
+      ts: Number(event.ts || Date.now()),
+      eventId: event.eventId,
+      type: event.type,
+      severity: event.severity,
+      source: event.source,
+      symbol: String(event.symbol || snapshot.symbol).toUpperCase(),
+      payload: event.payload || {}
+    };
+    // History persistence must never slow the scanner. Failure is visible but
+    // does not turn a market-data scan into an execution failure.
+    void dashboardScanHistoryCollection.insertOne(doc).catch(err => {
+      logger.warn?.(`[DASHBOARD HISTORY] persist failed: ${err.message}`);
+    });
+  }
+
   return event;
 }
 
@@ -6015,22 +6039,63 @@ app.get('/api/dashboard/scan-history', async (req, res) => {
     const toTs = Number.isFinite(Number(req.query.to)) ? Number(req.query.to) : now;
     const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : null;
     const limit = Math.min(5000, Math.max(1, Number(req.query.limit || 1000)));
+
+    if (dashboardScanHistoryCollection && isDbConnected) {
+      const filter = { ts: { $gte: fromTs, $lte: toTs } };
+      if (symbol) filter.symbol = symbol;
+      const rows = await dashboardScanHistoryCollection
+        .find(filter, { projection: { _id: 0 } })
+        .sort({ ts: -1 })
+        .limit(limit)
+        .toArray();
+
+      return res.json({
+        timestamp: now,
+        source: 'MONGODB_PRODUCTION_SCANNER_HISTORY',
+        durable: true,
+        range: { from: fromTs, to: toTs },
+        symbol,
+        count: rows.length,
+        events: rows.reverse().map(row => ({
+          ts: row.ts,
+          eventId: row.eventId,
+          type: row.type || 'SCAN:COIN',
+          symbol: row.symbol,
+          severity: row.severity || 'INFO',
+          source: row.source || 'scanner',
+          payload: row.payload || {}
+        }))
+      });
+    }
+
+    // Fallback for startup/reconnect before MongoDB is ready.
     const events = [];
-    await jarvisHistoricalReplay.run({ fromTs, toTs, onEvent: async e => {
-      if (e.type !== 'SCAN:COIN') return;
-      if (symbol && String(e.symbol || '').toUpperCase() !== symbol) return;
-      events.push(e);
-    }});
-    events.sort((a,b) => Number(a.ts||0)-Number(b.ts||0));
+    await jarvisHistoricalReplay.run({
+      fromTs,
+      toTs,
+      onEvent: async e => {
+        if (e.type !== 'SCAN:COIN') return;
+        if (symbol && String(e.symbol || '').toUpperCase() !== symbol) return;
+        events.push(e);
+      }
+    });
+    events.sort((a,b) => Number(a.ts || 0) - Number(b.ts || 0));
     const limited = events.slice(-limit);
-    res.setHeader('Cache-Control','no-store');
-    res.json({ timestamp: now, source:'PRODUCTION_SCANNER_HISTORY', range:{from:fromTs,to:toTs}, symbol, count:limited.length, events:limited });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      timestamp: now,
+      source: 'LOCAL_REPLAY_FALLBACK',
+      durable: false,
+      range: { from: fromTs, to: toTs },
+      symbol,
+      count: limited.length,
+      events: limited
+    });
   } catch (err) {
     logger.warn(`[Dashboard Scan History] ${err.message}`);
-    res.status(500).json({ error:'SCAN_HISTORY_FAILED', message:err.message });
+    res.status(500).json({ error: 'SCAN_HISTORY_FAILED', message: err.message });
   }
 });
-
 app.get('/api/dashboard/historical', async (req, res) => {
   try {
     const now = Date.now();
