@@ -734,8 +734,10 @@ const config = {
   TP1_CLOSE_PERCENT: parseFloat(process.env.TP1_CLOSE_PERCENT) || 60,
   ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false',
   MAX_EXPOSURE_RATIO: parseFloat(process.env.MAX_EXPOSURE_RATIO) || 0.6,
-  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 5,
-  SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 75000,
+  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 3,
+  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 3,
+  MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 5000,
+  SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 30000,
   SCAN_WATCHDOG_MS: parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 300000,
   MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,
   LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3,
@@ -2466,7 +2468,7 @@ async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
 // coalesced and the KuCoin circuit breaker is checked before fan-out.
 const marketDataInflight = new Map();
 const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
-  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 20000, 5000),
+  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 15000, 5000),
   Math.max(5000, config.SCAN_ITEM_TIMEOUT_MS - 1000)
 );
 
@@ -2474,7 +2476,60 @@ function isKucoinCircuitOpen() {
   return Date.now() < kucoinCircuitOpenUntil;
 }
 
+// Market-data worker pool. The scanner may evaluate several coins in parallel,
+// but the expensive Exchange/API fan-out is separately bounded. This prevents
+// 177+ candidates from turning into an uncontrolled burst of Kline/Futures/L2
+// requests. A queue timeout means a coin is skipped rather than waiting behind
+// a congested pool for tens of seconds.
+const marketDataPool = {
+  active: 0,
+  queue: [],
+
+  acquire(timeoutMs = config.MARKET_DATA_QUEUE_TIMEOUT_MS) {
+    if (this.active < Math.max(1, config.MARKET_DATA_CONCURRENCY)) {
+      this.active++;
+      return Promise.resolve(() => this.release());
+    }
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = timeoutMs > 0 ? setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        const idx = this.queue.findIndex(entry => entry.resolve === resolve);
+        if (idx !== -1) this.queue.splice(idx, 1);
+        const err = new Error(`market-data queue timeout after ${timeoutMs}ms`);
+        err.code = 'MARKET_DATA_QUEUE_TIMEOUT';
+        reject(err);
+      }, timeoutMs) : null;
+      this.queue.push({
+        resolve: (release) => {
+          if (settled) {
+            release();
+            return;
+          }
+          settled = true;
+          if (timer) clearTimeout(timer);
+          resolve(release);
+        },
+        reject
+      });
+    });
+  },
+
+  release() {
+    this.active = Math.max(0, this.active - 1);
+    while (this.queue.length > 0 && this.active < Math.max(1, config.MARKET_DATA_CONCURRENCY)) {
+      const entry = this.queue.shift();
+      if (!entry) break;
+      this.active++;
+      entry.resolve(() => this.release());
+    }
+  }
+};
+
 async function getMarketDataBundle(symbol) {
+  if (isKucoinCircuitOpen()) {
   if (isKucoinCircuitOpen()) {
     const err = new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
     err.code = 'KUCOIN_CIRCUIT_OPEN';
@@ -2486,7 +2541,9 @@ async function getMarketDataBundle(symbol) {
   if (existing) return existing;
 
   const task = (async () => {
-    const raw15m = await fetchKucoinKlinesCached(symbol, '15m', 100);
+    const release = await marketDataPool.acquire();
+    try {
+      const raw15m = await fetchKucoinKlinesCached(symbol, '15m', 100);
     if (!raw15m || raw15m.length < 20) {
       const err = new Error(`${symbol}/15m market data unavailable`);
       err.code = 'KLINES_UNAVAILABLE';
@@ -2523,12 +2580,15 @@ async function getMarketDataBundle(symbol) {
       fetchOrderBookMetrics(symbol)
     ]);
 
-    return {
-      symbol, raw15m, raw1h, raw4h,
-      futuresData: futuresResult.status === 'fulfilled' ? futuresResult.value : null,
-      orderBookMetrics: orderBookResult.status === 'fulfilled' ? orderBookResult.value : null,
-      fetchedAt: Date.now()
-    };
+      return {
+        symbol, raw15m, raw1h, raw4h,
+        futuresData: futuresResult.status === 'fulfilled' ? futuresResult.value : null,
+        orderBookMetrics: orderBookResult.status === 'fulfilled' ? orderBookResult.value : null,
+        fetchedAt: Date.now()
+      };
+    } finally {
+      release();
+    }
   })();
 
   marketDataInflight.set(key, task);
@@ -3344,7 +3404,7 @@ function createEmptyScanStats() {
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
     timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0,
-    marketDataTimeouts: 0, marketDataFailures: 0, circuitBreakerSkips: 0
+    marketDataTimeouts: 0, marketDataQueueTimeouts: 0, marketDataFailures: 0, circuitBreakerSkips: 0
   };
 }
 
