@@ -75,7 +75,7 @@ const { MarketDataReplay } = require('./market-data-replay.js');
 const { buildCoinTimeline } = require('./coin-timeline.js');
 const { downloadOHLCV, writeDataset, GRANULARITY } = require('./scripts/download-ohlcv');
 const fs = require('fs');
-
+const path = require('path');
 
 // ==========================================
 // OHLCV RESEARCH DATA MANAGER (Telegram)
@@ -2389,6 +2389,86 @@ async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
 }
 
 // ==========================================
+// CENTRAL MARKET-DATA GATEWAY
+// ==========================================
+// One bounded request bundle per symbol. Duplicate in-flight requests are
+// coalesced and the KuCoin circuit breaker is checked before fan-out.
+const marketDataInflight = new Map();
+const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
+  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 20000, 5000),
+  Math.max(5000, config.SCAN_ITEM_TIMEOUT_MS - 1000)
+);
+
+function isKucoinCircuitOpen() {
+  return Date.now() < kucoinCircuitOpenUntil;
+}
+
+async function getMarketDataBundle(symbol) {
+  if (isKucoinCircuitOpen()) {
+    const err = new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
+    err.code = 'KUCOIN_CIRCUIT_OPEN';
+    throw err;
+  }
+
+  const key = `bundle:${symbol}`;
+  const existing = marketDataInflight.get(key);
+  if (existing) return existing;
+
+  const task = (async () => {
+    const raw15m = await fetchKucoinKlinesCached(symbol, '15m', 100);
+    if (!raw15m || raw15m.length < 20) {
+      const err = new Error(`${symbol}/15m market data unavailable`);
+      err.code = 'KLINES_UNAVAILABLE';
+      throw err;
+    }
+
+    let raw1h = config.ENABLE_MULTI_TF_DERIVATION
+      ? deriveHigherTimeframes(raw15m, '1h')
+      : await fetchKucoinKlinesCached(symbol, '1h', 50);
+    if (!raw1h) {
+      const err = new Error(`${symbol}/1h market data unavailable`);
+      err.code = 'KLINES_UNAVAILABLE';
+      throw err;
+    }
+    raw1h = raw1h.filter(c => c.time + ONE_HOUR_MS <= Date.now());
+    if (raw1h.length === 0) {
+      const err = new Error(`${symbol}/1h closed candles unavailable`);
+      err.code = 'KLINES_UNAVAILABLE';
+      throw err;
+    }
+
+    let raw4h = null;
+    if (config.REQUIRE_4H_TREND) {
+      raw4h = config.ENABLE_MULTI_TF_DERIVATION
+        ? deriveHigherTimeframes(raw15m, '4h')
+        : await fetchKucoinKlinesCached(symbol, '4h', 50);
+      if (raw4h) raw4h = raw4h.filter(c => c.time + FOUR_HOUR_MS <= Date.now());
+    }
+
+    // Independent optional sources run concurrently. A failed optional source
+    // is handled by the existing strategy gate instead of blocking the bundle.
+    const [futuresResult, orderBookResult] = await Promise.allSettled([
+      fetchFuturesData(symbol),
+      fetchOrderBookMetrics(symbol)
+    ]);
+
+    return {
+      symbol, raw15m, raw1h, raw4h,
+      futuresData: futuresResult.status === 'fulfilled' ? futuresResult.value : null,
+      orderBookMetrics: orderBookResult.status === 'fulfilled' ? orderBookResult.value : null,
+      fetchedAt: Date.now()
+    };
+  })();
+
+  marketDataInflight.set(key, task);
+  try {
+    return await task;
+  } finally {
+    marketDataInflight.delete(key);
+  }
+}
+
+// ==========================================
 // 13. MARKT-REGIME & KELLY SIZING
 // ==========================================
 function detectMarketPhase(btcTrend, btcADX, btcVolatility) {
@@ -3192,7 +3272,8 @@ function createEmptyScanStats() {
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0
+    timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0,
+    marketDataTimeouts: 0, marketDataFailures: 0, circuitBreakerSkips: 0
   };
 }
 
@@ -3380,6 +3461,13 @@ async function scanMarket() {
       return;
     }
 
+    if (isKucoinCircuitOpen()) {
+      scanStats.circuitBreakerSkips = dynamicWatchlist.length;
+      logger.warn(`⏸️ [MARKET-DATA] Scan pausiert: KuCoin Circuit Breaker aktiv für weitere ${Math.ceil((kucoinCircuitOpenUntil - Date.now()) / 1000)}s.`);
+      lastScanStats = scanStats;
+      return;
+    }
+
     if (config.ENABLE_PRELOADING) {
       preloadKlines(dynamicWatchlist.slice(0, 20), '15m', 100);
     }
@@ -3421,46 +3509,25 @@ async function scanMarket() {
       }
 
       try {
-        const raw15m = await fetchKucoinKlinesCached(symbol, '15m', 100);
-        if (!raw15m || raw15m.length < 20) { 
-          scanStats.missingKlines++; 
-          return; 
-        }
-
-        let raw1h = config.ENABLE_MULTI_TF_DERIVATION 
-          ? deriveHigherTimeframes(raw15m, '1h') 
-          : await fetchKucoinKlinesCached(symbol, '1h', 50);
-
-        if (!raw1h) { 
-          scanStats.missingKlines++; 
-          return; 
-        }
-        // Explicit closed-candle guard: only use HTF candles whose full
-        // window has already elapsed. raw15m already excludes the
-        // still-forming 15m candle (see fetchKucoinKlines), so every
-        // derived group is inherently closed - this is defense-in-depth
-        // against a future change upstream reintroducing a partial candle.
-        raw1h = raw1h.filter(c => c.time + ONE_HOUR_MS <= Date.now());
-        if (raw1h.length === 0) {
-          scanStats.missingKlines++;
+        let marketData;
+        try {
+          marketData = await Promise.race([
+            getMarketDataBundle(symbol),
+            new Promise((_, reject) => setTimeout(() => reject(new Error(`${symbol} market-data bundle timed out after ${MARKET_DATA_BUNDLE_TIMEOUT_MS}ms`)), MARKET_DATA_BUNDLE_TIMEOUT_MS))
+          ]);
+        } catch (e) {
+          if (e?.code === 'KUCOIN_CIRCUIT_OPEN') {
+            scanStats.circuitBreakerSkips++;
+            return;
+          }
+          if (/timed out/i.test(e?.message || '')) scanStats.marketDataTimeouts++;
+          else scanStats.marketDataFailures++;
+          if (e?.code === 'KLINES_UNAVAILABLE') scanStats.missingKlines++;
+          logger.warn(`[MARKET-DATA] ${symbol}: ${e?.message || e}`);
           return;
         }
 
-        let raw4h = null;
-        if (config.REQUIRE_4H_TREND) {
-          if (config.ENABLE_MULTI_TF_DERIVATION) {
-            raw4h = deriveHigherTimeframes(raw15m, '4h');
-            if (!raw4h || raw4h.length < 30) {
-              raw4h = await fetchKucoinKlinesCached(symbol, '4h', 50);
-            }
-          } else {
-            raw4h = await fetchKucoinKlinesCached(symbol, '4h', 50);
-          }
-          if (raw4h) raw4h = raw4h.filter(c => c.time + FOUR_HOUR_MS <= Date.now());
-        }
-
-        const futuresData = await fetchFuturesData(symbol).catch(() => null);
-        const orderBookMetrics = await fetchOrderBookMetrics(symbol).catch(() => null);
+        const { raw15m, raw1h, raw4h, futuresData, orderBookMetrics } = marketData;
         if (!orderBookMetrics?.valid) {
           scanStats.orderBookBlocked = (scanStats.orderBookBlocked || 0) + 1;
           return;
@@ -3923,7 +3990,7 @@ async function scanMarket() {
     }
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
-    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors}`);
+    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
 
     if (marketPhaseLogsCollection && isDbConnected) {
       await marketPhaseLogsCollection.insertOne({
@@ -5351,14 +5418,18 @@ async function getDashboardData(symbol) {
   const cached = dashboardCache.get(symbol);
   if (cached && Date.now() - cached.ts < DASHBOARD_CACHE_MS) return cached.data;
 
-  const [candles, ticker, book, contract, macro] = await Promise.all([
-    fetchKucoinKlines(symbol, '15m', 100),
+  const [marketDataResult, tickerResult, macro] = await Promise.allSettled([
+    getMarketDataBundle(symbol),
     fetchKucoinTickerPrice(symbol),
-    fetchOrderBookMetrics(symbol),
-    fetchFuturesData(symbol),
     macroEngine.evaluateMacroEnvironment().catch(() => ({ value: 50, classification: 'Neutral', safe: true, multiplier: 1 }))
   ]);
 
+  if (marketDataResult.status !== 'fulfilled' || tickerResult.status !== 'fulfilled') {
+    throw new Error('LIVE_MARKET_DATA_UNAVAILABLE');
+  }
+
+  const { raw15m: candles, orderBookMetrics: book, futuresData: contract } = marketDataResult.value;
+  const ticker = tickerResult.value;
   if (!candles || candles.length < 50 || !Number.isFinite(ticker)) {
     throw new Error('LIVE_MARKET_DATA_UNAVAILABLE');
   }
