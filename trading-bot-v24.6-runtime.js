@@ -118,8 +118,31 @@ const DAILY_PROFIT_TARGET = parseFloat(process.env.DAILY_PROFIT_TARGET) || 500;
 
 let kucoinErrorCount = 0;
 let kucoinCircuitOpenUntil = 0;
-const KUCOIN_CIRCUIT_THRESHOLD = 3;
-const KUCOIN_CIRCUIT_COOLDOWN_MS = 300000;
+let kucoinCircuitState = 'CLOSED';
+let kucoinHalfOpenProbeInFlight = false;
+const KUCOIN_CIRCUIT_THRESHOLD = Number(process.env.KUCOIN_CIRCUIT_THRESHOLD || 3);
+const KUCOIN_CIRCUIT_COOLDOWN_MS = Number(process.env.KUCOIN_CIRCUIT_COOLDOWN_MS || 300000);
+const KUCOIN_HALF_OPEN_PROBE_TIMEOUT_MS = Number(process.env.KUCOIN_HALF_OPEN_PROBE_TIMEOUT_MS || 7000);
+
+function getKucoinCircuitState() {
+  if (kucoinCircuitState === 'OPEN' && Date.now() >= kucoinCircuitOpenUntil) return 'HALF_OPEN';
+  return kucoinCircuitState;
+}
+
+function markKucoinCircuitOpen(reason = 'error') {
+  kucoinCircuitState = 'OPEN';
+  kucoinCircuitOpenUntil = Date.now() + KUCOIN_CIRCUIT_COOLDOWN_MS;
+  kucoinHalfOpenProbeInFlight = false;
+  logger.error(`🚨 KuCoin API Schutz: Circuit OPEN reason=${reason} cooldownMs=${KUCOIN_CIRCUIT_COOLDOWN_MS}`);
+}
+
+function markKucoinCircuitSuccess() {
+  if (kucoinCircuitState !== 'CLOSED') logger.info('🟢 [KUCOIN-CIRCUIT] recovery successful → CLOSED');
+  kucoinErrorCount = 0;
+  kucoinCircuitState = 'CLOSED';
+  kucoinCircuitOpenUntil = 0;
+  kucoinHalfOpenProbeInFlight = false;
+}
 
 const manualBlacklist = new Set();
 
@@ -1018,42 +1041,61 @@ function predictSignalSuccess(features) {
 }
 
 async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 1000) {
-  if (Date.now() < kucoinCircuitOpenUntil) {
-    throw new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
+  const state = getKucoinCircuitState();
+  if (state === 'OPEN') {
+    const remainingMs = Math.max(0, kucoinCircuitOpenUntil - Date.now());
+    throw new Error(`KuCoin Circuit Breaker aktiv (API-Schutz) state=OPEN remainingMs=${remainingMs}`);
   }
 
-  // Market-data callers may explicitly disable retries. Retrying a timed-out
-  // public request 3x turns a 5s network problem into ~22s and starves the
-  // scanner. The scanner uses retryCount=0 and relies on the next scan cycle.
+  // HALF_OPEN permits exactly one probe. Other callers fail fast instead of
+  // stampeding the exchange while recovery is being tested.
+  if (state === 'HALF_OPEN') {
+    if (kucoinHalfOpenProbeInFlight) {
+      throw new Error('KuCoin Circuit Breaker aktiv (API-Schutz) state=HALF_OPEN probe-in-flight');
+    }
+    kucoinHalfOpenProbeInFlight = true;
+  }
+
   const effectiveRetries = Number.isInteger(options.retryCount)
     ? Math.max(0, options.retryCount)
     : retries;
   const requestOptions = { ...options };
   delete requestOptions.retryCount;
 
-  await apiRateLimiter.checkLimit();
-  for (let attempt = 0; attempt <= effectiveRetries; attempt++) {
-    try {
-      const startTime = Date.now();
-      const response = await axios.get(url, { timeout: requestOptions.timeout || 5000, ...requestOptions });
-      apiLatencyStats.record('kucoin', Date.now() - startTime);
-      kucoinErrorCount = 0;
-      return response;
-    } catch (error) {
-      if (error.response && error.response.status === 429 && attempt < effectiveRetries) {
-        await sleep(backoffMs * Math.pow(2, attempt));
-        continue;
-      }
-      if (attempt === effectiveRetries) {
-        kucoinErrorCount++;
-        if (kucoinErrorCount >= KUCOIN_CIRCUIT_THRESHOLD) {
-          kucoinCircuitOpenUntil = Date.now() + KUCOIN_CIRCUIT_COOLDOWN_MS;
-          logger.error(`🚨 KuCoin API Fehlerhäufung! Circuit Breaker für 5 Minuten aktiviert.`);
-          sendTelegramAlert(`⚠️ <b>KuCoin API Schutz aktiv:</b> Zu viele Fehler. Scans pausieren für 5 Minuten.`);
+  try {
+    await apiRateLimiter.checkLimit();
+    for (let attempt = 0; attempt <= effectiveRetries; attempt++) {
+      try {
+        const startTime = Date.now();
+        const response = await axios.get(url, {
+          timeout: requestOptions.timeout || 5000,
+          ...requestOptions
+        });
+        apiLatencyStats.record('kucoin', Date.now() - startTime);
+        markKucoinCircuitSuccess();
+        return response;
+      } catch (error) {
+        if (error.response && error.response.status === 429 && attempt < effectiveRetries) {
+          await sleep(backoffMs * Math.pow(2, attempt));
+          continue;
         }
+        if (attempt === effectiveRetries) {
+          kucoinErrorCount++;
+          if (kucoinCircuitState === 'HALF_OPEN') {
+            markKucoinCircuitOpen(`half-open probe failed: ${error.code || error.response?.status || error.message}`);
+          } else if (kucoinErrorCount >= KUCOIN_CIRCUIT_THRESHOLD) {
+            markKucoinCircuitOpen(`failure-threshold=${kucoinErrorCount}`);
+            try {
+              await sendTelegramAlert(`⚠️ <b>KuCoin API Schutz aktiv:</b> ${KUCOIN_CIRCUIT_COOLDOWN_MS / 60000} Min Cooldown. Automatische HALF_OPEN-Recovery aktiv.`);
+            } catch (_) {}
+          }
+        }
+        throw error;
       }
-      throw error;
     }
+  } finally {
+    if (state === 'HALF_OPEN' && kucoinCircuitState === 'CLOSED') kucoinHalfOpenProbeInFlight = false;
+    if (state === 'HALF_OPEN' && kucoinCircuitState === 'OPEN') kucoinHalfOpenProbeInFlight = false;
   }
 }
 
@@ -3735,7 +3777,7 @@ async function scanMarket() {
             maxDrawdownPct: MAX_DRAWDOWN_PERCENT,
             dailyLossPct: Math.max(0, -(dailyNetPnL / Math.max(config.CAPITAL_USD, 1)) * 100),
             maxDailyLossPct: Math.max(0, Number(config.MAX_DAILY_LOSS_USD || 0) / Math.max(config.CAPITAL_USD, 1) * 100),
-            killSwitch: safetyController.isActive('kill-switch') || isPaused, circuitBreaker: Date.now() < kucoinCircuitOpenUntil,
+            killSwitch: safetyController.isActive('kill-switch') || isPaused, circuitBreaker: getKucoinCircuitState() === 'OPEN', circuitState: getKucoinCircuitState(), circuitRemainingMs: Math.max(0, kucoinCircuitOpenUntil - Date.now()),
             regime: { confidence: currentMarketPhase === 'RANGING' || currentMarketPhase === 'TRENDING' ? 0.75 : 0.5 },
             oosScore: Number(mlModel.getStats().validationAccuracy || 0), driftScore: Number(modelDriftMonitor.status().score || 0)
           });
@@ -4205,7 +4247,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/kill_status') {
     const riskState = riskEngine.killSwitch ? '🔴 ACTIVE / FAIL-CLOSED' : '🟢 not active';
-    const circuit = Date.now() < kucoinCircuitOpenUntil ? '🔴 OPEN' : '🟢 CLOSED';
+    const circuit = getKucoinCircuitState() === 'OPEN' ? '🔴 OPEN' : (getKucoinCircuitState() === 'HALF_OPEN' ? '🟡 HALF_OPEN' : '🟢 CLOSED');
     await sendTelegramReply(chatId, `🛡️ <b>SAFETY STATUS</b>\nRiskEngine kill-switch: ${riskState}\nKuCoin circuit breaker: ${circuit}\nBot paused: ${isPaused ? '🟡 YES' : '🟢 NO'}`);
     return;
   }
@@ -5568,7 +5610,7 @@ async function getDashboardAgentNetwork(symbol) {
     dailyLossPct: Math.max(0, -(dailyNetPnL / Math.max(config.CAPITAL_USD, 1)) * 100),
     maxDailyLossPct: Math.max(0, Number(config.MAX_DAILY_LOSS_USD || 0) / Math.max(config.CAPITAL_USD, 1) * 100),
     killSwitch: safetyController.isActive('kill-switch') || isPaused,
-    circuitBreaker: Date.now() < kucoinCircuitOpenUntil,
+    circuitBreaker: getKucoinCircuitState() === 'OPEN', circuitState: getKucoinCircuitState(), circuitRemainingMs: Math.max(0, kucoinCircuitOpenUntil - Date.now()),
     regime: { confidence: currentMarketPhase === 'RANGING' || currentMarketPhase === 'TRENDING' ? 0.75 : 0.5 },
     expectancy: 0,
     sharpe: Number(data.risk?.sharpe || 0),
@@ -5852,7 +5894,7 @@ async function getDashboardExecutionPortfolio(symbol) {
     { key:'position', label:'POSITION', status: positions.some(p => p.symbol === symbol) ? 'OPEN' : 'FLAT', timestamp: positions.some(p => p.symbol === symbol) ? now : null },
     { key:'exit', label:'EXIT', status: positions.some(p => p.symbol === symbol) ? 'MONITORING' : 'WAITING', timestamp: null }
   ];
-  const executionSnapshot = { mode: readiness.execution?.paperOnly ? 'PAPER / SHADOW' : (readiness.execution?.liveOrders ? 'LIVE' : 'LOCKED'), ready: Boolean(risk.allowed && !isPaused && Date.now() >= kucoinCircuitOpenUntil), killSwitch: safetyController.isActive('kill-switch') || isPaused, circuitBreaker: Date.now() < kucoinCircuitOpenUntil, reconciliation: readiness.checks?.reconciliationHealthy !== false, lifecycle: stages.map(s => ({ key: s.key, status: s.status })) };
+  const executionSnapshot = { mode: readiness.execution?.paperOnly ? 'PAPER / SHADOW' : (readiness.execution?.liveOrders ? 'LIVE' : 'LOCKED'), ready: Boolean(risk.allowed && !isPaused && Date.now() >= kucoinCircuitOpenUntil), killSwitch: safetyController.isActive('kill-switch') || isPaused, circuitBreaker: getKucoinCircuitState() === 'OPEN', circuitState: getKucoinCircuitState(), circuitRemainingMs: Math.max(0, kucoinCircuitOpenUntil - Date.now()), reconciliation: readiness.checks?.reconciliationHealthy !== false, lifecycle: stages.map(s => ({ key: s.key, status: s.status })) };
   jarvisEventBus.emitEvent('EXECUTION:STATE', { symbol, ...executionSnapshot }, { source: 'execution-governance', severity: executionSnapshot.ready ? 'INFO' : 'WARN', persist: true, persistReplay: true, persistMinIntervalMs: 0 });
   jarvisEventBus.emitEvent('PORTFOLIO:SNAPSHOT', { symbol, equity, grossExposureUSD: gross, longNotionalUSD: longNotional, shortNotionalUSD: shortNotional, unrealizedPnL, openPositions: positions.length, maxConcentrationPct: maxConcentration }, { source: 'portfolio', persist: false });
   return {
@@ -5865,7 +5907,7 @@ async function getDashboardExecutionPortfolio(symbol) {
       gateReason: risk.allowed ? 'RISK APPROVED' : (risk.reason || 'RISK BLOCKED'),
       reconciliation: readiness.checks?.reconciliationHealthy !== false,
       killSwitch: safetyController.isActive('kill-switch') || isPaused,
-      circuitBreaker: Date.now() < kucoinCircuitOpenUntil
+      circuitBreaker: getKucoinCircuitState() === 'OPEN', circuitState: getKucoinCircuitState(), circuitRemainingMs: Math.max(0, kucoinCircuitOpenUntil - Date.now())
     },
     lifecycle: stages,
     latestDecision: latest,

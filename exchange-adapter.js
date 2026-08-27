@@ -53,6 +53,9 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     this.marketDataTimeoutMs = Number(this.config.KUCOIN_MARKET_DATA_TIMEOUT_MS || 7000);
     this.marketDataRetries = Number.isInteger(Number(this.config.KUCOIN_MARKET_DATA_RETRIES)) ? Number(this.config.KUCOIN_MARKET_DATA_RETRIES) : 0;
     this.granularityMinutes = { '1d': 1440, '4h': 240, '1h': 60, '15m': 15, '5m': 5, '1m': 1 };
+    this.klineCache = new Map();
+    this.klineInflight = new Map();
+    this.klineCacheTtlMs = Number(this.config.KUCOIN_KLINE_CACHE_TTL_MS || 3000);
   }
 
   getCapabilities() {
@@ -86,24 +89,39 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     const from = now - (limit + 10) * timeframeMs;
     const to = now;
     const url = `https://api-futures.kucoin.com/api/v1/kline/query?symbol=${futuresSymbol}&granularity=${granularity}&from=${from}&to=${to}`;
-    const res = await this.futuresRequest(url, { timeout: this.marketDataTimeoutMs, retryCount: this.marketDataRetries });
-    if (res?.data?.code !== '200000' || !Array.isArray(res.data.data)) return null;
+    const cacheKey = `${futuresSymbol}:${timeframe}:${limit}`;
+    const cached = this.klineCache.get(cacheKey);
+    if (cached && (now - cached.at) < this.klineCacheTtlMs) return cached.data;
+    const existing = this.klineInflight.get(cacheKey);
+    if (existing) return existing;
 
-    const context = `${futuresSymbol}/${timeframe}`;
-    return res.data.data.map(c => {
-      const time = parseInt(c[0], 10);
-      const open = this.parseFloatSafe(c[1], 'open', context);
-      const high = this.parseFloatSafe(c[2], 'high', context);
-      const low = this.parseFloatSafe(c[3], 'low', context);
-      const close = this.parseFloatSafe(c[4], 'close', context);
-      const volume = this.parseFloatSafe(c[5], 'volume', context);
-      if (!Number.isFinite(time) || [open, high, low, close, volume].some(v => v === null || !Number.isFinite(v))) return null;
-      return { time, open, high, low, close, volume };
-    }).filter(Boolean)
-      .sort((a, b) => a.time - b.time)
-      // KuCoin timestamps are candle OPEN timestamps. Never use a forming candle.
-      .filter(c => c.time + timeframeMs <= now)
-      .slice(-limit);
+    const requestPromise = (async () => {
+      try {
+        const res = await this.futuresRequest(url, { timeout: this.marketDataTimeoutMs, retryCount: this.marketDataRetries });
+        if (res?.data?.code !== '200000' || !Array.isArray(res.data.data)) return null;
+
+        const context = `${futuresSymbol}/${timeframe}`;
+        const data = res.data.data.map(c => {
+          const time = parseInt(c[0], 10);
+          const open = this.parseFloatSafe(c[1], 'open', context);
+          const high = this.parseFloatSafe(c[2], 'high', context);
+          const low = this.parseFloatSafe(c[3], 'low', context);
+          const close = this.parseFloatSafe(c[4], 'close', context);
+          const volume = this.parseFloatSafe(c[5], 'volume', context);
+          if (!Number.isFinite(time) || [open, high, low, close, volume].some(v => v === null || !Number.isFinite(v))) return null;
+          return { time, open, high, low, close, volume };
+        }).filter(Boolean)
+          .sort((a, b) => a.time - b.time)
+          .filter(c => c.time + timeframeMs <= now);
+        const limited = data.slice(-limit);
+        this.klineCache.set(cacheKey, { at: Date.now(), data: limited });
+        return limited;
+      } finally {
+        this.klineInflight.delete(cacheKey);
+      }
+    })();
+    this.klineInflight.set(cacheKey, requestPromise);
+    return requestPromise;
   }
 
   async getTicker(symbol) {
