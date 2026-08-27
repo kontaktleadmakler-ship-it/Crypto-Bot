@@ -50,12 +50,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     this.getFuturesSymbol = getFuturesSymbol;
     this.parseFloatSafe = parseFloatSafe;
     this.config = config || {};
-    this.marketDataTimeoutMs = Number(this.config.KUCOIN_MARKET_DATA_TIMEOUT_MS || 7000);
-    this.marketDataRetries = Number.isInteger(Number(this.config.KUCOIN_MARKET_DATA_RETRIES)) ? Number(this.config.KUCOIN_MARKET_DATA_RETRIES) : 0;
     this.granularityMinutes = { '1d': 1440, '4h': 240, '1h': 60, '15m': 15, '5m': 5, '1m': 1 };
-    this.klineCache = new Map();
-    this.klineInflight = new Map();
-    this.klineCacheTtlMs = Number(this.config.KUCOIN_KLINE_CACHE_TTL_MS || 3000);
   }
 
   getCapabilities() {
@@ -72,7 +67,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
   async healthCheck() {
     const started = Date.now();
     const url = 'https://api-futures.kucoin.com/api/v1/contracts/active';
-    const res = await this.futuresRequest(url, { timeout: this.marketDataTimeoutMs, retryCount: this.marketDataRetries });
+    const res = await this.futuresRequest(url, { timeout: 5000 });
     if (res?.data?.code !== '200000' || !Array.isArray(res.data.data)) {
       throw new Error('KuCoin Futures health check returned invalid response');
     }
@@ -89,46 +84,31 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     const from = now - (limit + 10) * timeframeMs;
     const to = now;
     const url = `https://api-futures.kucoin.com/api/v1/kline/query?symbol=${futuresSymbol}&granularity=${granularity}&from=${from}&to=${to}`;
-    const cacheKey = `${futuresSymbol}:${timeframe}:${limit}`;
-    const cached = this.klineCache.get(cacheKey);
-    if (cached && (now - cached.at) < this.klineCacheTtlMs) return cached.data;
-    const existing = this.klineInflight.get(cacheKey);
-    if (existing) return existing;
+    const res = await this.futuresRequest(url, { timeout: 5000 });
+    if (res?.data?.code !== '200000' || !Array.isArray(res.data.data)) return null;
 
-    const requestPromise = (async () => {
-      try {
-        const res = await this.futuresRequest(url, { timeout: this.marketDataTimeoutMs, retryCount: this.marketDataRetries });
-        if (res?.data?.code !== '200000' || !Array.isArray(res.data.data)) return null;
-
-        const context = `${futuresSymbol}/${timeframe}`;
-        const data = res.data.data.map(c => {
-          const time = parseInt(c[0], 10);
-          const open = this.parseFloatSafe(c[1], 'open', context);
-          const high = this.parseFloatSafe(c[2], 'high', context);
-          const low = this.parseFloatSafe(c[3], 'low', context);
-          const close = this.parseFloatSafe(c[4], 'close', context);
-          const volume = this.parseFloatSafe(c[5], 'volume', context);
-          if (!Number.isFinite(time) || [open, high, low, close, volume].some(v => v === null || !Number.isFinite(v))) return null;
-          return { time, open, high, low, close, volume };
-        }).filter(Boolean)
-          .sort((a, b) => a.time - b.time)
-          .filter(c => c.time + timeframeMs <= now);
-        const limited = data.slice(-limit);
-        this.klineCache.set(cacheKey, { at: Date.now(), data: limited });
-        return limited;
-      } finally {
-        this.klineInflight.delete(cacheKey);
-      }
-    })();
-    this.klineInflight.set(cacheKey, requestPromise);
-    return requestPromise;
+    const context = `${futuresSymbol}/${timeframe}`;
+    return res.data.data.map(c => {
+      const time = parseInt(c[0], 10);
+      const open = this.parseFloatSafe(c[1], 'open', context);
+      const high = this.parseFloatSafe(c[2], 'high', context);
+      const low = this.parseFloatSafe(c[3], 'low', context);
+      const close = this.parseFloatSafe(c[4], 'close', context);
+      const volume = this.parseFloatSafe(c[5], 'volume', context);
+      if (!Number.isFinite(time) || [open, high, low, close, volume].some(v => v === null || !Number.isFinite(v))) return null;
+      return { time, open, high, low, close, volume };
+    }).filter(Boolean)
+      .sort((a, b) => a.time - b.time)
+      // KuCoin timestamps are candle OPEN timestamps. Never use a forming candle.
+      .filter(c => c.time + timeframeMs <= now)
+      .slice(-limit);
   }
 
   async getTicker(symbol) {
     const futuresSymbol = this.getFuturesSymbol(symbol);
     if (!futuresSymbol) return null;
     const url = `https://api-futures.kucoin.com/api/v1/ticker?symbol=${futuresSymbol}`;
-    const res = await this.futuresRequest(url, { timeout: Math.min(this.marketDataTimeoutMs, 4000), retryCount: this.marketDataRetries });
+    const res = await this.futuresRequest(url, { timeout: 4000 });
     if (res?.data?.code === '200000' && res.data.data?.price != null) {
       return this.parseFloatSafe(res.data.data.price, 'tickerPrice', futuresSymbol);
     }
@@ -139,7 +119,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     const futuresSymbol = this.getFuturesSymbol(symbol);
     if (!futuresSymbol) return null;
     const url = `https://api-futures.kucoin.com/api/v1/mark-price/${futuresSymbol}/current`;
-    const res = await this.futuresRequest(url, { timeout: Math.min(this.marketDataTimeoutMs, 4000), retryCount: this.marketDataRetries });
+    const res = await this.futuresRequest(url, { timeout: 4000 });
     if (res?.data?.code === '200000' && res.data.data?.value != null) {
       return this.parseFloatSafe(res.data.data.value, 'markPrice', futuresSymbol);
     }
@@ -150,7 +130,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     const futuresSymbol = this.getFuturesSymbol(symbol);
     if (!futuresSymbol) return null;
     const url = `https://api-futures.kucoin.com/api/v1/contracts/${futuresSymbol}`;
-    const res = await this.futuresRequest(url, { timeout: Math.min(this.marketDataTimeoutMs, 4000), retryCount: this.marketDataRetries });
+    const res = await this.futuresRequest(url, { timeout: 4000 });
     if (res?.data?.code !== '200000' || !res.data.data) return null;
     const oi = this.parseFloatSafe(res.data.data.openInterestVal ?? res.data.data.openInterest, 'openInterest', symbol);
     const funding = this.parseFloatSafe(res.data.data.fundingFeeRate, 'fundingRate', symbol);
@@ -161,7 +141,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     const futuresSymbol = this.getFuturesSymbol(symbol);
     if (!futuresSymbol) return null;
     const url = `https://api-futures.kucoin.com/api/v1/level2/snapshot?symbol=${futuresSymbol}`;
-    const res = await this.futuresRequest(url, { timeout: Math.min(this.marketDataTimeoutMs, 3000), retryCount: this.marketDataRetries });
+    const res = await this.futuresRequest(url, { timeout: 3000 });
     if (res?.data?.code !== '200000' || !res.data.data) return null;
     const bids = res.data.data.bids || [];
     const asks = res.data.data.asks || [];
@@ -185,7 +165,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
 
   async getActiveContracts() {
     const url = 'https://api-futures.kucoin.com/api/v1/contracts/active';
-    const res = await this.futuresRequest(url, { timeout: Math.max(this.marketDataTimeoutMs, 8000), retryCount: this.marketDataRetries });
+    const res = await this.futuresRequest(url, { timeout: 8000 });
     if (res?.data?.code !== '200000' || !Array.isArray(res.data.data)) return [];
     return res.data.data;
   }
@@ -195,11 +175,30 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     const res = await this.request(url, { timeout: 6000 });
     if (res?.data?.code !== '200000' || !Array.isArray(res.data.data?.ticker)) return [];
     const blacklist = ['USDC-USDT', 'FDUSD-USDT', 'TUSD-USDT', 'EUR-USDT', 'DAI-USDT', 'USDP-USDT', 'KCS-USDT', 'WBTC-USDT'];
-    return res.data.data.ticker
+    const filtered = res.data.data.ticker
       .filter(x => x.symbol?.endsWith('-USDT') && !blacklist.includes(x.symbol) && !x.symbol.includes('3L') && !x.symbol.includes('3S'))
-      .sort((a, b) => Number(b.volValue || 0) - Number(a.volValue || 0))
-      .slice(0, limit)
-      .map(x => x.symbol);
+      .sort((a, b) => Number(b.volValue || 0) - Number(a.volValue || 0));
+    // Cache the full bulk-ticker payload (price/change/volume for every
+    // symbol) from this single request so callers that need a cheap,
+    // whole-universe market snapshot (e.g. a live dashboard) don't have to
+    // issue a separate per-symbol request for each coin - this one call
+    // already contains everything needed for a lightweight overview.
+    this._lastAllTickers = filtered;
+    this._lastAllTickersAt = Date.now();
+    return filtered.slice(0, limit).map(x => x.symbol);
+  }
+
+  // Cheap, whole-universe snapshot built from the same response
+  // getTopSpotPairs() already fetched - no extra HTTP calls. Returns [] if
+  // getTopSpotPairs() hasn't run yet or the cached data is stale.
+  getCachedTickerSnapshot(maxAgeMs = 120000) {
+    if (!this._lastAllTickers || Date.now() - (this._lastAllTickersAt || 0) > maxAgeMs) return [];
+    return this._lastAllTickers.map(x => ({
+      symbol: x.symbol,
+      price: Number(x.last) || 0,
+      changePct: Number(x.changeRate) * 100 || 0,
+      volume24hUSD: Number(x.volValue) || 0
+    }));
   }
 }
 
