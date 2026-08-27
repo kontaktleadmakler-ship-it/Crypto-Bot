@@ -8,3 +8,28 @@ assert(Array.isArray(features));
 assert.strictEqual(features.length, FEATURE_NAMES.length);
 assert(features.every(Number.isFinite));
 console.log('ML legacy training fallback test: OK');
+
+
+const normalizedLegacy = {
+  pnlUSD: -3,
+  direction: 'SHORT',
+  signalScore: 61,
+  adxAtEntry: 24,
+  rsiAtEntry: 47,
+  relativeVolumeAtEntry: 1.2,
+  atrPctAtEntry: 1.4,
+  hurstAtEntry: 0.55,
+  macdHistogramPctAtEntry: -0.02,
+  pocDistancePctAtEntry: 0.2,
+  vwapDistancePctAtEntry: -0.1,
+  trend4hAtEntry: 'BEARISH',
+  trend1hAtEntry: 'BEARISH',
+  trend15mAtEntry: 'RANGING',
+  btcTrendAtEntry: 'BEARISH',
+  marketPhase: 'RANGING'
+};
+const normalizedFeatures = m.featuresFromTrade(normalizedLegacy);
+assert(Array.isArray(normalizedFeatures));
+assert.strictEqual(normalizedFeatures.length, FEATURE_NAMES.length);
+assert(normalizedFeatures.every(Number.isFinite));
+console.log('ML normalized legacy-without-price test: OK');
