@@ -586,7 +586,14 @@ const config = {
 
   LOCK_ACQUIRE_RETRIES: parseInt(process.env.LOCK_ACQUIRE_RETRIES, 10) || 30,
   LOCK_ACQUIRE_RETRY_DELAY_MS: parseInt(process.env.LOCK_ACQUIRE_RETRY_DELAY_MS, 10) || 5000,
-  LOCK_STALE_AFTER_MS: parseInt(process.env.LOCK_STALE_AFTER_MS, 10) || 90 * 1000,
+  // A heartbeat every few seconds means a lock that has stopped updating for
+  // even 30-45s is already overwhelming evidence the owning process is dead
+  // (crashed, OOM-killed, or force-replaced) — no signal handler can run in
+  // those cases, so staleness detection (not graceful release) is the only
+  // backstop. A multi-minute default here just turns every hard-kill into
+  // several minutes of avoidable downtime on every redeploy.
+  LOCK_STALE_AFTER_MS: parseInt(process.env.LOCK_STALE_AFTER_MS, 10) || 45 * 1000,
+  LOCK_HEARTBEAT_INTERVAL_MS: parseInt(process.env.LOCK_HEARTBEAT_INTERVAL_MS, 10) || 5000,
 
   FUNDING_INTERVAL_HOURS: parseFloat(process.env.FUNDING_INTERVAL_HOURS) || 8,
   SCAN_STATS_TELEGRAM_EVERY_N_SCANS: parseInt(process.env.SCAN_STATS_TELEGRAM_EVERY_N_SCANS, 10) || 4,
@@ -1287,7 +1294,7 @@ function startLockHeartbeat(instanceId) {
   lockHeartbeatInterval = setInterval(async () => {
     if (!isDbConnected || !lockCollection) return;
     try { await lockCollection.updateOne({ _id: 'instanceLock', instanceId }, { $set: { lastSeen: new Date() } }); } catch (e) {}
-  }, 15_000);
+  }, config.LOCK_HEARTBEAT_INTERVAL_MS);
 }
 
 async function loadPersistedFilterState() {
@@ -6390,15 +6397,40 @@ async function runExecutionRecovery() {
 async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
+  logger.info?.(`[SHUTDOWN] ${signal} received, shutting down gracefully...`);
   cronJobs.forEach(j => j.stop());
   intervalTimers.forEach(t => clearInterval(t));
   if (dbBulkTimer) clearInterval(dbBulkTimer);
   if (lockHeartbeatInterval) clearInterval(lockHeartbeatInterval);
   if (dbReconnectInterval) { clearInterval(dbReconnectInterval); dbReconnectInterval = null; }
-  await processDbBulkQueue();
   server.close();
-  await releaseInstanceLock();
-  try { await client.close(); } catch (e) {}
+
+  // Orchestration platforms (Render, k8s, ...) send SIGTERM but only grant a
+  // finite grace period before SIGKILL. If SIGKILL lands before this handler
+  // finishes, releaseInstanceLock() never runs and the mongo lock document is
+  // orphaned with a frozen lastSeen — the next deploy then has to wait out the
+  // full LOCK_STALE_AFTER_MS window before it can take over. To guarantee the
+  // lock is freed within that grace period:
+  //   1. Release the lock FIRST, before any other (potentially slow/hanging)
+  //      cleanup work such as flushing the DB bulk queue.
+  //   2. Wrap the whole shutdown in a hard deadline so a stuck network call
+  //      (e.g. a degraded MongoDB connection) can never block process exit.
+  const withTimeout = (promise, ms, label) => Promise.race([
+    promise,
+    new Promise(resolve => setTimeout(() => { logger.warn?.(`[SHUTDOWN] ${label} timed out after ${ms}ms, continuing`); resolve(undefined); }, ms))
+  ]);
+
+  const hardExitTimer = setTimeout(() => {
+    logger.error?.('[SHUTDOWN] Hard deadline exceeded, forcing exit.');
+    process.exit(0);
+  }, 8000);
+  hardExitTimer.unref?.();
+
+  await withTimeout(releaseInstanceLock(), 2000, 'releaseInstanceLock');
+  await withTimeout(processDbBulkQueue(), 3000, 'processDbBulkQueue');
+  await withTimeout(client.close().catch(() => {}), 2000, 'client.close');
+
+  clearTimeout(hardExitTimer);
   process.exit(0);
 }
 
