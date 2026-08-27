@@ -56,6 +56,7 @@ function classificationMetrics(probabilities, labels, threshold = 0.5) {
   const recall = tp + fn ? tp / (tp + fn) : 0;
   const specificity = tn + fp ? tn / (tn + fp) : 0;
   const precision = tp + fp ? tp / (tp + fp) : 0;
+  const balancedAccuracy = (recall + specificity) / 2;
   const predictedPositive = tp + fp;
   const predictedNegative = tn + fn;
   return { tp, tn, fp, fn, precision, recall, specificity, balancedAccuracy, predictedPositive, predictedNegative };
