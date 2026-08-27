@@ -4834,11 +4834,18 @@ app.use(express.json({ limit: '256kb' }));
 // Institutional API boundary: authenticated by default, fail-closed.
 app.use((req, res, next) => {
   // Liveness endpoint is intentionally public: UptimeRobot cannot supply
-  // the bot's private API key. Authentication remains mandatory everywhere else.
-  if (req.path === '/health' || req.path === '/dashboard' || req.path.startsWith('/api/dashboard/')) return next();
+  // the bot's private API key. Authentication remains mandatory everywhere else,
+  // including the dashboard and its /api/dashboard/* data endpoints, which
+  // expose live strategy/portfolio internals and must never be reachable by
+  // an unauthenticated caller on a publicly bound (0.0.0.0) deployment.
+  if (req.path === '/health') return next();
   if (config.ALLOW_UNAUTHENTICATED_API) return next();
   if (!config.API_KEY) return res.status(503).json({ error: 'API_KEY_NOT_CONFIGURED' });
-  if (req.get('X-API-Key') !== config.API_KEY) return res.status(401).json({ error: 'UNAUTHORIZED' });
+  // EventSource (used by /api/dashboard/events/stream) cannot set custom
+  // headers, so the key may also be supplied as a query parameter for that
+  // one case. It still must match exactly; nothing is exempted from auth.
+  const suppliedKey = req.get('X-API-Key') || req.query.apiKey;
+  if (suppliedKey !== config.API_KEY) return res.status(401).json({ error: 'UNAUTHORIZED' });
   next();
 });
 
