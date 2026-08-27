@@ -73,6 +73,79 @@ const { route: adaptiveStrategyRoute } = require('./adaptive-strategy-router');
 const { compare: counterfactualCompare } = require('./counterfactual-decision-engine');
 const { MarketDataReplay } = require('./market-data-replay.js');
 const { buildCoinTimeline } = require('./coin-timeline.js');
+const { downloadOHLCV, writeDataset, GRANULARITY } = require('./scripts/download-ohlcv');
+const fs = require('fs');
+const path = require('path');
+
+// ==========================================
+// OHLCV RESEARCH DATA MANAGER (Telegram)
+// Background-only: downloads public market data for offline backtests.
+// It never places, modifies or cancels exchange orders.
+// ==========================================
+const OHLCV_DATA_ROOT = path.join(__dirname, 'data', 'ohlcv');
+const ohlcvJobs = new Map();
+
+function normalizeOhlcvSymbol(value) {
+  const raw = String(value || '').trim().toUpperCase();
+  if (!/^[A-Z0-9]{2,20}(?:[-_]?USDT)$/.test(raw)) return null;
+  const base = raw.replace(/[-_]/g, '').replace(/USDT$/, '');
+  if (!base) return null;
+  return `${base}-USDT`;
+}
+
+function ohlcvJobKey(symbol, timeframe) { return `${symbol}:${timeframe}`; }
+
+function startOhlcvDownload({ symbol, timeframe, from, to = Date.now(), chatId, mode = 'download' }) {
+  const key = ohlcvJobKey(symbol, timeframe);
+  const existing = ohlcvJobs.get(key);
+  if (existing && ['queued', 'running'].includes(existing.status)) return { existing: true, job: existing };
+
+  const job = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, key, symbol, timeframe, from, to, chatId: String(chatId), mode, status: 'queued', startedAt: Date.now(), updatedAt: Date.now(), percent: 0, candles: 0, requests: 0, error: null, file: null, cancelled: false };
+  ohlcvJobs.set(key, job);
+
+  (async () => {
+    job.status = 'running'; job.updatedAt = Date.now();
+    try {
+      const dataset = await downloadOHLCV({
+        symbol, timeframe, from, to,
+        logger: { log: msg => logger.info(msg) },
+        shouldContinue: () => !job.cancelled && !isShuttingDown,
+        onProgress: progress => {
+          job.percent = Number(progress.percent || 0);
+          job.candles = progress.candles || 0;
+          job.requests = progress.requests || 0;
+          job.updatedAt = Date.now();
+        }
+      });
+      if (job.cancelled) { job.status = 'cancelled'; return; }
+      job.file = writeDataset(dataset, OHLCV_DATA_ROOT);
+      job.percent = 100; job.candles = dataset.bars.length; job.requests = dataset.requests; job.quality = dataset.quality; job.status = 'completed'; job.updatedAt = Date.now();
+      await sendTelegramReply(job.chatId, `✅ <b>OHLCV DOWNLOAD FERTIG</b>\n━━━━━━━━━━━━━━━━━━\n<b>${escapeHtml(symbol)} · ${escapeHtml(timeframe)}</b>\nKerzen: <b>${dataset.bars.length.toLocaleString('de-DE')}</b>\nRequests: ${dataset.requests}\nGaps: ${dataset.quality.missingBars}\nDuplicates: ${dataset.quality.duplicates}\nInvalid: ${dataset.quality.invalid}\n\n<code>${escapeHtml(path.relative(__dirname, job.file))}</code>`);
+    } catch (e) {
+      job.error = e.message; job.updatedAt = Date.now();
+      job.status = e.code === 'OHLCV_DOWNLOAD_CANCELLED' ? 'cancelled' : 'failed';
+      if (job.status === 'failed') await sendTelegramReply(job.chatId, `❌ <b>OHLCV DOWNLOAD FEHLGESCHLAGEN</b>\n${escapeHtml(symbol)} · ${escapeHtml(timeframe)}\n<code>${escapeHtml(e.message)}</code>`);
+    }
+  })().catch(e => logger.error(`[OHLCV] Background job fatal: ${e.message}`));
+  return { existing: false, job };
+}
+
+function listOhlcvDatasets() {
+  const result = [];
+  if (!fs.existsSync(OHLCV_DATA_ROOT)) return result;
+  for (const symbol of fs.readdirSync(OHLCV_DATA_ROOT, { withFileTypes: true })) {
+    if (!symbol.isDirectory()) continue;
+    for (const file of fs.readdirSync(path.join(OHLCV_DATA_ROOT, symbol.name))) {
+      if (!file.endsWith('.json')) continue;
+      const filePath = path.join(OHLCV_DATA_ROOT, symbol.name, file);
+      try {
+        const meta = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        result.push({ symbol: meta.symbol || symbol.name, timeframe: meta.timeframe || file.slice(0, -5), from: meta.from, to: meta.to, bars: meta.bars?.length || 0, quality: meta.quality || {}, file: path.relative(__dirname, filePath) });
+      } catch (e) { logger.warn(`[OHLCV] Dataset konnte nicht gelesen werden ${filePath}: ${e.message}`); }
+    }
+  }
+  return result.sort((a, b) => `${a.symbol}:${a.timeframe}`.localeCompare(`${b.symbol}:${b.timeframe}`));
+}
 
 // ==========================================
 // 1. LOGGER, LOG-SPEICHER & GLOBALE ZUSTÄNDE
@@ -436,7 +509,12 @@ const TELEGRAM_COMMANDS_V24_6 = [
   { command: 'status', description: 'Bot Status' },
   { command: 'stats', description: 'Tagesperformance' },
   { command: 'pause', description: 'Bot pausieren' },
-  { command: 'resume', description: 'Bot fortsetzen' }
+  { command: 'resume', description: 'Bot fortsetzen' },
+  { command: 'download', description: 'Historische OHLCV-Daten laden' },
+  { command: 'download_status', description: 'OHLCV Download-Status' },
+  { command: 'download_cancel', description: 'OHLCV Download abbrechen' },
+  { command: 'datasets', description: 'Lokale OHLCV-Datasets anzeigen' },
+  { command: 'update', description: 'OHLCV-Dataset inkrementell aktualisieren' }
 ];
 
 async function registerTelegramCommands() {
@@ -4088,7 +4166,12 @@ async function handleTelegramCommand(chatId, text) {
       `<b>🤖 Künstliche Intelligenz & DQN:</b>\n` +
       `/ki [Frage] - Marktanalyse per KI abfragen\n` +
       `/report - Automatisches KI-Trading Briefing\n` +
-      `/retrain - TensorFlow.js & DQN Agent neu trainieren\n\n` +
+      `/retrain - TensorFlow.js & DQN Agent neu trainieren\n` +
+      `/download BTC-USDT 2020 15m - Historische OHLCV-Daten laden\n` +
+      `/download_status - Download-Fortschritt\n` +
+      `/download_cancel - Download abbrechen\n` +
+      `/datasets - Lokale Datasets anzeigen\n` +
+      `/update BTC-USDT 15m - Dataset fortschreiben\n\n` +
       `<b>🚨 Trade-Steuerung:</b>\n` +
       `/close [Symbol] - Einzelnen Trade schließen (z. B. <code>/close BTC-USDT</code>)\n` +
       `/closeall - ALLE aktiven Trades sofort schließen\n` +
@@ -4234,6 +4317,62 @@ async function handleTelegramCommand(chatId, text) {
       logger.error(`Gemini Briefing Fehler: ${e.message}`);
       await sendTelegramReply(chatId, `⚠️ <b>Briefing fehlgeschlagen:</b> Die KI ist momentan überlastet oder nicht erreichbar.`);
     }
+    return;
+  }
+
+  if (command === '/download' || command === '/update') {
+    const symbol = normalizeOhlcvSymbol(args[0]);
+    const timeframe = args[2] || (command === '/download' ? '15m' : null);
+    if (!symbol || !timeframe || !GRANULARITY[timeframe]) {
+      await sendTelegramReply(chatId, '⚠️ Syntax: <code>/download BTC-USDT 2020 15m</code>\noder <code>/update BTC-USDT 15m</code>');
+      return;
+    }
+    let from;
+    if (command === '/update') {
+      const existing = listOhlcvDatasets().find(x => x.symbol === symbol && x.timeframe === timeframe);
+      from = existing?.to || Date.now() - 30 * 86400000;
+    } else {
+      const year = Number(args[1]);
+      if (!Number.isInteger(year) || year < 2017 || year > new Date().getUTCFullYear()) {
+        await sendTelegramReply(chatId, '⚠️ Bitte ein gültiges Startjahr angeben (z. B. <code>2020</code>).');
+        return;
+      }
+      from = Date.UTC(year, 0, 1);
+    }
+    const active = ohlcvJobs.get(ohlcvJobKey(symbol, timeframe));
+    if (active && ['queued', 'running'].includes(active.status)) {
+      await sendTelegramReply(chatId, `⏳ Für <b>${escapeHtml(symbol)} ${escapeHtml(timeframe)}</b> läuft bereits ein Download. Nutze /download_status.`);
+      return;
+    }
+    const result = startOhlcvDownload({ symbol, timeframe, from, to: Date.now(), chatId, mode: command.slice(1) });
+    await sendTelegramReply(chatId, `📥 <b>OHLCV DOWNLOAD GESTARTET</b>\n━━━━━━━━━━━━━━━━━━\nSymbol: <b>${escapeHtml(symbol)}</b>\nTimeframe: <b>${escapeHtml(timeframe)}</b>\nStart: <b>${new Date(from).toISOString().slice(0,10)}</b>\nEnde: <b>${new Date().toISOString().slice(0,10)}</b>\nJob: <code>${escapeHtml(result.job.id)}</code>\n\nNutze /download_status für den Fortschritt.`);
+    return;
+  }
+
+  if (command === '/download_status') {
+    const jobs = [...ohlcvJobs.values()].filter(j => ['queued', 'running'].includes(j.status));
+    if (!jobs.length) { await sendTelegramReply(chatId, 'ℹ️ Kein laufender OHLCV-Download.'); return; }
+    const lines = jobs.map(j => {
+      const age = Math.max(0, Math.round((Date.now() - j.updatedAt) / 1000));
+      return `📥 <b>${escapeHtml(j.symbol)} · ${escapeHtml(j.timeframe)}</b>\n${Math.round(j.percent)}% | ${j.candles.toLocaleString('de-DE')} Kerzen | ${j.requests} Requests | Update vor ${age}s`;
+    });
+    await sendTelegramReply(chatId, `<b>📊 OHLCV DOWNLOAD STATUS</b>\n━━━━━━━━━━━━━━━━━━\n${lines.join('\n\n')}\n\n/download_cancel zum Abbrechen`);
+    return;
+  }
+
+  if (command === '/download_cancel') {
+    const jobs = [...ohlcvJobs.values()].filter(j => ['queued', 'running'].includes(j.status));
+    if (!jobs.length) { await sendTelegramReply(chatId, 'ℹ️ Kein laufender OHLCV-Download.'); return; }
+    jobs.forEach(j => { j.cancelled = true; j.updatedAt = Date.now(); });
+    await sendTelegramReply(chatId, `🛑 ${jobs.length} OHLCV-Download${jobs.length === 1 ? '' : 's'} zum Abbruch markiert.`);
+    return;
+  }
+
+  if (command === '/datasets') {
+    const datasets = listOhlcvDatasets();
+    if (!datasets.length) { await sendTelegramReply(chatId, '📦 Keine lokalen OHLCV-Datasets vorhanden.\nNutze z. B. <code>/download BTC-USDT 2020 15m</code>.'); return; }
+    const lines = datasets.map(d => `• <b>${escapeHtml(d.symbol)} ${escapeHtml(d.timeframe)}</b> — ${d.bars.toLocaleString('de-DE')} Bars\n  ${String(d.from).slice(0,10)} → ${String(d.to).slice(0,10)} | gaps=${d.quality.missingBars || 0} | ${escapeHtml(d.file)}`);
+    await sendTelegramReply(chatId, `<b>📦 LOKALE OHLCV-DATASETS</b>\n━━━━━━━━━━━━━━━━━━\n${lines.join('\n')}`);
     return;
   }
 
