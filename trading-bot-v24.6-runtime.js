@@ -75,7 +75,7 @@ const { MarketDataReplay } = require('./market-data-replay.js');
 const { buildCoinTimeline } = require('./coin-timeline.js');
 const { downloadOHLCV, writeDataset, GRANULARITY } = require('./scripts/download-ohlcv');
 const fs = require('fs');
-const path = require('path');
+
 
 // ==========================================
 // OHLCV RESEARCH DATA MANAGER (Telegram)
@@ -5524,7 +5524,7 @@ app.get('/dashboard', (req, res) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
-  res.sendFile(require('node:path').join(__dirname, 'dashboard.html'));
+  res.sendFile(path.join(__dirname, 'dashboard.html'));
 });
 
 app.get('/api/dashboard/build', (req, res) => {
