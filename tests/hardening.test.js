@@ -21,7 +21,7 @@ assert.equal(r.allowed, true);
 risk.setKillSwitch('test');
 assert.equal(risk.evaluate({ equityUSD: 10000, dailyPnL: 0, peakEquityUSD: 10000, activeTrades: [], direction: 'LONG', notionalUSD: 1000, maxConcurrent: 3, maxSameDirection: 2, maxExposureRatio: .6, maxDailyLossUSD: 250, maxDrawdownPercent: 25, leverage: 3 }).allowed, false);
 
-const main = fs.readFileSync(path.join(root, 'trading-bot-v22.2.1.js'), 'utf8');
+const main = fs.readFileSync(path.join(root, 'archive', 'legacy-bot-versions', 'trading-bot-v22.2.1.js'), 'utf8');
 const ml = fs.readFileSync(path.join(root, 'ml-engine.js'), 'utf8');
 const rl = fs.readFileSync(path.join(root, 'rl-engine.js'), 'utf8');
 const bt = fs.readFileSync(path.join(root, 'backtest-engine.js'), 'utf8');

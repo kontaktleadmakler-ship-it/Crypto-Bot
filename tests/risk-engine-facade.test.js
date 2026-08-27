@@ -1,0 +1,16 @@
+'use strict';
+const assert = require('assert');
+const { RiskEngine } = require('../risk-engine');
+const cfg = { CAPITAL_USD: 1000, LEVERAGE: 2, MAX_DRAWDOWN_PERCENT: 20, MAX_DAILY_LOSS_USD: 100, MAX_WEEKLY_DRAWDOWN_PERCENT: 10, MAX_CONCURRENT_TRADES: 2, MAX_SAME_DIRECTION: 1, MAX_CONSECUTIVE_LOSSES: 3, MAX_EXPOSURE_RATIO: 0.5 };
+const engine = () => new RiskEngine({ config: cfg, logger: { warn() {} } });
+let r = engine().assess({ equity: 1000, peakEquity: 1000, dailyPnL: 0, weeklyPnL: 0, openPositions: [], direction: 'LONG', consecutiveLosses: 0, proposed: { notionalUSD: 100 }});
+assert.strictEqual(r.allowed, true);
+r = engine().assess({ equity: 1000, peakEquity: 1000, openPositions: [{direction:'LONG',notionalUSD:100}], direction:'LONG', proposed:{notionalUSD:100} });
+assert.strictEqual(r.reason, 'max-same-direction');
+r = engine().assess({ equity: 1000, peakEquity: 1000, openPositions: [{notionalUSD:900}], proposed:{notionalUSD:200} });
+assert.strictEqual(r.reason, 'max-exposure');
+r = engine().assess({ equity: 1000, peakEquity: 1000, dailyPnL:-100 });
+assert.strictEqual(r.allowed, false); assert.strictEqual(r.reason, 'daily-loss-limit');
+r = engine().assess({ equity: 700, peakEquity:1000 });
+assert.strictEqual(r.state, 'EMERGENCY');
+console.log('risk-engine-facade: PASS');
