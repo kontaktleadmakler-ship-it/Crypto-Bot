@@ -68,7 +68,7 @@ async function fetchWindow(symbol, timeframe, from, to, retries = 4) {
   throw new Error(`KuCoin Kline-Abruf fehlgeschlagen: ${lastError?.message || 'unknown error'}`);
 }
 
-async function downloadOHLCV({ symbol = 'BTC-USDT', timeframe = '15m', from, to = Date.now(), delayMs = 150, logger = console }) {
+async function downloadOHLCV({ symbol = 'BTC-USDT', timeframe = '15m', from, to = Date.now(), delayMs = 150, logger = console, shouldContinue = () => true, onProgress = null }) {
   if (!GRANULARITY[timeframe]) throw new Error(`Unsupported timeframe: ${timeframe}`);
   const end = parseTime(to, Date.now());
   const start = parseTime(from, end - 30 * 86400000);
@@ -79,6 +79,11 @@ async function downloadOHLCV({ symbol = 'BTC-USDT', timeframe = '15m', from, to 
   let cursor = end;
   let requests = 0;
   while (cursor > start) {
+    if (!shouldContinue()) {
+      const error = new Error('OHLCV download cancelled');
+      error.code = 'OHLCV_DOWNLOAD_CANCELLED';
+      throw error;
+    }
     const windowFrom = Math.max(start, cursor - windowMs);
     const rows = await fetchWindow(symbol, timeframe, windowFrom, cursor);
     requests++;
@@ -89,6 +94,7 @@ async function downloadOHLCV({ symbol = 'BTC-USDT', timeframe = '15m', from, to 
     cursor = minTime - 1;
     if (delayMs > 0) await sleep(delayMs);
     logger.log?.(`[OHLCV] ${symbol} ${timeframe}: request=${requests}, candles=${all.length}`);
+    onProgress?.({ symbol, timeframe, start, end, cursor, requests, candles: all.length, percent: Math.max(0, Math.min(100, ((end - cursor) / (end - start)) * 100)) });
   }
   const map = new Map();
   for (const bar of all) map.set(bar.time, bar);
