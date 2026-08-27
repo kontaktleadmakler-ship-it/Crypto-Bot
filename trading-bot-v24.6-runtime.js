@@ -1224,7 +1224,21 @@ async function tryAcquireLockOnce(instanceId) {
 async function acquireInstanceLock() {
   const instanceId = process.env.INSTANCE_ID || `primary-${process.pid}-${Date.now()}`;
   try {
-    for (let attempt = 1; attempt <= config.LOCK_ACQUIRE_RETRIES; attempt++) {
+    // The retry budget must comfortably outlast LOCK_STALE_AFTER_MS: only once
+    // the previous owner's lease is provably stale can this instance take over.
+    // A fixed retry-count budget shorter than the staleness window (e.g. the
+    // historical 30 * 2000ms = 60s budget against a 300s staleness window) can
+    // never succeed after an unclean shutdown (SIGKILL/OOM/crash) of the
+    // previous owner, causing an infinite deploy crash-loop. Derive the budget
+    // from the actual staleness window plus a safety margin instead of relying
+    // on two independently-configured constants staying in sync.
+    const minWaitMs = config.LOCK_STALE_AFTER_MS + (3 * config.LOCK_ACQUIRE_RETRY_DELAY_MS);
+    const configuredWaitMs = config.LOCK_ACQUIRE_RETRIES * config.LOCK_ACQUIRE_RETRY_DELAY_MS;
+    const totalWaitMs = Math.max(minWaitMs, configuredWaitMs);
+    const maxAttempts = Math.max(config.LOCK_ACQUIRE_RETRIES, Math.ceil(totalWaitMs / config.LOCK_ACQUIRE_RETRY_DELAY_MS));
+    const deadline = Date.now() + totalWaitMs;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const acquired = await tryAcquireLockOnce(instanceId);
       if (acquired) {
         currentInstanceId = instanceId;
@@ -1236,7 +1250,7 @@ async function acquireInstanceLock() {
         logger.info(`[INSTANCE-LOCK] acquired owner=${instanceId} attempt=${attempt}`);
         return instanceId;
       }
-      if (attempt < config.LOCK_ACQUIRE_RETRIES) {
+      if (Date.now() < deadline) {
         let ownerInfo = '';
         try {
           const lockDoc = await lockCollection.findOne({ _id: 'instanceLock' });
@@ -1245,8 +1259,11 @@ async function acquireInstanceLock() {
             ownerInfo = ` owner=${lockDoc.instanceId} ageMs=${ageMs ?? 'unknown'} staleAfterMs=${config.LOCK_STALE_AFTER_MS}`;
           }
         } catch (_) {}
-        logger.warn(`[INSTANCE-LOCK] busy; retry ${attempt}/${config.LOCK_ACQUIRE_RETRIES}${ownerInfo}`);
+        const remainingMs = Math.max(0, deadline - Date.now());
+        logger.warn(`[INSTANCE-LOCK] busy; retry ${attempt}/${maxAttempts} remainingMs=${remainingMs}${ownerInfo}`);
         await sleep(config.LOCK_ACQUIRE_RETRY_DELAY_MS);
+      } else {
+        break;
       }
     }
     logger.error('🔴 Konnte Instance-Lock nicht erwerben – beende Prozess.');
