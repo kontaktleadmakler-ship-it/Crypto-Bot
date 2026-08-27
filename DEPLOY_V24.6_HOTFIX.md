@@ -16,4 +16,4 @@ Recommended Render Start Command:
 npm start
 ```
 
-Existing `node trading-bot-v21.1-tfjs.js` commands remain compatible through a wrapper.
+Existing `node archive/legacy-bot-versions/trading-bot-v21.1-tfjs.js` commands remain compatible through a wrapper.

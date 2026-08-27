@@ -19,7 +19,7 @@ Die bestehende Codebasis verwendet MongoDB, Telegram, TensorFlow.js/DQN, KuCoin-
 | `src/tracker.js` | Paper-Trade-Mark-to-market/Stop/TP-Hilfslogik |
 | `src/telegram-bot.js` | Telegram Polling/Send + bounded queue |
 | `src/index.js` | Dependency-Injection/Composition Root für die neuen Services |
-| `trading-bot-v21.1-tfjs.js` | Kritische Fixes, gemeinsame Indikatoren, bounded Telegram/DB queues, API-Key und Health |
+| `archive/legacy-bot-versions/trading-bot-v21.1-tfjs.js` | Kritische Fixes, gemeinsame Indikatoren, bounded Telegram/DB queues, API-Key und Health |
 | `backtest-engine.js` | Gemeinsame Indikatorquelle |
 | `ml-engine.js` | Hyperparameter-Suche nur täglich/alle N Retrains |
 | `rl-engine.js` | `tf.tidy()` für Prediction-Tensoren + sichere Async-Disposition |

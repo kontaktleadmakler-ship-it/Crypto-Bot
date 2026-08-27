@@ -38,6 +38,12 @@ const { VolatilitySurfaceManager } = require('./volatilitySurface');
 const { OrderFlowAnalyzer } = require('./orderFlowAnalyzer');
 const { MacroFilterEngine } = require('./macroFilter'); // <-- Makro & Sentiment Filter (in v21.1 wiederhergestellt)
 const { runBacktest, buildConfig: buildBacktestConfig, optimizeHyperparameters } = require('./backtest-engine');
+const {
+  calculateEMA, calculateEMASeries, calculateRSI, calculateATR, calculateADX,
+  calculateHurstExponent, calculateMACD, calculateVWAP, calculateVolumeProfilePOC,
+  calculateRelativeVolume, checkSwingBreakOfStructure, calculateChoppinessIndex,
+  findSwingStop, aggregate, trend
+} = require('./src/indicators');
 const { KuCoinFuturesAdapter } = require('./exchange-adapter');
 const { ExecutionSimulator } = require('./execution-simulator');
 const { ExecutionIdempotency } = require('./execution-idempotency');
@@ -46,7 +52,6 @@ const { ReconciliationEngine } = require('./reconciliation-engine');
 const { OrderBookEngine } = require('./orderbook-engine');
 const { ExecutionParity } = require('./execution-parity');
 const { RiskEngine } = require('./risk-engine');
-const { RiskGovernor } = require('./risk-governor');
 const { splitWalkForward } = require('./walk-forward-validator');
 const { evaluateProbabilities } = require('./ml-evaluation');
 const { evaluateActions } = require('./dqn-evaluation');
@@ -269,7 +274,7 @@ function queueTelegramMessage(taskFn) {
   telegramQueue = telegramQueue.then(async () => {
     try {
       await taskFn();
-    } catch (e) {}
+    } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
   });
   return telegramQueue;
 }
@@ -360,7 +365,7 @@ async function persistAlertHistoryEntry(key, timestamp) {
       { $set: { lastSent: timestamp } },
       { upsert: true }
     );
-  } catch (e) {}
+  } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
 }
 
 async function sendDeduplicatedAlert(key, text, cooldownMs = 300000) {
@@ -1095,6 +1100,7 @@ async function processDbBulkQueue() {
     if (closeOps.length > 0) await closedTradesCollection.bulkWrite(closeOps);
     apiLatencyStats.record('mongodb', Date.now() - startTime);
   } catch (e) {
+    logger.error?.(`[DB-BULK] Persistenz fehlgeschlagen; Batch wird gepuffert: ${e.message}`);
     dbBulkQueue.push(...batch);
   }
 }
@@ -1104,12 +1110,12 @@ async function loadPauseState() {
   try {
     const doc = await botStateCollection.findOne({ _id: 'botControl' });
     if (doc) isPaused = !!doc.isPaused;
-  } catch (e) {}
+  } catch (e) { logger.warn?.(`[STATE] botControl-Laden fehlgeschlagen: ${e.message}`); }
 }
 
 async function persistPauseState() {
-  if (!botStateCollection || !isDbConnected) return;
-  try { await botStateCollection.updateOne({ _id: 'botControl' }, { $set: { isPaused } }, { upsert: true }); } catch (e) {}
+  if (!botStateCollection || !isDbConnected) { riskEngine.setKillSwitch(true, 'state-persistence-unavailable:botControl'); return false; }
+  try { await botStateCollection.updateOne({ _id: 'botControl' }, { $set: { isPaused } }, { upsert: true }); } catch (e) { logger.error?.(`[STATE] botControl-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:botControl'); return false; }
 }
 
 let lastMLHistoryRecoveryAt = 0;
@@ -1335,7 +1341,7 @@ async function acquireInstanceLock() {
           const remainingLeaseMs = ageMs === null ? null : Math.max(0, config.LOCK_STALE_AFTER_MS - ageMs);
           ownerInfo = ` owner=${lockDoc.instanceId} ageMs=${ageMs ?? 'unknown'} remainingLeaseMs=${remainingLeaseMs ?? 'unknown'} staleAfterMs=${config.LOCK_STALE_AFTER_MS}`;
         }
-      } catch (_) {}
+      } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
 
       const remainingMs = Math.max(0, deadline - Date.now());
       logger.warn(`[INSTANCE-LOCK] busy; retry ${attempt}/${maxAttempts} remainingMs=${remainingMs}${ownerInfo}`);
@@ -1481,7 +1487,7 @@ async function logFilterChange(filterKey, action, oldValue, newValue, user = 'Te
         newValue,
         user
       });
-    } catch (e) {}
+    } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
   }
   logger.info(`⚙️ [FILTER CHANGE] ${filterKey} (${action}): ${oldValue} -> ${newValue}`);
 }
@@ -1553,7 +1559,7 @@ async function initDatabase() {
       await filterChangeLogCollection.createIndex({ timestamp: -1 });
       await paperOrdersCollection.createIndex({ symbol: 1, simulatedAt: -1 });
       await executionIdempotencyCollection.createIndex({ createdAt: 1 }, { expireAfterSeconds: 7 * 24 * 3600 });
-    } catch (e) {}
+    } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
 
     if (dbReconnectInterval) { clearInterval(dbReconnectInterval); dbReconnectInterval = null; }
     const runtimeDoc = await botStateCollection.findOne({ _id: 'runtimeConfig' });
@@ -1648,17 +1654,17 @@ async function loadDailyPnLState() {
       dailyNetPnL = 0;
       await persistDailyPnLState();
     }
-  } catch (e) {}
+  } catch (e) { logger.error?.(`[STATE] dailyPnL-Laden fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-load-failed:dailyPnL'); throw e; }
 }
 
 async function persistDailyPnLState() {
-  if (!botStateCollection || !isDbConnected) return;
-  try { await botStateCollection.updateOne({ _id: 'dailyPnL' }, { $set: { value: dailyNetPnL, dateUTC: todayUTCString() } }, { upsert: true }); } catch (e) {}
+  if (!botStateCollection || !isDbConnected) { riskEngine.setKillSwitch(true, 'state-persistence-unavailable:dailyPnL'); return false; }
+  try { await botStateCollection.updateOne({ _id: 'dailyPnL' }, { $set: { value: dailyNetPnL, dateUTC: todayUTCString() } }, { upsert: true }); } catch (e) { logger.error?.(`[STATE] dailyPnL-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:dailyPnL'); return false; }
 }
 
 async function persistPeakCapital() {
-  if (!botStateCollection || !isDbConnected) return;
-  try { await botStateCollection.updateOne({ _id: 'peakCapital' }, { $set: { value: peakCapital } }, { upsert: true }); } catch (e) {}
+  if (!botStateCollection || !isDbConnected) { riskEngine.setKillSwitch(true, 'state-persistence-unavailable:peakCapital'); return false; }
+  try { await botStateCollection.updateOne({ _id: 'peakCapital' }, { $set: { value: peakCapital } }, { upsert: true }); } catch (e) { logger.error?.(`[STATE] peakCapital-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:peakCapital'); return false; }
 }
 
 async function persistCriticalState(operation, label) {
@@ -1707,17 +1713,11 @@ async function executePaperExecutionThroughCore({
   spreadPct = Infinity,
   marketDataAgeMs = Infinity,
   risk = { allowed: false, reason: 'UNKNOWN' },
-  riskGovernorContext = null,
-  riskGovernorAction = 'OPEN',
-  riskGovernorReducedSize = false
+  riskContext = null
 }) {
   const side = String(direction).toUpperCase() === 'SHORT' ? 'SELL' : 'BUY';
 
-  riskGovernor.assertExecutionAllowed({
-    action,
-    proposed: riskGovernorContext?.proposed || { notionalUSD: Number(quantity) * Number(referencePrice) },
-    reducedSize: riskGovernorReducedSize
-  });
+  riskEngine.assertExecutionAllowed({ action, proposed: riskContext?.proposed || { notionalUSD: Number(quantity) * Number(referencePrice) }, reducedSize: riskContext?.reducedSize === true });
 
   return protectedSubmit({
     symbol,
@@ -1735,7 +1735,7 @@ async function executePaperExecutionThroughCore({
       spreadPct,
       marketDataAgeMs,
       risk,
-      riskGovernorState: riskGovernor.snapshot()
+      riskState: riskEngine.snapshot()
     }),
     orderBookValid,
     spreadPct,
@@ -1909,7 +1909,7 @@ async function isCoinDynamicallyBlacklisted(symbol) {
         return true;
       }
     }
-  } catch (e) {}
+  } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
   return false;
 }
 
@@ -2016,27 +2016,6 @@ function calculateSharpeRatio(dailyReturns, riskFreeRate = 0.02) {
   return stdDev === 0 ? 0 : ((avgReturn - riskFreeRate / 365) / stdDev) * Math.sqrt(365);
 }
 
-function canOpenNewTrade(activeTradesCount, direction, notionalUSD = 0) {
-  if (!isDbConnected) return { allowed: false, reason: 'skippedDbDisconnected' };
-  if (activeTradesCount >= config.MAX_CONCURRENT_TRADES) return { allowed: false, reason: 'skippedMaxConcurrentTrades' };
-  if (dailyNetPnL <= -config.MAX_DAILY_LOSS_USD) return { allowed: false, reason: 'skippedDailyLossLimit' };
-
-  const currentEquity = config.CAPITAL_USD + dailyNetPnL;
-  if (checkGlobalDrawdown(currentEquity)) return { allowed: false, reason: 'skippedMaxDrawdown' };
-
-  if (direction) {
-    const sameCount = [...activeTrades.values()].filter(t => t.direction === direction).length;
-    if (sameCount >= config.MAX_SAME_DIRECTION) return { allowed: false, reason: 'skippedMaxSameDirection' };
-  }
-
-  const totalNotional = [...activeTrades.values()].reduce((sum, t) => sum + (t.notionalUSD || 0), 0) + notionalUSD;
-  const leverage = Math.max(1, Number(config.LEVERAGE) || 1);
-  const totalMarginUSD = totalNotional / leverage;
-  if (totalMarginUSD > currentEquity * config.MAX_EXPOSURE_RATIO) return { allowed: false, reason: 'skippedExposureLimit' };
-
-  return { allowed: true, reason: null };
-}
-
 function calculatePositionSize(entryPrice, stopLossPrice, capitalUSD, riskPercent) {
   const riskAmountUSD = capitalUSD * (riskPercent / 100);
   const riskPerUnit = Math.abs(entryPrice - stopLossPrice);
@@ -2079,221 +2058,6 @@ function getFuturesSymbol(spotSymbol) {
 // ==========================================
 // 10. INDIKATOREN & HURST-EXPONENT
 // ==========================================
-function calculateEMA(prices, period) {
-  if (!prices || prices.length < period) return prices ? prices[prices.length - 1] : 0;
-  const k = 2 / (period + 1);
-  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
-  return ema;
-}
-
-function calculateEMASeries(values, period) {
-  if (!values || values.length < period) return [];
-  const k = 2 / (period + 1);
-  const series = new Array(values.length).fill(null);
-  let ema = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  series[period - 1] = ema;
-  for (let i = period; i < values.length; i++) {
-    ema = values[i] * k + ema * (1 - k);
-    series[i] = ema;
-  }
-  return series;
-}
-
-function calculateRSI(prices, period = 14) {
-  if (!prices || prices.length <= period) return 50;
-  let gains = 0, losses = 0;
-  for (let i = 1; i <= period; i++) {
-    const diff = prices[i] - prices[i - 1];
-    if (diff >= 0) gains += diff; else losses += Math.abs(diff);
-  }
-  let avgGain = gains / period, avgLoss = losses / period;
-  for (let i = period + 1; i < prices.length; i++) {
-    const diff = prices[i] - prices[i - 1];
-    if (diff >= 0) {
-      avgGain = (avgGain * (period - 1) + diff) / period;
-      avgLoss = (avgLoss * (period - 1)) / period;
-    } else {
-      avgGain = (avgGain * (period - 1)) / period;
-      avgLoss = (avgLoss * (period - 1) + Math.abs(diff)) / period;
-    }
-  }
-  const rs = avgGain / (avgLoss === 0 ? 0.001 : avgLoss);
-  return 100 - (100 / (1 + rs));
-}
-
-function calculateATR(candles, period = 14) {
-  if (!candles || candles.length < period + 1) return 0;
-  let tr = [];
-  for (let i = 1; i < candles.length; i++) {
-    tr.push(Math.max(
-      candles[i].high - candles[i].low,
-      Math.abs(candles[i].high - candles[i - 1].close),
-      Math.abs(candles[i].low - candles[i - 1].close)
-    ));
-  }
-  return tr.slice(-period).reduce((a, b) => a + b, 0) / period;
-}
-
-// Finds the most recent swing low/high over `lookback` closed candles
-// (excludes the current, still-forming candle) to anchor the stop-loss to
-// real market structure instead of a rigid ATR multiple.
-function findSwingStop(candles, direction, lookback = 10) {
-  if (!candles || candles.length < lookback + 1) return null;
-  const sample = candles.slice(-lookback - 1, -1);
-  return direction === 'LONG'
-    ? Math.min(...sample.map(c => c.low))
-    : Math.max(...sample.map(c => c.high));
-}
-
-function calculateChoppinessIndex(candles, period = 14) {
-  if (!candles || candles.length < period + 1) return 50;
-  const sample = candles.slice(-period);
-  const highest = Math.max(...sample.map(c => c.high));
-  const lowest = Math.min(...sample.map(c => c.low));
-  let sumTR = 0;
-  for (let i = 1; i < sample.length; i++) {
-    sumTR += Math.max(sample[i].high - sample[i].low, Math.abs(sample[i].high - sample[i - 1].close), Math.abs(sample[i].low - sample[i - 1].close));
-  }
-  const range = highest - lowest;
-  if (range === 0) return 50;
-  return Number((100 * (Math.log10(sumTR / range) / Math.log10(period))).toFixed(1));
-}
-
-function calculateADX(candles, period = 14) {
-  if (!candles || candles.length < period * 2 + 10) return 0;
-  let tr = [], pDM = [], mDM = [];
-  for (let i = 1; i < candles.length; i++) {
-    const high = candles[i].high, low = candles[i].low;
-    const prevClose = candles[i - 1].close, prevHigh = candles[i - 1].high, prevLow = candles[i - 1].low;
-    tr.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
-    const upMove = high - prevHigh, downMove = prevLow - low;
-    pDM.push(upMove > downMove && upMove > 0 ? upMove : 0);
-    mDM.push(downMove > upMove && downMove > 0 ? downMove : 0);
-  }
-  let smoothTR = tr.slice(0, period).reduce((a, b) => a + b, 0);
-  let smoothpDM = pDM.slice(0, period).reduce((a, b) => a + b, 0);
-  let smoothmDM = mDM.slice(0, period).reduce((a, b) => a + b, 0);
-  let dxList = [];
-  for (let i = period; i < tr.length; i++) {
-    smoothTR   = smoothTR   - smoothTR   / period + tr[i]   / period;
-    smoothpDM  = smoothpDM  - smoothpDM  / period + pDM[i]  / period;
-    smoothmDM  = smoothmDM  - smoothmDM  / period + mDM[i]  / period;
-    const pDI = (smoothpDM / (smoothTR || 1)) * 100;
-    const mDI = (smoothmDM / (smoothTR || 1)) * 100;
-    const diDiff = Math.abs(pDI - mDI);
-    const diSum = pDI + mDI;
-    dxList.push(diSum === 0 ? 0 : (diDiff / diSum) * 100);
-  }
-  if (dxList.length < period) return 0;
-  return Number((dxList.slice(-period).reduce((a, b) => a + b, 0) / period).toFixed(1));
-}
-
-function calculateHurstExponent(prices) {
-  // Bug fixed: this previously computed a SINGLE Rescaled-Range value over
-  // the entire price window (H = log(R/S) / log(n)) - a single-scale
-  // estimate is noisy/biased and, worse, was inconsistent with
-  // backtest-engine.js's calculateHurstExponent, which already used the
-  // statistically correct approach (multiple window sizes, log-log
-  // regression of R/S vs. window size -> the slope is the Hurst exponent).
-  // Live and backtest now compute Hurst identically.
-  if (!prices || prices.length < 50) return 0.5;
-  const returns = [];
-  for (let i = 1; i < prices.length; i++) returns.push(Math.log(prices[i] / prices[i - 1]));
-
-  const sizes = [8, 16, 32].filter(s => s < returns.length / 2);
-  if (sizes.length < 2) return 0.5;
-
-  const points = [];
-  for (const size of sizes) {
-    const rsValues = [];
-    for (let i = 0; i + size <= returns.length; i += size) {
-      const segment = returns.slice(i, i + size);
-      const mean = segment.reduce((a, b) => a + b, 0) / segment.length;
-      let cumSum = 0, max = -Infinity, min = Infinity, variance = 0;
-      for (const r of segment) {
-        cumSum += r - mean;
-        max = Math.max(max, cumSum);
-        min = Math.min(min, cumSum);
-        variance += Math.pow(r - mean, 2);
-      }
-      const sd = Math.sqrt(variance / segment.length);
-      if (sd > 0 && max > min) rsValues.push((max - min) / sd);
-    }
-    if (rsValues.length) {
-      const avgRS = rsValues.reduce((a, b) => a + b, 0) / rsValues.length;
-      points.push([Math.log(size), Math.log(avgRS)]);
-    }
-  }
-  if (points.length < 2) return 0.5;
-
-  const meanX = points.reduce((a, p) => a + p[0], 0) / points.length;
-  const meanY = points.reduce((a, p) => a + p[1], 0) / points.length;
-  const num = points.reduce((a, p) => a + (p[0] - meanX) * (p[1] - meanY), 0);
-  const den = points.reduce((a, p) => a + Math.pow(p[0] - meanX, 2), 0);
-  const hurst = den ? num / den : 0.5;
-  return Number(Math.max(0, Math.min(1, hurst)).toFixed(3));
-}
-
-function calculateMACD(closes) {
-  if (!closes || closes.length < 35) return { macd: 0, signal: 0, histogram: 0 };
-  const ema12Series = calculateEMASeries(closes, 12);
-  const ema26Series = calculateEMASeries(closes, 26);
-  const macdSeries = [];
-  for (let i = 0; i < closes.length; i++) {
-    if (ema12Series[i] != null && ema26Series[i] != null) macdSeries.push(ema12Series[i] - ema26Series[i]);
-  }
-  if (macdSeries.length < 9) {
-    const macdLine = macdSeries[macdSeries.length - 1] || 0;
-    return { macd: macdLine, signal: 0, histogram: macdLine };
-  }
-  const signalSeries = calculateEMASeries(macdSeries, 9);
-  const macdLine = macdSeries[macdSeries.length - 1];
-  const signalLine = signalSeries[signalSeries.length - 1] ?? 0;
-  return { macd: macdLine, signal: signalLine, histogram: macdLine - signalLine };
-}
-
-// Punkt 8 - VWAP-Konsistenz: Berechnung lebt jetzt ausschließlich in
-// ./vwap-calculator.js und wird von Live-Bot und Backtest-Engine gemeinsam
-// genutzt, damit beide bei identischen Eingabedaten bitgenau dasselbe Ergebnis
-// liefern.
-const { calculateVWAP } = require('./vwap-calculator');
-
-function calculateVolumeProfilePOC(candles, lookback = 30, binsCount = 20) {
-  if (!candles || candles.length < lookback) return null;
-  const sample = candles.slice(-lookback);
-  let minPrice = Infinity, maxPrice = -Infinity;
-  sample.forEach(c => { if (c.low < minPrice) minPrice = c.low; if (c.high > maxPrice) maxPrice = c.high; });
-  const step = (maxPrice - minPrice) / binsCount;
-  if (step === 0) return minPrice;
-  const bins = new Array(binsCount).fill(0);
-  sample.forEach(c => {
-    const avgPrice = (c.high + c.low + c.close) / 3;
-    const binIndex = Math.min(Math.floor((avgPrice - minPrice) / step), binsCount - 1);
-    bins[binIndex] += c.volume;
-  });
-  let maxVolBin = 0, maxVol = 0;
-  bins.forEach((vol, idx) => { if (vol > maxVol) { maxVol = vol; maxVolBin = idx; } });
-  return Number((minPrice + (maxVolBin + 0.5) * step).toFixed(4));
-}
-
-function calculateRelativeVolume(candles, lookback = 20) {
-  if (!candles || candles.length < lookback + 1) return 1;
-  const current = candles[candles.length - 1].volume;
-  const previous = candles.slice(-lookback - 1, -1);
-  const avgVolume = previous.reduce((a, c) => a + c.volume, 0) / previous.length;
-  return avgVolume === 0 ? 1 : current / avgVolume;
-}
-
-function checkSwingBreakOfStructure(candles, lookback = 10) {
-  if (!candles || candles.length < lookback + 2) return { bosBullish: false, bosBearish: false };
-  const current = candles[candles.length - 1];
-  const prevCandles = candles.slice(-lookback - 2, -2);
-  const highestClose = Math.max(...prevCandles.map(c => c.close));
-  const lowestClose = Math.min(...prevCandles.map(c => c.close));
-  return { bosBullish: current.close > highestClose, bosBearish: current.close < lowestClose };
-}
-
 // Punkt 11 - Dynamisches Scoring-System: die Gewichtung der Indikatoren war
 // bisher statisch, obwohl unterschiedliche Marktphasen unterschiedliche
 // Anforderungen haben. In TRENDING-Märkten zählen ADX und MACD (klassische
@@ -2344,7 +2108,6 @@ logger.info(`🔌 Exchange Adapter: ${exchangeAdapter.name} | Execution: DISABLE
 const executionSimulator = new ExecutionSimulator({ config, logger });
 const executionParity = new ExecutionParity({ config, simulator: executionSimulator });
 const riskEngine = new RiskEngine({ config, logger });
-const riskGovernor = new RiskGovernor({ config, logger });
 const paperExecutionIdempotency = new ExecutionIdempotency({
   collection: null,
   logger,
@@ -2406,17 +2169,17 @@ function deriveHigherTimeframes(candles15m, targetTimeframe) {
 
 async function fetchKucoinTickerPrice(symbol) {
   try { return await exchangeAdapter.getTicker(symbol); }
-  catch (e) { return null; }
+  catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
 }
 
 async function fetchKucoinMarkPrice(symbol) {
   try { return await exchangeAdapter.getMarkPrice(symbol); }
-  catch (e) { return null; }
+  catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
 }
 
 async function fetchFuturesData(symbol) {
   try { return await exchangeAdapter.getContract(symbol); }
-  catch (e) { return null; }
+  catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
 }
 
 async function fetchOrderBookMetrics(symbol) {
@@ -2527,7 +2290,7 @@ async function processPreloadQueue() {
   isPreloading = true;
   while (preloadQueue.length > 0) {
     const { symbol, timeframe, limit } = preloadQueue.shift();
-    try { await fetchKucoinKlinesCached(symbol, timeframe, limit); } catch (e) {}
+    try { await fetchKucoinKlinesCached(symbol, timeframe, limit); } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
     await sleep(50);
   }
   isPreloading = false;
@@ -2603,6 +2366,15 @@ function formatPeriodPerformanceReport(stats, periodLabel, startDate, endDate) {
   return report;
 }
 
+async function getPeriodNetPnL(daysBack) {
+  if (!closedTradesCollection || !isDbConnected) return 0;
+  try {
+    const since = Date.now() - Number(daysBack) * 86400000;
+    const rows = await closedTradesCollection.find({ closeTime: { $gte: since } }, { projection: { pnlUSD: 1 } }).toArray();
+    return rows.reduce((sum, t) => sum + (Number(t.pnlUSD) || 0), 0);
+  } catch (e) { logger.warn?.(`[RISK] Period-PnL read failed: ${e.message}`); return 0; }
+}
+
 async function getPeriodPerformanceStats(daysBack) {
   if (daysBack <= 0) daysBack = 7;
   try {
@@ -2657,7 +2429,7 @@ async function getPeriodPerformanceStats(daysBack) {
       sharpeRatio: calculateSharpeRatio(dailyPnLs).toFixed(2),
       startDate: startDate.toISOString().slice(0, 10), endDate: now.toISOString().slice(0, 10)
     };
-  } catch (e) { return null; }
+  } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
 }
 
 async function getTimeBasedAnalysis() {
@@ -2674,7 +2446,7 @@ async function getTimeBasedAnalysis() {
       dailyStats[dy].trades++; dailyStats[dy].pnl += pnl; if (pnl > 0) dailyStats[dy].wins++;
     });
     return { hourlyStats, dailyStats };
-  } catch (e) { return null; }
+  } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
 }
 
 async function checkRiskLevels() {
@@ -2731,7 +2503,6 @@ function formatScanStatsReport(stats) {
   if (stats.cooldownActive) reasons.push(`Signal-Cooldown aktiv: ${stats.cooldownActive}`);
   if (stats.positionTooSmallForLot) reasons.push(`Position zu klein für Min-Lot: ${stats.positionTooSmallForLot}`);
   if (stats.agentBlocked) reasons.push(`Agent Supervisor: ${stats.agentBlocked}`);
-  if (stats.riskGovernorBlocked) reasons.push(`Risk Governor: ${stats.riskGovernorBlocked}`);
   if (stats.riskEngineBlocked) reasons.push(`Risk Engine: ${stats.riskEngineBlocked}`);
   if (stats.reconciliationBlocked) reasons.push(`Reconciliation Gate: ${stats.reconciliationBlocked}`);
   if (stats.paperExecutionRejected) reasons.push(`Paper Execution abgelehnt: ${stats.paperExecutionRejected}`);
@@ -3561,7 +3332,7 @@ async function scanMarket() {
         return;
       }
 
-      const preCheck = canOpenNewTrade(activeTrades.size, null);
+      const preCheck = riskEngine.assess({ equity: config.CAPITAL_USD + dailyNetPnL, peakEquity: peakCapital, dailyPnL: dailyNetPnL, openPositions: [...activeTrades.values()] });
       if (!preCheck.allowed) {
         if (preCheck.reason && scanStats.hasOwnProperty(preCheck.reason)) {
           scanStats[preCheck.reason]++;
@@ -3907,39 +3678,16 @@ async function scanMarket() {
             return;
           }
 
-          const governorSnapshot = riskGovernor.evaluate({
-            equity: config.CAPITAL_USD + dailyNetPnL,
-            peakEquity: peakCapital,
-            dailyPnL: dailyNetPnL,
-            openPositions: [...activeTrades.values()],
-            proposed: sizing,
-            spreadPct: Number(orderBookMetrics.spreadPct),
-            slippagePct: Number(config.SLIPPAGE_PERCENT || 0),
-            marketDataAgeMs: Math.max(0, Date.now() - Number(orderBookMetrics.fetchedAt || Date.now()))
-          });
-          if (governorSnapshot.state === 'HALT' || governorSnapshot.state === 'EMERGENCY') {
-            scanStats.riskGovernorBlocked = (scanStats.riskGovernorBlocked || 0) + 1;
-            logger.warn(`[RISK-GOVERNOR] ${governorSnapshot.state}: ${governorSnapshot.reason}`);
-            return;
-          }
-
+          const weeklyPnL = await getPeriodNetPnL(7);
           const riskCheck = riskEngine.assess({
-            equity: config.CAPITAL_USD + dailyNetPnL,
-            peakEquity: peakCapital,
-            dailyPnL: dailyNetPnL,
-            openPositions: [...activeTrades.values()],
-            proposed: sizing
+            equity: config.CAPITAL_USD + dailyNetPnL, peakEquity: peakCapital, dailyPnL: dailyNetPnL, weeklyPnL,
+            openPositions: [...activeTrades.values()], direction, consecutiveLosses, proposed: sizing,
+            spreadPct: Number(orderBookMetrics.spreadPct), slippagePct: Number(config.SLIPPAGE_PERCENT || 0),
+            marketDataAgeMs: Math.max(0, Date.now() - Number(orderBookMetrics.fetchedAt || Date.now()))
           });
           if (!riskCheck.allowed) {
             scanStats.riskEngineBlocked = (scanStats.riskEngineBlocked || 0) + 1;
-            logger.warn(`[RISK-ENGINE] Signal blockiert: ${riskCheck.reason}`);
-            return;
-          }
-
-          const finalCheck = canOpenNewTrade(activeTrades.size, direction, sizing.notionalUSD);
-          if (!finalCheck.allowed) {
-            scanStats[finalCheck.reason] = (scanStats[finalCheck.reason] || 0) + 1;
-            return;
+            logger.warn(`[RISK-ENGINE] Signal blockiert: ${riskCheck.reason}`); return;
           }
 
           let paperOrder = null;
@@ -3957,7 +3705,7 @@ async function scanMarket() {
                 spreadPct: Number(orderBookMetrics.spreadPct),
                 marketDataAgeMs: Math.max(0, Date.now() - Number(orderBookMetrics.fetchedAt || Date.now())),
                 risk: riskCheck,
-                riskGovernorContext: {
+                riskContext: {
                   proposed: sizing,
                   equity: config.CAPITAL_USD + dailyNetPnL,
                   peakEquity: peakCapital,
@@ -3965,9 +3713,9 @@ async function scanMarket() {
                   openPositions: [...activeTrades.values()],
                   spreadPct: Number(orderBookMetrics.spreadPct),
                   slippagePct: Number(config.SLIPPAGE_PERCENT || 0),
-                  marketDataAgeMs: Math.max(0, Date.now() - Number(orderBookMetrics.fetchedAt || Date.now()))
-                },
-                riskGovernorReducedSize: riskGovernor.state === 'REDUCED'
+                  marketDataAgeMs: Math.max(0, Date.now() - Number(orderBookMetrics.fetchedAt || Date.now())),
+                  reducedSize: riskEngine.state === 'REDUCED'
+                }
               });
               paperOrder = executionResult?.remote || null;
               if (executionResult?.state === ExecutionState.UNKNOWN) {
@@ -4967,7 +4715,7 @@ async function handleTelegramCommand(chatId, text) {
     const currentEquity = config.CAPITAL_USD + dailyNetPnL;
     const drawdownPercent = peakCapital > 0 ? ((peakCapital - currentEquity) / peakCapital * 100).toFixed(1) : 0;
     lines.push(`Drawdown: ${drawdownPercent}%`);
-    lines.push(`Risk Governor: <b>${riskGovernor.state}</b> | ${escapeHtml(riskGovernor.reason)}`);
+    lines.push(`Risk State: <b>${riskEngine.state}</b> | ${escapeHtml(riskEngine.reason)}`);
     lines.push(`KuCoin Fehler: ${kucoinErrorCount} | Circuit Breaker: ${Date.now() < kucoinCircuitOpenUntil ? '🚨 AKTIV' : '✅ Inaktiv'}`);
 
     if (activeTrades.size > 0) {
@@ -5087,7 +4835,7 @@ async function pollTelegramUpdates() {
       }
     } catch (e) {
       if (e.response?.status === 409) {
-        try { await axios.get(`https://api.telegram.org/bot${token}/deleteWebhook`); } catch (e2) {}
+        try { await axios.get(`https://api.telegram.org/bot${token}/deleteWebhook`); } catch (e2) { logger.warn?.(`[RUNTIME] Webhook cleanup failed: ${e2.message}`); }
       }
       logger.error(`Telegram poll error: ${e.message}`);
       await sleep(5000);
@@ -5244,7 +4992,7 @@ async function getDashboardPortfolioLearning() {
   for (const [sym, trade] of activeTrades.entries()) {
     const direction = String(trade.direction || 'LONG').toUpperCase();
     let mark = Number(trade.entry || 0);
-    try { mark = Number(await fetchKucoinTickerPrice(sym)) || mark; } catch (_) {}
+    try { mark = Number(await fetchKucoinTickerPrice(sym)) || mark; } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
     const units = Number(trade.positionSizeUnits || trade.quantity || 0);
     const notional = Number(trade.notionalUSD || (Math.abs(units) * mark) || 0);
     const entry = Number(trade.entry || mark);
@@ -5265,7 +5013,7 @@ async function getDashboardPortfolioLearning() {
       const closes=(candles||[]).map(c=>Number(c.close)).filter(Number.isFinite);
       const returns=[]; for(let i=1;i<closes.length;i++) returns.push(closes[i]/closes[i-1]-1);
       series.set(sym, returns.slice(-50));
-    } catch (_) {}
+    } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
   });
   const correlations=[];
   const syms=[...series.keys()];
@@ -5277,7 +5025,7 @@ async function getDashboardPortfolioLearning() {
 
   let closed=[];
   if (closedTradesCollection && isDbConnected) {
-    try { closed = await closedTradesCollection.find({isPartial:{$ne:true},closeTime:{$exists:true}}).sort({closeTime:-1}).limit(500).toArray(); } catch (_) {}
+    try { closed = await closedTradesCollection.find({isPartial:{$ne:true},closeTime:{$exists:true}}).sort({closeTime:-1}).limit(500).toArray(); } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
   }
   const rewards=closed.map(t=>DeepQTheTradingAgent.riskAdjustedReward({pnlUSD:Number(t.pnlUSD||0),drawdownPct:Number(t.drawdownPct||0),slippagePct:Number(t.slippagePct||0),exposurePct:Number(t.exposurePct||0),goodExit:Boolean(t.goodExit)}));
   const avgReward=rewards.length?rewards.reduce((a,b)=>a+b,0)/rewards.length:0;
@@ -5419,7 +5167,7 @@ async function getDashboardScanMatrix() {
       const trend = ma20 > ma50 ? 'BULL' : ma20 < ma50 ? 'BEAR' : 'FLAT';
       const volume24h = candles.slice(-96).reduce((sum, c) => sum + Number(c.volume || 0) * Number(c.close || 0), 0);
       rows.push({ symbol: sym, price, change, rsi, macd: Number(macd.histogram || 0), ma20, ma50, volatility, trend, tech, volume24h, timestamp: now });
-    } catch (_) {}
+    } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
   });
   rows.sort((a,b) => symbols.indexOf(a.symbol) - symbols.indexOf(b.symbol));
   const data = {
@@ -5620,7 +5368,7 @@ async function getDashboardAgentNetwork(symbol) {
     });
     const ml = predictSignalSuccess(mlFeatures);
     if (Number.isFinite(ml?.probability)) mlProbability = Number(ml.probability);
-  } catch (_) {}
+  } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
 
   const equity = config.CAPITAL_USD + dailyNetPnL;
   const gross = [...activeTrades.values()].reduce((sum, t) => sum + Math.abs(Number(t.notionalUSD || 0)), 0);
@@ -5997,7 +5745,7 @@ app.get('/api/dashboard/events/stream', (req, res) => {
   try {
     const replay = jarvisEventBus.recent({ limit: 200, symbol, types: null }).reverse();
     for (const event of replay) send(event);
-  } catch (_) {}
+  } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
   const heartbeat = setInterval(() => res.write(`: heartbeat ${Date.now()}\n\n`), 15000);
   req.on('close', () => { clearInterval(heartbeat); jarvisEventBus.off('event', send); });
 });
@@ -6296,7 +6044,7 @@ app.get('/api/dashboard/historical/status', (req, res) => {
   const fs = require('node:fs');
   const dir = jarvisHistoricalReplay.dir;
   let files = [];
-  try { files = fs.existsSync(dir) ? fs.readdirSync(dir).filter(f => f.endsWith('.jsonl')).sort() : []; } catch (_) {}
+  try { files = fs.existsSync(dir) ? fs.readdirSync(dir).filter(f => f.endsWith('.jsonl')).sort() : []; } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
   res.json({ timestamp: Date.now(), mode: 'READ_ONLY', directory: dir, available: files.length > 0, files: files.slice(-31), liveExecutionTouched: false });
 });
 
