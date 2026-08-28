@@ -2514,8 +2514,7 @@ async function getMarketDataBundle(symbol) {
   if (existing) return existing;
 
   const task = (async () => {
-    try {
-      const raw15m = await fetchKucoinKlinesCached(symbol, '15m', 100);
+    const raw15m = await fetchKucoinKlinesCached(symbol, '15m', 100);
     if (!raw15m || raw15m.length < 20) {
       const err = new Error(`${symbol}/15m market data unavailable`);
       err.code = 'KLINES_UNAVAILABLE';
@@ -2552,13 +2551,12 @@ async function getMarketDataBundle(symbol) {
       fetchOrderBookMetrics(symbol)
     ]);
 
-      return {
-        symbol, raw15m, raw1h, raw4h,
-        futuresData: futuresResult.status === 'fulfilled' ? futuresResult.value : null,
-        orderBookMetrics: orderBookResult.status === 'fulfilled' ? orderBookResult.value : null,
-        fetchedAt: Date.now()
-      };
-    }
+    return {
+      symbol, raw15m, raw1h, raw4h,
+      futuresData: futuresResult.status === 'fulfilled' ? futuresResult.value : null,
+      orderBookMetrics: orderBookResult.status === 'fulfilled' ? orderBookResult.value : null,
+      fetchedAt: Date.now()
+    };
   })();
 
   marketDataInflight.set(key, task);
