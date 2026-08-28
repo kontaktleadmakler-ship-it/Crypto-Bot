@@ -735,7 +735,7 @@ const config = {
   ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false',
   MAX_EXPOSURE_RATIO: parseFloat(process.env.MAX_EXPOSURE_RATIO) || 0.6,
   SCAN_CONCURRENCY: Math.max(6, Math.min(12, parseInt(process.env.SCAN_CONCURRENCY, 10) || 8)),
-  MARKET_DATA_CONCURRENCY: Math.max(6, Math.min(10, parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 6)),
+  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 8,
   MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 0,
   SCAN_ITEM_TIMEOUT_MS: Math.max(45000, Math.min(60000, parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 45000)),
   SCAN_WATCHDOG_MS: Math.max(180000, Math.min(300000, parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 240000)),
@@ -775,7 +775,7 @@ const config = {
   ENABLE_ORDERBOOK_ANALYSIS: process.env.ENABLE_ORDERBOOK_ANALYSIS !== 'false',
   ENABLE_CORRELATION_LIMITS: process.env.ENABLE_CORRELATION_LIMITS !== 'false',
   ENABLE_MULTI_TF_DERIVATION: process.env.ENABLE_MULTI_TF_DERIVATION !== 'false',
-  ENABLE_PRELOADING: process.env.ENABLE_PRELOADING !== 'false',
+  ENABLE_PRELOADING: process.env.ENABLE_PRELOADING === 'true',
   ENABLE_BATCH_SIGNALS: process.env.ENABLE_BATCH_SIGNALS !== 'false',
   ENABLE_TIME_FILTER: process.env.ENABLE_TIME_FILTER !== 'false',
   ORDERBOOK_DEPTH_LEVELS: parseInt(process.env.ORDERBOOK_DEPTH_LEVELS, 10) || 10,
@@ -3243,7 +3243,11 @@ async function asyncPool(concurrency, items, iteratorFn, itemTimeoutMs = config.
     if (!itemTimeoutMs) return Promise.resolve().then(() => iteratorFn(item));
     let timer;
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`asyncPool item timed out after ${itemTimeoutMs}ms`)), itemTimeoutMs);
+      timer = setTimeout(() => {
+        const err = new Error(`asyncPool item timed out after ${itemTimeoutMs}ms`);
+        err.code = 'ASYNC_POOL_ITEM_TIMEOUT';
+        reject(err);
+      }, itemTimeoutMs);
     });
     return Promise.race([Promise.resolve().then(() => iteratorFn(item)), timeout])
       .finally(() => clearTimeout(timer));
