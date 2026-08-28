@@ -2530,7 +2530,6 @@ const marketDataPool = {
 
 async function getMarketDataBundle(symbol) {
   if (isKucoinCircuitOpen()) {
-  if (isKucoinCircuitOpen()) {
     const err = new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
     err.code = 'KUCOIN_CIRCUIT_OPEN';
     throw err;
