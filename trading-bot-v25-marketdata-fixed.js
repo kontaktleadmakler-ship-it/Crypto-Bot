@@ -75,7 +75,6 @@ const { MarketDataReplay } = require('./market-data-replay.js');
 const { buildCoinTimeline } = require('./coin-timeline.js');
 const { downloadOHLCV, writeDataset, GRANULARITY } = require('./scripts/download-ohlcv');
 const fs = require('fs');
-const path = require('path');
 
 // ==========================================
 // OHLCV RESEARCH DATA MANAGER (Telegram)
@@ -670,10 +669,12 @@ const config = {
   // 3 concurrent scan workers keeps each worker's multi-request bundle from
   // creating a burst of 15m/1h/4h/orderbook/futures calls. Operators can
   // override this explicitly through Render environment variables.
-  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 3,
-  SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 75000,
-  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 3,
-  SCAN_WATCHDOG_MS: parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 300000,
+  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 6,
+  SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 60000,
+  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 6,
+  MARKET_DATA_CACHE_TTL_MS: parseInt(process.env.MARKET_DATA_CACHE_TTL_MS, 10) || 55000,
+  MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 45000,
+  SCAN_WATCHDOG_MS: parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 600000,
   MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,
   LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3,
   MARGIN_MODE: (process.env.MARGIN_MODE || 'ISOLATED').toUpperCase(),
@@ -698,7 +699,7 @@ const config = {
   FUNDING_INTERVAL_HOURS: parseFloat(process.env.FUNDING_INTERVAL_HOURS) || 8,
   SCAN_STATS_TELEGRAM_EVERY_N_SCANS: parseInt(process.env.SCAN_STATS_TELEGRAM_EVERY_N_SCANS, 10) || 4,
   
-  MAX_KLINES_CACHE_SIZE: parseInt(process.env.MAX_KLINES_CACHE_SIZE, 10) || 200,
+  MAX_KLINES_CACHE_SIZE: parseInt(process.env.MAX_KLINES_CACHE_SIZE, 10) || 1000,
   CACHE_CLEANUP_MINUTES: parseInt(process.env.CACHE_CLEANUP_MINUTES, 10) || 5,
   
   RISK_WARNING_ENABLED: process.env.RISK_WARNING_ENABLED !== 'false',
@@ -764,7 +765,7 @@ function validateConfig() {
     'PAPER_EXECUTION_LATENCY_MS', 'PAPER_SPREAD_PERCENT', 'PAPER_SLIPPAGE_PERCENT',
     'PAPER_IMPACT_BPS', 'PAPER_MAKER_FEE_PERCENT', 'PAPER_TAKER_FEE_PERCENT', 'PAPER_FILL_RATIO',
     'TP1_CLOSE_PERCENT', 'MAX_EXPOSURE_RATIO',
-    'SCAN_CONCURRENCY', 'MARKET_DATA_CONCURRENCY', 'MAX_CONSECUTIVE_PRICE_FAILURES', 'LEVERAGE',
+    'SCAN_CONCURRENCY', 'MARKET_DATA_CONCURRENCY', 'MARKET_DATA_CACHE_TTL_MS', 'MARKET_DATA_QUEUE_TIMEOUT_MS', 'MAX_CONSECUTIVE_PRICE_FAILURES', 'LEVERAGE',
     'LOCK_ACQUIRE_RETRIES', 'LOCK_ACQUIRE_RETRY_DELAY_MS', 'LOCK_STALE_AFTER_MS',
     'FUNDING_INTERVAL_HOURS', 'SCAN_STATS_TELEGRAM_EVERY_N_SCANS',
     'TREND_EMA_FAST_15M', 'TREND_EMA_SLOW_15M',
@@ -2383,7 +2384,7 @@ async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
   const now = Date.now();
   const cacheKey = `${symbol}_${timeframe}`;
   const cached = klinesCache.get(cacheKey);
-  if (cached && cached.timeframe === timeframe && (now - cached.timestamp) < 55000) {
+  if (cached && cached.timeframe === timeframe && (now - cached.timestamp) < (Number(config.MARKET_DATA_CACHE_TTL_MS) || 55000)) {
     return cached.candles;
   }
   const candles = await fetchKucoinKlines(symbol, timeframe, limit);
@@ -2406,7 +2407,7 @@ const marketDataSemaphore = {
   active: 0,
   queue: [],
   limit: Math.max(1, Number(config.MARKET_DATA_CONCURRENCY || 3)),
-  async acquire(timeoutMs = 10000) {
+  async acquire(timeoutMs = config.MARKET_DATA_QUEUE_TIMEOUT_MS) {
     if (this.active < this.limit) {
       this.active++;
       return true;
@@ -2455,9 +2456,9 @@ async function getMarketDataBundle(symbol) {
   if (existing) return existing;
 
   const task = (async () => {
-    const acquired = await marketDataSemaphore.acquire(10000);
+    const acquired = await marketDataSemaphore.acquire();
     if (!acquired) {
-      const err = new Error(`${symbol} market-data concurrency queue timeout after 10000ms`);
+      const err = new Error(`${symbol} market-data concurrency queue timeout after ${config.MARKET_DATA_QUEUE_TIMEOUT_MS}ms`);
       err.code = 'MARKET_DATA_QUEUE_TIMEOUT';
       throw err;
     }
