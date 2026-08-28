@@ -1,5 +1,13 @@
 'use strict';
-const tf = require('@tensorflow/tfjs-node');
+let tf = null;
+try {
+  tf = require('@tensorflow/tfjs-node');
+} catch (e) {
+  // Native module not installed/compatible with the current Node version.
+  // Don't crash the whole bot at require-time; RL features report
+  // themselves unavailable instead (see init()).
+  tf = null;
+}
 const fs = require('fs');
 const path = require('path');
 const { PrioritizedReplayBuffer } = require('./prioritized-replay');
@@ -101,6 +109,10 @@ class DeepQTheTradingAgent {
 
   async init() {
     if (this.isInitialized) return;
+    if (!tf) {
+      this.logger.warn('[RL-Engine] @tensorflow/tfjs-node nicht verfügbar - RL-Agent bleibt inaktiv (fail-closed).');
+      throw new Error('tfjs-unavailable');
+    }
     fs.mkdirSync(this.modelDir, { recursive: true });
     try {
       const modelPath = path.join(this.modelDir, 'model.json');
