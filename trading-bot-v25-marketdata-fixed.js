@@ -1171,6 +1171,17 @@ async function futuresApiGetWithRetry(url, options = {}, retries = 3, backoffMs 
   finally { futuresApiSemaphore.release(); }
 }
 
+// MARKET-DATA FIX v25.0.12: scanning must never inherit the generic
+// 3-retry/backoff policy. A single 5s request can otherwise consume roughly
+// 18s (5s + 1s + 5s + 2s + 5s), and a bundle contains multiple requests.
+// That is the direct cause of the recurring 20s async-pool timeouts.
+// Market-data calls are already protected by the circuit breaker and bounded
+// concurrency, so a scan request gets exactly one bounded attempt.
+async function marketDataFuturesRequest(url, options = {}) {
+  const timeout = Math.min(Number(options.timeout) || 4000, 4500);
+  return futuresApiGetWithRetry(url, { ...options, timeout }, 0, 0);
+}
+
 async function processDbBulkQueue() {
   if (dbBulkQueue.length === 0 || !isDbConnected) return;
   const batch = [...dbBulkQueue];
@@ -2245,7 +2256,7 @@ function calculateSignalScore(params) {
 const exchangeAdapter = new KuCoinFuturesAdapter({
   logger,
   request: axiosGetWithRetry,
-  futuresRequest: futuresApiGetWithRetry,
+  futuresRequest: marketDataFuturesRequest,
   getFuturesSymbol,
   parseFloatSafe: safeParseFloat,
   config
@@ -2500,9 +2511,9 @@ const marketDataSemaphore = {
   }
 };
 const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
-  12000,
-  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 12000, 5000),
-  Math.max(5000, config.SCAN_ITEM_TIMEOUT_MS - 2000)
+  10000,
+  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 10000, 7000),
+  Math.max(7000, config.SCAN_ITEM_TIMEOUT_MS - 2000)
 );
 
 function isKucoinCircuitOpen() {
