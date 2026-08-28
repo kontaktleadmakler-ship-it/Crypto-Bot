@@ -8,7 +8,7 @@ const axios = require('axios');
  * cancel, amend, or other trading endpoint exists here.
  */
 class KucoinApi {
-  constructor({ logger = console, baseUrl = 'https://api-futures.kucoin.com', maxRetries = 2, circuitThreshold = 8, cooldownMs = 15000 } = {}) {
+  constructor({ logger = console, baseUrl = 'https://api-futures.kucoin.com', maxRetries = 3, circuitThreshold = 3, cooldownMs = 300000 } = {}) {
     this.logger = logger; this.baseUrl = baseUrl.replace(/\/$/, '');
     this.maxRetries = maxRetries; this.circuitThreshold = circuitThreshold; this.cooldownMs = cooldownMs;
     this.errors = 0; this.openUntil = 0;
@@ -25,17 +25,9 @@ class KucoinApi {
         this.errors = 0; this.openUntil = 0; return response;
       } catch (e) {
         last = e;
-        // Do not trip a global market-data breaker on deterministic client
-        // errors (4xx). Only transient network/rate/server failures count.
-        const status = Number(e?.response?.status || 0);
-        const transient = !status || status === 408 || status === 425 || status === 429 || status >= 500;
-        if (transient) this.errors++;
-        else this.errors = 0;
-        if (transient && this.errors >= this.circuitThreshold) {
-          this.openUntil = Date.now() + this.cooldownMs;
-          this.logger?.warn?.(`[KuCoinApi] circuit opened for ${this.cooldownMs}ms after ${this.errors} transient failures`);
-        }
-        if (attempt <= this.maxRetries) await new Promise(r => setTimeout(r, Math.min(4000, 350 * 2 ** (attempt - 1))));
+        this.errors++;
+        if (this.errors >= this.circuitThreshold) this.openUntil = Date.now() + this.cooldownMs;
+        if (attempt <= this.maxRetries) await new Promise(r => setTimeout(r, Math.min(8000, 500 * 2 ** (attempt - 1))));
       }
     }
     throw last;
