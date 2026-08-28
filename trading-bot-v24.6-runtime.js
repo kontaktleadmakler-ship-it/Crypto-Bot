@@ -735,8 +735,8 @@ const config = {
   ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false',
   MAX_EXPOSURE_RATIO: parseFloat(process.env.MAX_EXPOSURE_RATIO) || 0.6,
   SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 3,
-  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 3,
-  MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 5000,
+  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 6,
+  MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 10000,
   SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 30000,
   SCAN_WATCHDOG_MS: parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 300000,
   MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,
@@ -2468,7 +2468,7 @@ async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
 // coalesced and the KuCoin circuit breaker is checked before fan-out.
 const marketDataInflight = new Map();
 const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
-  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 15000, 5000),
+  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 20000, 5000),
   Math.max(5000, config.SCAN_ITEM_TIMEOUT_MS - 1000)
 );
 

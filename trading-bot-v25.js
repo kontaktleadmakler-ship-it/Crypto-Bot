@@ -6,7 +6,7 @@
  * Dynamic import avoids Node's MODULE_TYPELESS_PACKAGE_JSON reparsing warning
  * without globally switching package.json to "type": "module".
  */
-import('./trading-bot-v24.6-runtime.js').catch((err) => {
+import('./trading-bot-v25-marketdata-fixed.js').catch((err) => {
   console.error('[BOOT] Runtime startup failed:', err);
   process.exitCode = 1;
 });
