@@ -3,7 +3,19 @@
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const tf = require('@tensorflow/tfjs-node');
+let tf = null;
+try {
+  tf = require('@tensorflow/tfjs-node');
+} catch (e) {
+  // Native module not installed/compatible with the current Node version.
+  // Don't crash the whole process at require-time - trainModelFromRecords()
+  // below already wraps all tf usage in try/catch and falls back to
+  // gate-only signals when training isn't possible, so a null tf here
+  // just means every retrain attempt reports itself untrained instead of
+  // taking down backtest-engine.js (and everything that requires it) at
+  // startup.
+  tf = null;
+}
 const { TensorFlowSignalModel, FEATURE_NAMES } = require('./ml-engine');
 
 const FUTURES_GRANULARITY_MINUTES = { '1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440 };
@@ -169,6 +181,7 @@ function makeModelRecord(signal, pnlUSD, closeTime){
 }
 
 async function trainModelFromRecords(model,records,cfg){
+  if(!tf) return false;
   if(!records||records.length<cfg.ML_MIN_TRAINING_SAMPLES)return false;
   const positives=records.filter(r=>r.pnlUSD>0).length;
   if(positives<5||records.length-positives<5)return false;
