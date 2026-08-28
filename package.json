@@ -1,6 +1,6 @@
 {
   "name": "crypto-bot-institutional",
-  "version": "25.0.16",
+  "version": "25.0.17",
   "private": true,
   "description": "Signal/Paper/Shadow institutional trading platform with fail-closed production gates and JARVIS live scanner dashboard bridge",
   "scripts": {
@@ -21,9 +21,7 @@
     "ml:recover": "node scripts/recover-ml-history.js",
     "data:download": "node scripts/download-ohlcv.js",
     "data:validate": "node scripts/validate-ohlcv.js",
-    "test:ohlcv": "node tests/ohlcv-downloader.test.js",
-    "check:runtime": "node --check trading-bot-v24.6-runtime.js && node --check trading-bot-v25.js && node --check exchange-adapter.js && node --check kucoin.js && node --check src/api/kucoin.js && node --check ml-engine.js",
-    "test:marketdata-root": "node tests/market-data-root-fix.test.js"
+    "test:ohlcv": "node tests/ohlcv-downloader.test.js"
   },
   "engines": {
     "node": "22.x"
