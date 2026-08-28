@@ -36,7 +36,7 @@ const { DeepQTheTradingAgent } = require('./rl-engine'); // <-- DQN Agent Modul 
 const HedgeManager = require('./hedgeManager');
 const VolatilitySurfaceManager = require('./volatilitySurface');
 const { OrderFlowAnalyzer } = require('./orderFlowAnalyzer');
-const { MacroFilterEngine } = require('./macroFilter'); // <-- Makro & Sentiment Filter (in v21.1 wiederhergestellt)
+const MacroFilterEngine = require('./macroFilter'); // <-- Makro & Sentiment Filter (in v21.1 wiederhergestellt)
 const { runBacktest, buildConfig: buildBacktestConfig, optimizeHyperparameters } = require('./backtest-engine');
 const {
   calculateEMA, calculateEMASeries, calculateRSI, calculateATR, calculateADX,
