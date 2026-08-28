@@ -1,6 +1,6 @@
 'use strict';
 
-import { ExecutionState } from './execution-state-machine.js';
+import { ExecutionState } from './execution-state-machine.mjs';
 import { assertPreTradeSafe } from '../pre-trade-gate.mjs';
 
 /**
