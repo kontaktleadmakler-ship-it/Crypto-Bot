@@ -1,6 +1,6 @@
 # Market-Data Gateway Fix v25.0.9
 
-Replace `trading-bot-v24.6-runtime.js` in the repository with the included file.
+Replace `trading-bot-v24.6-runtime.mjs` in the repository with the included file.
 
 Changes:
 - Central market-data bundle for scanner data.
@@ -17,4 +17,4 @@ Optional env:
 `MARKET_DATA_BUNDLE_TIMEOUT_MS=20000`
 
 Validation:
-`node --check trading-bot-v24.6-runtime.js`
+`node --check trading-bot-v24.6-runtime.mjs`

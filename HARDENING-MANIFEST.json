@@ -2,9 +2,9 @@
   "source": "trading-bot-final-2026-08-25.zip",
   "hardening": [
     "package.json",
-    "symbol-execution-lock.js",
+    "symbol-execution-lock.mjs",
     "durable-state-outbox.js",
-    "pre-trade-gate.js",
+    "pre-trade-gate.mjs",
     "macroFilter.js",
     "orderFlowAnalyzer.js",
     "graceful-shutdown.js",
