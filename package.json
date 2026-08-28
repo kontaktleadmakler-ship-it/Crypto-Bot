@@ -1,7 +1,7 @@
 {
   "name": "crypto-bot-optimized",
-  "version": "2.0.0",
-  "description": "Optimierter modularer Trading-Signal-Bot mit robustem Fehler- und Datenmanagement",
+  "version": "2.1.0",
+  "description": "Optimierter modularer Trading-Signal-Bot mit robustem asyncPool und Timeout-Schutz",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
