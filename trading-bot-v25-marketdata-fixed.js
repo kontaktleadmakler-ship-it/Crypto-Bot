@@ -830,6 +830,7 @@ client.on('error', (err) => {
 let db = null;
 let tradesCollection, closedTradesCollection, botStateCollection, lockCollection, marketPhaseLogsCollection, filterChangeLogCollection;
 let paperOrdersCollection, executionIdempotencyCollection;
+let dashboardScanHistoryCollection;
 const activeTrades = new Map();
 // ===== Integrated Execution Core (P1-P4) =====
 const symbolExecutionLock = new SymbolExecutionLock();
@@ -1589,6 +1590,8 @@ async function initDatabase() {
     filterChangeLogCollection = db.collection('filterChangeLogs');
     paperOrdersCollection = db.collection('paperOrders');
     executionIdempotencyCollection = db.collection('executionIdempotency');
+    // Durable JARVIS scanner history: survives Render restarts/deploy overlap.
+    dashboardScanHistoryCollection = db.collection('dashboardScanHistory');
 
     // Wire persistence after the DB connection is known to be healthy.
     paperExecutionIdempotency.collection = executionIdempotencyCollection;
@@ -1643,6 +1646,9 @@ async function initDatabase() {
       await filterChangeLogCollection.createIndex({ timestamp: -1 });
       await paperOrdersCollection.createIndex({ symbol: 1, simulatedAt: -1 });
       await executionIdempotencyCollection.createIndex({ createdAt: 1 }, { expireAfterSeconds: 7 * 24 * 3600 });
+      await dashboardScanHistoryCollection.createIndex({ ts: -1 });
+      await dashboardScanHistoryCollection.createIndex({ symbol: 1, ts: -1 });
+      await dashboardScanHistoryCollection.createIndex({ eventId: 1 }, { unique: true, sparse: true });
     } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
 
     if (dbReconnectInterval) { clearInterval(dbReconnectInterval); dbReconnectInterval = null; }
@@ -1971,30 +1977,91 @@ function shouldSkipSignal(symbol, direction, score) {
   return false;
 }
 
-async function isCoinDynamicallyBlacklisted(symbol) {
-  if (manualBlacklist.has(symbol)) return true;
-  try {
-    if (!closedTradesCollection || !isDbConnected) return false;
-    const recentTrades = await closedTradesCollection
-      .find({ symbol: symbol })
-      .sort({ closeTime: -1 })
-      .limit(3)
-      .toArray();
+// Dynamic blacklist is a strategy filter, not a reason to perform one MongoDB
+// query per symbol. The old implementation did exactly that inside the scan pool.
+// With ~177 candidates this created a DB request storm and could occupy every
+// scan worker until SCAN_ITEM_TIMEOUT_MS fired.
+//
+// We refresh the blacklist once per scan (one aggregation query), then perform
+// O(1) in-memory lookups for each symbol.
+const dynamicBlacklistCache = new Map();
+const DYNAMIC_BLACKLIST_CACHE_TTL_MS =
+  Math.max(60_000, parseInt(process.env.DYNAMIC_BLACKLIST_CACHE_TTL_MS, 10) || 300_000);
 
-    if (recentTrades.length < 2) return false;
+async function refreshDynamicBlacklist(symbols) {
+  const now = Date.now();
+  const result = new Set();
 
-    const recentConsecutiveLosses = recentTrades.every(t => (t.pnlUSD || 0) < 0);
-    if (recentConsecutiveLosses) {
-      const lastCloseTime = new Date(recentTrades[0].closeTime).getTime();
-      const hoursSinceLoss = (Date.now() - lastCloseTime) / (1000 * 60 * 60);
-
-      if (hoursSinceLoss < 12) {
-        logger.info(`🧠 [AI-Learning] Coin ${symbol} wurde temporär gesperrt wegen 2 Verlusten in Folge.`);
-        return true;
-      }
+  for (const [symbol, entry] of dynamicBlacklistCache) {
+    if (!entry || now - entry.checkedAt > DYNAMIC_BLACKLIST_CACHE_TTL_MS) {
+      dynamicBlacklistCache.delete(symbol);
+    } else if (entry.blacklisted) {
+      result.add(symbol);
     }
-  } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
-  return false;
+  }
+
+  if (!closedTradesCollection || !isDbConnected || !symbols?.length) return result;
+
+  // Only refresh symbols whose cached decision is stale/missing.
+  const staleSymbols = symbols.filter((symbol) => {
+    const entry = dynamicBlacklistCache.get(symbol);
+    return !entry || now - entry.checkedAt > DYNAMIC_BLACKLIST_CACHE_TTL_MS;
+  });
+
+  if (!staleSymbols.length) return result;
+
+  try {
+    const query = closedTradesCollection.aggregate([
+      { $match: { symbol: { $in: staleSymbols } } },
+      { $sort: { symbol: 1, closeTime: -1 } },
+      { $group: { _id: '$symbol', trades: { $push: '$$ROOT' } } },
+      { $project: { trades: { $slice: ['$trades', 3] } } }
+    ]);
+
+    // This is deliberately short. A learning/blacklist lookup must never
+    // stall the market-data scanner.
+    const timeoutMs = Math.max(
+      500,
+      parseInt(process.env.DYNAMIC_BLACKLIST_DB_TIMEOUT_MS, 10) || 3000
+    );
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => {
+        const err = new Error(`dynamic blacklist DB query timed out after ${timeoutMs}ms`);
+        err.code = 'DYNAMIC_BLACKLIST_DB_TIMEOUT';
+        reject(err);
+      }, timeoutMs)
+    );
+
+    const rows = await Promise.race([query.toArray(), timeout]);
+    const bySymbol = new Map(rows.map((row) => [row._id, row.trades || []]));
+
+    for (const symbol of staleSymbols) {
+      const recentTrades = bySymbol.get(symbol) || [];
+      let blacklisted = false;
+
+      if (recentTrades.length >= 2) {
+        const consecutiveLosses = recentTrades.every((t) => (t.pnlUSD || 0) < 0);
+        if (consecutiveLosses) {
+          const lastCloseTime = new Date(recentTrades[0].closeTime).getTime();
+          const hoursSinceLoss = (Date.now() - lastCloseTime) / (1000 * 60 * 60);
+          blacklisted = Number.isFinite(hoursSinceLoss) && hoursSinceLoss < 12;
+        }
+      }
+
+      dynamicBlacklistCache.set(symbol, { checkedAt: now, blacklisted });
+      if (blacklisted) result.add(symbol);
+    }
+  } catch (e) {
+    // Keep previous cached decisions if MongoDB is temporarily slow/down.
+    logger.warn?.(`[DYNAMIC-BLACKLIST] refresh skipped: ${e?.message || e}`);
+  }
+
+  return result;
+}
+
+function isCoinDynamicallyBlacklisted(symbol) {
+  if (manualBlacklist.has(symbol)) return true;
+  return dynamicBlacklistCache.get(symbol)?.blacklisted === true;
 }
 
 // ==========================================
@@ -3187,33 +3254,73 @@ async function getBitcoinTrend() {
 // fulfillment and rejection, and Promise.allSettled so one rejected/
 // timed-out item can never keep the whole pool pending.
 async function asyncPool(concurrency, items, iteratorFn, itemTimeoutMs = config.SCAN_ITEM_TIMEOUT_MS) {
-  const results = [];
-  const executing = [];
-  const withTimeout = (item) => {
-    if (!itemTimeoutMs) return Promise.resolve().then(() => iteratorFn(item));
-    let timer;
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`asyncPool item timed out after ${itemTimeoutMs}ms`)), itemTimeoutMs);
-    });
-    return Promise.race([Promise.resolve().then(() => iteratorFn(item)), timeout])
-      .finally(() => clearTimeout(timer));
-  };
-  for (const item of items) {
-    const p = withTimeout(item).catch((e) => {
-      logger.warn(`[ASYNC-POOL] item failed/timed out: ${e?.message || e}`);
-      return undefined;
-    });
-    results.push(p);
-    if (concurrency <= items.length) {
-      const e = p.finally(() => {
-        const idx = executing.indexOf(e);
-        if (idx !== -1) executing.splice(idx, 1);
-      });
-      executing.push(e);
-      if (executing.length >= concurrency) await Promise.race(executing);
+  const limit = Math.max(1, Number(concurrency) || 1);
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  // The previous Promise.race implementation released a worker when the
+  // timeout fired even though iteratorFn was still running. That caused the
+  // actual concurrency to grow beyond the configured limit and amplified
+  // KuCoin/DB contention. A timeout now reports the item, but the worker is
+  // not reused until the underlying task has really settled.
+  async function worker(workerId) {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+
+      const item = items[index];
+      const startedAt = Date.now();
+      let timer = null;
+      let task = null;
+
+      try {
+        task = Promise.resolve().then(() => iteratorFn(item));
+
+        if (itemTimeoutMs > 0) {
+          const timeout = new Promise((_, reject) => {
+            timer = setTimeout(() => {
+              const err = new Error(`asyncPool item timed out after ${itemTimeoutMs}ms`);
+              err.code = 'ASYNC_POOL_ITEM_TIMEOUT';
+              reject(err);
+            }, itemTimeoutMs);
+          });
+
+          try {
+            results[index] = await Promise.race([task, timeout]);
+          } catch (e) {
+            logger.warn(
+              `[ASYNC-POOL] item failed/timed out worker=${workerId} symbol=${item} ` +
+              `elapsedMs=${Date.now() - startedAt}: ${e?.message || e}`
+            );
+            results[index] = undefined;
+
+            // Critical: do not start another item while the timed-out task is
+            // still running. This preserves the real concurrency bound.
+            try { await task; } catch (_) {}
+          }
+        } else {
+          results[index] = await task;
+        }
+      } catch (e) {
+        logger.warn(
+          `[ASYNC-POOL] item failed worker=${workerId} symbol=${item} ` +
+          `elapsedMs=${Date.now() - startedAt}: ${e?.message || e}`
+        );
+        results[index] = undefined;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     }
   }
-  return Promise.allSettled(results);
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(limit, items.length) },
+      (_, i) => worker(i + 1)
+    )
+  );
+
+  return results.map((value) => ({ status: 'fulfilled', value }));
 }
 
 function evaluateDirectionGates(dir, p, scanStats) {
@@ -3525,6 +3632,9 @@ async function scanMarket() {
 
     let signalsSent = 0;
 
+    // One bounded DB lookup for the whole scan; never query MongoDB per coin.
+    const dynamicBlacklist = await refreshDynamicBlacklist(dynamicWatchlist);
+
     await asyncPool(config.SCAN_CONCURRENCY, dynamicWatchlist, async (symbol) => {
       scanStats.total++;
       dashboardScanState.checked = scanStats.total;
@@ -3534,7 +3644,7 @@ async function scanMarket() {
         return; 
       }
 
-      if (await isCoinDynamicallyBlacklisted(symbol).catch(() => false)) {
+      if (isCoinDynamicallyBlacklisted(symbol) || dynamicBlacklist.has(symbol)) {
         scanStats.skippedDynamicBlacklist++;
         return;
       }
@@ -5168,6 +5278,7 @@ jarvisEventBus.on('event', (event) => {
 
 function dashboardRecordProductionScanCoin(snapshot, severity = 'INFO') {
   if (!snapshot || !snapshot.symbol) return null;
+
   const event = jarvisEventBus.emitEvent('SCAN:COIN', snapshot, {
     source: 'scanner',
     severity,
@@ -5175,7 +5286,63 @@ function dashboardRecordProductionScanCoin(snapshot, severity = 'INFO') {
     persistReplay: true,
     persistMinIntervalMs: 0
   });
+
+  // Persist every scanner observation asynchronously. The dashboard must not
+  // depend on the lifetime of the Render process or the in-memory EventBus.
+  if (dashboardScanHistoryCollection && isDbConnected) {
+    const doc = {
+      ts: Number(event.ts || Date.now()),
+      eventId: event.eventId,
+      type: event.type,
+      severity: event.severity,
+      source: event.source,
+      symbol: String(event.symbol || snapshot.symbol).toUpperCase(),
+      payload: event.payload || {}
+    };
+    void dashboardScanHistoryCollection.updateOne(
+      { eventId: doc.eventId },
+      { $set: doc },
+      { upsert: true }
+    ).catch(err => {
+      logger.warn?.(`[DASHBOARD HISTORY] persist failed: ${err.message}`);
+    });
+  }
+
   return event;
+}
+
+async function hydrateDashboardLiveSnapshotsFromDb({ limit = 1000 } = {}) {
+  if (dashboardLiveCoinSnapshots.size > 0) return;
+  if (!dashboardScanHistoryCollection || !isDbConnected) return;
+
+  try {
+    const rows = await dashboardScanHistoryCollection
+      .find({ type: 'SCAN:COIN' }, { projection: { _id: 0 } })
+      .sort({ ts: -1 })
+      .limit(Math.min(2000, Math.max(50, Number(limit) || 1000)))
+      .toArray();
+
+    // Keep only the newest observation per symbol.
+    for (const row of rows.reverse()) {
+      const symbol = String(row.symbol || row.payload?.symbol || '').toUpperCase();
+      if (!symbol || dashboardLiveCoinSnapshots.has(symbol)) continue;
+      dashboardLiveCoinSnapshots.set(symbol, {
+        ...(row.payload || {}),
+        symbol,
+        eventTs: Number(row.ts || Date.now()),
+        source: 'mongodb-production-scanner'
+      });
+    }
+
+    if (dashboardLiveCoinSnapshots.size) {
+      dashboardLastLiveScanCounter = Math.max(
+        dashboardLastLiveScanCounter,
+        ...[...dashboardLiveCoinSnapshots.values()].map(x => Number(x.scanCounter || 0))
+      );
+    }
+  } catch (err) {
+    logger.warn?.(`[DASHBOARD HISTORY] hydrate failed: ${err.message}`);
+  }
 }
 
 function dashboardLiveScannerRows() {
@@ -5815,7 +5982,8 @@ app.get('/api/dashboard/supervisor', async (req, res) => {
   }
 });
 
-app.get('/api/dashboard/connection', (req, res) => {
+app.get('/api/dashboard/connection', async (req, res) => {
+  await hydrateDashboardLiveSnapshotsFromDb({ limit: 2000 });
   const rows = dashboardLiveScannerRows();
   res.setHeader('Cache-Control','no-store');
   const newestTs = rows.reduce((max, r) => Math.max(max, Number(r?.eventTs || 0)), 0);
@@ -5832,13 +6000,34 @@ app.get('/api/dashboard/connection', (req, res) => {
   });
 });
 
-app.get('/api/dashboard/live-scanner', (req, res) => {
-  const rows = dashboardLiveScannerRows().map(r => ({
-    ...r, ageMs: Math.max(0, Date.now() - Number(r.eventTs || r.timestamp || Date.now())),
-    live: true
-  }));
-  res.setHeader('Cache-Control','no-store');
-  res.json({ timestamp: Date.now(), source: 'PRODUCTION_SCANNER', scan: { ...dashboardScanState, universe: dashboardScanUniverse, lastLiveScanCounter: dashboardLastLiveScanCounter }, rows });
+app.get('/api/dashboard/live-scanner', async (req, res) => {
+  try {
+    // Critical for Render: the HTTP/dashboard process may be a new process
+    // while another process previously owned the instance lock. In-memory
+    // EventBus state is not shared between processes, so recover the latest
+    // production observations from MongoDB before returning an empty matrix.
+    await hydrateDashboardLiveSnapshotsFromDb({ limit: 2000 });
+
+    const rows = dashboardLiveScannerRows().map(r => ({
+      ...r,
+      ageMs: Math.max(0, Date.now() - Number(r.eventTs || r.timestamp || Date.now())),
+      live: true
+    }));
+    res.setHeader('Cache-Control','no-store, no-cache, must-revalidate');
+    res.json({
+      timestamp: Date.now(),
+      source: rows.length ? 'PRODUCTION_SCANNER' : 'PRODUCTION_SCANNER_WAITING',
+      scan: {
+        ...dashboardScanState,
+        universe: dashboardScanUniverse,
+        lastLiveScanCounter: dashboardLastLiveScanCounter
+      },
+      rows
+    });
+  } catch (err) {
+    logger.warn?.(`[Dashboard Live Scanner] ${err.message}`);
+    res.status(503).json({ error: 'LIVE_SCANNER_UNAVAILABLE', message: err.message });
+  }
 });
 
 app.get('/api/dashboard/market-overview', async (req, res) => {
