@@ -1,5 +1,5 @@
 from pathlib import Path
-p=Path('/mnt/data/j45/trading-bot-v24.6-runtime.js')
+p=Path('/mnt/data/j45/trading-bot-v24.6-runtime.mjs')
 s=p.read_text()
 needle="const { TimesFMForecastAgent } = require('./timesfm-forecast-agent');"
 if "const { MonteCarloEngine } = require('./monte-carlo-engine');" not in s:

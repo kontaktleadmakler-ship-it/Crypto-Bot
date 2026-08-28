@@ -27,7 +27,7 @@ If Render currently contains `LOCK_STALE_AFTER_MS=300000`, the explicit Render v
 
 ## Validation
 
-- `node --check trading-bot-v24.6-runtime.js`
+- `node --check trading-bot-v24.6-runtime.mjs`
 - `node --check trading-bot-v25.js`
 - `node tests/instance-lock-hardening.test.js`
 

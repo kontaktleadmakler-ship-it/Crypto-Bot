@@ -54,7 +54,7 @@ class ExecutionRouter {
     if (!quotes.length) throw new Error('No execution venue with quote');
     const best = order.side === 'buy' ? quotes.reduce((a, b) => a.quote.ask < b.quote.ask ? a : b) : quotes.reduce((a, b) => a.quote.bid > b.quote.bid ? a : b);
     // Legacy execution router is intentionally disabled. All runtime execution
-    // must enter through execution-core/protected-submit.js.
+    // must enter through execution-core/protected-submit.mjs.
     throw new ExecutionHaltedError('LEGACY_EXECUTION_ROUTER_DISABLED_USE_EXECUTION_CORE');
   }
 }
