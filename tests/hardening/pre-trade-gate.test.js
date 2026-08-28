@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { assertPreTradeSafe } from '../../pre-trade-gate.js';
+import { assertPreTradeSafe } from '../../pre-trade-gate.mjs';
 
 const healthy = {
   dbHealthy: true,

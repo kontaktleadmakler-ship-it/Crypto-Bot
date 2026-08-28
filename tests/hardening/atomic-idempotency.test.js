@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AtomicIdempotency } from '../../execution-core/atomic-idempotency.js';
+import { AtomicIdempotency } from '../../execution-core/atomic-idempotency.mjs';
 
 test('duplicate insert is treated as already reserved', async () => {
   const rows = new Map();

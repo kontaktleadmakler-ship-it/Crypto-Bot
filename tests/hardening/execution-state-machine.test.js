@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ExecutionState, ExecutionStateMachine } from '../../execution-core/execution-state-machine.js';
+import { ExecutionState, ExecutionStateMachine } from '../../execution-core/execution-state-machine.mjs';
 
 test('execution state machine enters UNKNOWN after submit timeout', () => {
   const sm = new ExecutionStateMachine();

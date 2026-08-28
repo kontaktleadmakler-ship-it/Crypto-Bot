@@ -1,2 +1,2 @@
 'use strict';
-require('./trading-bot-v24.6-runtime.js');
+require('./trading-bot-v24.6-runtime.mjs');

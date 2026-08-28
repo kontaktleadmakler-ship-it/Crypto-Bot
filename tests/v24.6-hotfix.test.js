@@ -2,7 +2,7 @@
 const assert = require('assert');
 const fs = require('fs');
 
-const runtime = fs.readFileSync(require('path').join(__dirname, '..', 'trading-bot-v24.6-runtime.js'), 'utf8');
+const runtime = fs.readFileSync(require('path').join(__dirname, '..', 'trading-bot-v24.6-runtime.mjs'), 'utf8');
 const rl = fs.readFileSync(require('path').join(__dirname, '..', 'rl-engine.js'), 'utf8');
 const pkg = require('../package.json');
 

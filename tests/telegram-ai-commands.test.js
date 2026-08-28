@@ -1,6 +1,6 @@
 'use strict';
 const fs=require('fs');
-const src=fs.readFileSync('trading-bot-v24.6-runtime.js','utf8');
+const src=fs.readFileSync('trading-bot-v24.6-runtime.mjs','utf8');
 const pkg=require('../package.json');
 const required=["commands", "aicommands", "agents", "agents_status", "agent", "agent_on", "agent_off", "agents_on", "agents_off", "agent_weights", "llm_status", "llm_on", "llm_off", "llm_test", "signals", "top_signals", "signal", "explain", "confluence", "anomalies", "regime", "risk", "ai_hardening", "ai_architecture", "drift", "model_drift", "agent_attribution", "agent_stats", "kill_status", "retrain"];
 for(const c of required){ if(!src.includes("command === '/"+c+"'") && !src.includes("command === '/"+c+"' ||")) throw new Error('missing handler: /'+c); }

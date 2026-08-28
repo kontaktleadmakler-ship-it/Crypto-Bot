@@ -3,12 +3,12 @@ import { test } from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { protectedSubmit } from '../../execution-core/protected-submit.js';
-import { CriticalStateQueue } from '../../execution-core/critical-state-queue.js';
-import { ExecutionState, ExecutionStateMachine } from '../../execution-core/execution-state-machine.js';
+import { protectedSubmit } from '../../execution-core/protected-submit.mjs';
+import { CriticalStateQueue } from '../../execution-core/critical-state-queue.mjs';
+import { ExecutionState, ExecutionStateMachine } from '../../execution-core/execution-state-machine.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const runtime = fs.readFileSync(path.join(here, '../../trading-bot-v24.6-runtime.js'), 'utf8');
+const runtime = fs.readFileSync(path.join(here, '../../trading-bot-v24.6-runtime.mjs'), 'utf8');
 
 test('runtime routes paper opening execution through protectedSubmit', () => {
   assert.match(runtime, /protectedSubmit\(/);
