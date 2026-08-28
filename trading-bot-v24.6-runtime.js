@@ -3654,6 +3654,10 @@ async function scanMarket() {
           else scanStats.marketDataFailures++;
           if (e?.code === 'KLINES_UNAVAILABLE') scanStats.missingKlines++;
           logger.warn(`[MARKET-DATA] ${symbol}: ${e?.message || e}`);
+          // Do not silently drop the coin from JARVIS. Record the actual
+          // production scanner outcome so the dashboard can show WHY the
+          // neural/gate pipeline never evaluated this symbol.
+          dashboardRecordMarketDataFailure(symbol, scanCounter + 1, e);
           return;
         }
 
@@ -5286,6 +5290,68 @@ function dashboardLiveScannerRows() {
     .sort((a,b) => symbols.indexOf(a.symbol) - symbols.indexOf(b.symbol));
 }
 
+// Always keep the dashboard informed about the scanner stage. A coin that
+// cannot be evaluated is still a real scanner observation and must not simply
+// disappear from the UI. We deliberately do NOT invent RSI/ML/DQN values.
+function dashboardRecordMarketDataFailure(symbol, scanCounter, error) {
+  const sym = String(symbol || '').toUpperCase();
+  if (!sym) return;
+
+  let ticker = null;
+  try {
+    const snapshot = exchangeAdapter?.getCachedTickerSnapshot?.() || [];
+    const row = snapshot.find(x => String(x?.symbol || '').toUpperCase() === sym);
+    if (row) ticker = row;
+  } catch (_) {}
+
+  const reason = String(error?.message || error || 'LIVE_MARKET_DATA_UNAVAILABLE');
+  dashboardRecordProductionScanCoin({
+    symbol: sym,
+    scanCounter: Number(scanCounter || scanCounterGlobal || 0),
+    scanStatus: 'DATA_UNAVAILABLE',
+    dataQuality: 'UNAVAILABLE',
+    price: Number(ticker?.price || 0),
+    changePct: Number(ticker?.changePct || ticker?.change || 0),
+    volume24h: Number(ticker?.volume24hUSD || ticker?.volume24h || 0),
+    gateDirection: null,
+    gateStatus: 'DATA_UNAVAILABLE',
+    gateReason: reason,
+    marketPhase: currentMarketPhase,
+    timestamp: Date.now()
+  }, 'WARN');
+}
+
+function dashboardFallbackAgentNetwork(symbol) {
+  const sym = String(symbol || 'BTC-USDT').toUpperCase();
+  const snap = dashboardLiveCoinSnapshots.get(sym) || {};
+  const dqnStats = typeof dqnAgent?.getStats === 'function' ? dqnAgent.getStats() : {};
+  const dataUnavailable = String(snap.scanStatus || '').toUpperCase() === 'DATA_UNAVAILABLE';
+  return {
+    timestamp: Date.now(),
+    symbol: sym,
+    direction: null,
+    nodes: [
+      { id:'market-data', label:'MARKET DATA', score:0, decision:dataUnavailable ? 'UNAVAILABLE' : 'WAITING', status:'OFFLINE', color:'red' },
+      { id:'technical', label:'TECHNICAL', score:0, decision:'WAITING FOR MARKET DATA', status:'OFFLINE', color:'red' },
+      { id:'sentiment', label:'SENTIMENT', score:0, decision:'WAITING FOR MARKET DATA', status:'OFFLINE', color:'red' },
+      { id:'risk', label:'RISK', score:0, decision:'NOT EVALUATED', status:'MONITOR', color:'gold' },
+      { id:'dqn', label:'DQN / RL CORE', score:0, decision:dqnStats?.initialized ? 'READY / NO OBSERVATION' : 'UNAVAILABLE', status:dqnStats?.initialized ? 'MONITOR' : 'OFFLINE', color:'gold' },
+      { id:'meta-supervisor', label:'META SUPERVISOR', score:0, decision:'WAITING FOR INPUTS', status:'MONITOR', color:'gold' }
+    ],
+    dqn: {
+      ...dqnStats,
+      action: 'UNAVAILABLE',
+      qValues: null
+    },
+    meta: { confidence: 0, decision: 'MONITOR', hardBlock: true },
+    confidence: 0,
+    consensus: 0,
+    vetoes: [{ agent:'MARKET DATA', reason: dataUnavailable ? snap.gateReason : 'LIVE_MARKET_DATA_UNAVAILABLE' }],
+    finalAction: 'MONITOR',
+    raw: { marketData: 'UNAVAILABLE', snapshot: snap }
+  };
+}
+
 const DASHBOARD_REPLAY_MAX = 240;
 
 function pushDashboardReplay(snapshot) {
@@ -5896,8 +5962,13 @@ app.get('/api/dashboard/agents', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.json(data);
   } catch (e) {
+    // Dashboard must remain observable even when the expensive market-data
+    // path is unavailable. Never fabricate a neural score; return an explicit
+    // offline observation instead.
+    const symbol = String(req.query.symbol || 'BTC-USDT').toUpperCase();
     logger.warn(`[Dashboard Agents] ${e.message}`);
-    res.status(503).json({ error: e.message });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(dashboardFallbackAgentNetwork(symbol));
   }
 });
 
@@ -5985,8 +6056,32 @@ app.get('/api/dashboard/intelligence', async (req, res) => {
     res.setHeader('Cache-Control','no-store');
     res.json({ timestamp: Date.now(), current, replay, performance, readiness, scanner: { ...dashboardScanState, universe: dashboardScanUniverse, intervalMs: Number(config.SCAN_INTERVAL_MS || config.SCAN_INTERVAL || 0) || null }, regime: dashboardRegimeSnapshot() });
   } catch (e) {
+    const symbol = String(req.query.symbol || 'BTC-USDT').toUpperCase();
     logger.warn(`[Dashboard Intelligence] ${e.message}`);
-    res.status(503).json({ error: e.message });
+    const fallback = dashboardFallbackAgentNetwork(symbol);
+    const mlStats = mlModel.getStats();
+    const dqnStats = dqnAgent.getStats();
+    const readiness = dashboardReadinessSnapshot();
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      timestamp: Date.now(),
+      degraded: true,
+      error: 'LIVE_MARKET_DATA_UNAVAILABLE',
+      current: {
+        symbol, timestamp: Date.now(), marketPhase: dashboardRegimeSnapshot(),
+        confidence: 0, consensus: 0, vetoes: fallback.vetoes, finalAction: 'MONITOR',
+        activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, equity: config.CAPITAL_USD + dailyNetPnL,
+        risk: { allowed: false, level: 'UNKNOWN', reason: 'Market data unavailable' },
+        agents: fallback.nodes, dqn: { ...dqnStats, action: 'UNAVAILABLE', qValues: null },
+        ml: { validationAccuracy: mlStats.validationAccuracy, stats: mlStats },
+        drift: modelDriftMonitor.status(), execution: readiness.execution
+      },
+      replay: dashboardDecisionReplay.slice(0, 80),
+      performance: dashboardAgentPerformance(),
+      readiness,
+      scanner: { ...dashboardScanState, universe: dashboardScanUniverse },
+      regime: dashboardRegimeSnapshot()
+    });
   }
 });
 
