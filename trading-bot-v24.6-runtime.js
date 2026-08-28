@@ -19,7 +19,7 @@ const __dirname = path.dirname(__filename);
 
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - v25.0.16 INSTITUTIONAL EDITION
+ * TRADING SIGNAL BOT - v25.0.9 INSTITUTIONAL EDITION
  * (Mit adaptivem TensorFlow.js ML, Deep Q-Network Agent, globaler Telegram-Queue,
  *  State-Persistenz, Hurst-Exponent, Marktphasen-Logging & Dynamic Filter Control)
  * ============================================================================
@@ -196,8 +196,8 @@ const DAILY_PROFIT_TARGET = parseFloat(process.env.DAILY_PROFIT_TARGET) || 500;
 
 let kucoinErrorCount = 0;
 let kucoinCircuitOpenUntil = 0;
-const KUCOIN_CIRCUIT_THRESHOLD = Math.max(8, parseInt(process.env.KUCOIN_CIRCUIT_THRESHOLD, 10) || 8);
-const KUCOIN_CIRCUIT_COOLDOWN_MS = Math.max(10000, parseInt(process.env.KUCOIN_CIRCUIT_COOLDOWN_MS, 10) || 15000);
+const KUCOIN_CIRCUIT_THRESHOLD = 8;
+const KUCOIN_CIRCUIT_COOLDOWN_MS = 15000;
 
 const manualBlacklist = new Set();
 
@@ -734,14 +734,11 @@ const config = {
   TP1_CLOSE_PERCENT: parseFloat(process.env.TP1_CLOSE_PERCENT) || 60,
   ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false',
   MAX_EXPOSURE_RATIO: parseFloat(process.env.MAX_EXPOSURE_RATIO) || 0.6,
-  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 3,
-  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 8,
-  // 0 = wait for a worker instead of dropping symbols because the scanner
-  // temporarily occupies the market-data pool. The outer scan watchdog still
-  // bounds each symbol, so this cannot make the scan hang forever.
+  SCAN_CONCURRENCY: Math.max(6, Math.min(12, parseInt(process.env.SCAN_CONCURRENCY, 10) || 8)),
+  MARKET_DATA_CONCURRENCY: Math.max(6, Math.min(10, parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 6)),
   MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 0,
-  SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 30000,
-  SCAN_WATCHDOG_MS: parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 300000,
+  SCAN_ITEM_TIMEOUT_MS: Math.max(45000, Math.min(60000, parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 45000)),
+  SCAN_WATCHDOG_MS: Math.max(180000, Math.min(300000, parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 240000)),
   MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,
   LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3,
   MARGIN_MODE: (process.env.MARGIN_MODE || 'ISOLATED').toUpperCase(),
@@ -778,7 +775,7 @@ const config = {
   ENABLE_ORDERBOOK_ANALYSIS: process.env.ENABLE_ORDERBOOK_ANALYSIS !== 'false',
   ENABLE_CORRELATION_LIMITS: process.env.ENABLE_CORRELATION_LIMITS !== 'false',
   ENABLE_MULTI_TF_DERIVATION: process.env.ENABLE_MULTI_TF_DERIVATION !== 'false',
-  ENABLE_PRELOADING: process.env.ENABLE_PRELOADING === 'true',
+  ENABLE_PRELOADING: process.env.ENABLE_PRELOADING !== 'false',
   ENABLE_BATCH_SIGNALS: process.env.ENABLE_BATCH_SIGNALS !== 'false',
   ENABLE_TIME_FILTER: process.env.ENABLE_TIME_FILTER !== 'false',
   ORDERBOOK_DEPTH_LEVELS: parseInt(process.env.ORDERBOOK_DEPTH_LEVELS, 10) || 10,
@@ -1205,14 +1202,25 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
       }
       if (attempt === retries) {
         const status = Number(error?.response?.status || 0);
-        const transient = !status || status === 408 || status === 425 || status === 429 || status >= 500;
-        // Deterministic client/symbol errors must not disable the entire feed.
-        if (transient) kucoinErrorCount++;
-        else kucoinErrorCount = 0;
-        if (transient && kucoinErrorCount >= KUCOIN_CIRCUIT_THRESHOLD) {
-          kucoinCircuitOpenUntil = Date.now() + KUCOIN_CIRCUIT_COOLDOWN_MS;
-          logger.error(`🚨 KuCoin API Fehlerhäufung! Circuit Breaker für ${Math.ceil(KUCOIN_CIRCUIT_COOLDOWN_MS / 1000)}s aktiviert.`);
-          sendTelegramAlert(`⚠️ <b>KuCoin API Schutz aktiv:</b> Zu viele transiente Fehler. Market-Data-Scans pausieren für ${Math.ceil(KUCOIN_CIRCUIT_COOLDOWN_MS / 1000)}s.`);
+        const code = String(error?.code || '');
+        const transient =
+          status === 429 ||
+          status >= 500 ||
+          code === 'ECONNABORTED' ||
+          code === 'ETIMEDOUT' ||
+          code === 'ECONNRESET' ||
+          code === 'ENETUNREACH' ||
+          code === 'EAI_AGAIN';
+
+        // IMPORTANT: invalid/unsupported symbols and other 4xx responses are
+        // per-symbol failures. They must never open the global circuit and
+        // thereby disable market data for every other coin.
+        if (transient) {
+          kucoinErrorCount++;
+          if (kucoinErrorCount >= KUCOIN_CIRCUIT_THRESHOLD) {
+            kucoinCircuitOpenUntil = Date.now() + KUCOIN_CIRCUIT_COOLDOWN_MS;
+            logger.warn(`⚠️ KuCoin transient-error protection active for ${Math.ceil(KUCOIN_CIRCUIT_COOLDOWN_MS / 1000)}s (${kucoinErrorCount} consecutive errors)`);
+          }
         }
       }
       throw error;
@@ -1223,7 +1231,8 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
 const futuresApiSemaphore = {
   active: 0, queue: [],
   async acquire() {
-    if (this.active < 6) { this.active++; return; }
+    const limit = Math.max(6, Math.min(10, Number(config.MARKET_DATA_CONCURRENCY) || 6));
+    if (this.active < limit) { this.active++; return; }
     await new Promise(resolve => this.queue.push(resolve));
     this.active++;
   },
@@ -2475,131 +2484,80 @@ async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
 // coalesced and the KuCoin circuit breaker is checked before fan-out.
 const marketDataInflight = new Map();
 const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
-  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 15000, 5000),
-  Math.max(5000, config.SCAN_ITEM_TIMEOUT_MS - 1000)
+  18000,
+  Math.max(8000, parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 18000),
+  Math.max(8000, config.SCAN_ITEM_TIMEOUT_MS - 2000)
 );
 
 function isKucoinCircuitOpen() {
   return Date.now() < kucoinCircuitOpenUntil;
 }
 
-// Market-data worker pool. The scanner may evaluate several coins in parallel,
-// but the expensive Exchange/API fan-out is separately bounded. This prevents
-// 177+ candidates from turning into an uncontrolled burst of Kline/Futures/L2
-// requests. A queue timeout means a coin is skipped rather than waiting behind
-// a congested pool for tens of seconds.
-const marketDataPool = {
-  active: 0,
-  queue: [],
-
-  acquire(timeoutMs = config.MARKET_DATA_QUEUE_TIMEOUT_MS) {
-    if (this.active < Math.max(1, config.MARKET_DATA_CONCURRENCY)) {
-      this.active++;
-      return Promise.resolve(() => this.release());
-    }
-
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const timer = timeoutMs > 0 ? setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        const idx = this.queue.findIndex(entry => entry.resolve === resolve);
-        if (idx !== -1) this.queue.splice(idx, 1);
-        const err = new Error(`market-data queue timeout after ${timeoutMs}ms`);
-        err.code = 'MARKET_DATA_QUEUE_TIMEOUT';
-        reject(err);
-      }, timeoutMs) : null;
-      this.queue.push({
-        resolve: (release) => {
-          if (settled) {
-            release();
-            return;
-          }
-          settled = true;
-          if (timer) clearTimeout(timer);
-          resolve(release);
-        },
-        reject
-      });
-    });
-  },
-
-  release() {
-    this.active = Math.max(0, this.active - 1);
-    while (this.queue.length > 0 && this.active < Math.max(1, config.MARKET_DATA_CONCURRENCY)) {
-      const entry = this.queue.shift();
-      if (!entry) break;
-      this.active++;
-      entry.resolve(() => this.release());
-    }
-  }
-};
+// MARKET DATA CONCURRENCY
+// Do NOT hold a global semaphore for the lifetime of a complete symbol
+// bundle. A bundle contains several sequential/parallel exchange requests;
+// holding one slot for all of them created a second queue in front of the
+// actual KuCoin request pool. With 177 candidates this caused queue timeouts
+// and made the scan watchdog fire even though individual HTTP requests had
+// valid timeouts. Concurrency is now enforced at the exchange-request layer
+// (futuresApiSemaphore) instead.
 
 async function getMarketDataBundle(symbol) {
-  // IMPORTANT: do not gate the entire function on the circuit before
-  // coalescing. A dashboard request and a scanner request for the same symbol
-  // must share one in-flight bundle rather than creating duplicate API load.
-  const key = `bundle:${symbol}`;
-  const existing = marketDataInflight.get(key);
-  if (existing) return existing;
-
   if (isKucoinCircuitOpen()) {
     const err = new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
     err.code = 'KUCOIN_CIRCUIT_OPEN';
     throw err;
   }
 
+  const key = `bundle:${symbol}`;
+  const existing = marketDataInflight.get(key);
+  if (existing) return existing;
+
   const task = (async () => {
-    const release = await marketDataPool.acquire();
     try {
       const raw15m = await fetchKucoinKlinesCached(symbol, '15m', 100);
-      if (!raw15m || raw15m.length < 20) {
-        const err = new Error(`${symbol}/15m market data unavailable`);
-        err.code = 'KLINES_UNAVAILABLE';
-        throw err;
-      }
+    if (!raw15m || raw15m.length < 20) {
+      const err = new Error(`${symbol}/15m market data unavailable`);
+      err.code = 'KLINES_UNAVAILABLE';
+      throw err;
+    }
 
-      let raw1h = config.ENABLE_MULTI_TF_DERIVATION
-        ? deriveHigherTimeframes(raw15m, '1h')
-        : await fetchKucoinKlinesCached(symbol, '1h', 50);
-      if (!raw1h) {
-        const err = new Error(`${symbol}/1h market data unavailable`);
-        err.code = 'KLINES_UNAVAILABLE';
-        throw err;
-      }
-      raw1h = raw1h.filter(c => c.time + ONE_HOUR_MS <= Date.now());
-      if (raw1h.length === 0) {
-        const err = new Error(`${symbol}/1h closed candles unavailable`);
-        err.code = 'KLINES_UNAVAILABLE';
-        throw err;
-      }
+    let raw1h = config.ENABLE_MULTI_TF_DERIVATION
+      ? deriveHigherTimeframes(raw15m, '1h')
+      : await fetchKucoinKlinesCached(symbol, '1h', 50);
+    if (!raw1h) {
+      const err = new Error(`${symbol}/1h market data unavailable`);
+      err.code = 'KLINES_UNAVAILABLE';
+      throw err;
+    }
+    raw1h = raw1h.filter(c => c.time + ONE_HOUR_MS <= Date.now());
+    if (raw1h.length === 0) {
+      const err = new Error(`${symbol}/1h closed candles unavailable`);
+      err.code = 'KLINES_UNAVAILABLE';
+      throw err;
+    }
 
-      let raw4h = null;
-      if (config.REQUIRE_4H_TREND) {
-        raw4h = config.ENABLE_MULTI_TF_DERIVATION
-          ? deriveHigherTimeframes(raw15m, '4h')
-          : await fetchKucoinKlinesCached(symbol, '4h', 50);
-        if (raw4h) raw4h = raw4h.filter(c => c.time + FOUR_HOUR_MS <= Date.now());
-      }
+    let raw4h = null;
+    if (config.REQUIRE_4H_TREND) {
+      raw4h = config.ENABLE_MULTI_TF_DERIVATION
+        ? deriveHigherTimeframes(raw15m, '4h')
+        : await fetchKucoinKlinesCached(symbol, '4h', 50);
+      if (raw4h) raw4h = raw4h.filter(c => c.time + FOUR_HOUR_MS <= Date.now());
+    }
 
-      // Optional sources are isolated: an L2 or contract endpoint failure
-      // must not invalidate otherwise usable candle data.
-      const [futuresResult, orderBookResult] = await Promise.allSettled([
-        fetchFuturesData(symbol),
-        fetchOrderBookMetrics(symbol)
-      ]);
+    // Independent optional sources run concurrently. A failed optional source
+    // is handled by the existing strategy gate instead of blocking the bundle.
+    const [futuresResult, orderBookResult] = await Promise.allSettled([
+      fetchFuturesData(symbol),
+      fetchOrderBookMetrics(symbol)
+    ]);
 
       return {
-        symbol,
-        raw15m,
-        raw1h,
-        raw4h,
+        symbol, raw15m, raw1h, raw4h,
         futuresData: futuresResult.status === 'fulfilled' ? futuresResult.value : null,
         orderBookMetrics: orderBookResult.status === 'fulfilled' ? orderBookResult.value : null,
         fetchedAt: Date.now()
       };
-    } finally {
-      release();
     }
   })();
 
@@ -3285,7 +3243,7 @@ async function asyncPool(concurrency, items, iteratorFn, itemTimeoutMs = config.
     if (!itemTimeoutMs) return Promise.resolve().then(() => iteratorFn(item));
     let timer;
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => { const err = new Error(`asyncPool item timed out after ${itemTimeoutMs}ms`); err.code = 'ASYNC_POOL_ITEM_TIMEOUT'; reject(err); }, itemTimeoutMs);
+      timer = setTimeout(() => reject(new Error(`asyncPool item timed out after ${itemTimeoutMs}ms`)), itemTimeoutMs);
     });
     return Promise.race([Promise.resolve().then(() => iteratorFn(item)), timeout])
       .finally(() => clearTimeout(timer));
@@ -6882,7 +6840,7 @@ process.on('unhandledRejection', async (reason) => {
 // 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 (async () => {
-  logger.info('🚀 Starte Trading Bot v25.0.16 Institutional Edition (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
+  logger.info('🚀 Starte Trading Bot v25.0.9 Institutional Edition (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
