@@ -267,7 +267,7 @@ let liveEventSource=null;
 let liveReloadTimer=null;
 function scheduleLiveRefresh(){
   clearTimeout(liveReloadTimer);
-  liveReloadTimer=setTimeout(()=>load().catch(()=>{}),5000);
+  liveReloadTimer=setTimeout(()=>load().catch(()=>{}),120);
 }
 function applyProductionEvent(evt){
   if(!evt||!evt.type) return;
@@ -288,6 +288,7 @@ function applyProductionEvent(evt){
       $('heroSymbol').textContent=row.symbol;$('chartSymbol').textContent=row.symbol;
       brain3dData.action=String(row.gateDirection||'SCANNING').toUpperCase();
     }
+    scheduleLiveRefresh();
     return;
   }
   if(['AGENTS:EVALUATED','RISK:EVALUATED','SUPERVISOR:EVALUATED','DECISION:REPLAY','EXECUTION:STATE','COUNTERFACTUAL:EVALUATED','ROUTER:EVALUATED'].includes(evt.type)){
@@ -312,7 +313,7 @@ function connectProductionStream(){
     };
   }catch(_){$('eventCount').textContent='POLLING';}
 }
-load();setInterval(load,10000);
+load();setInterval(load,1500);
 connectProductionStream();
 </script>
 </body>
