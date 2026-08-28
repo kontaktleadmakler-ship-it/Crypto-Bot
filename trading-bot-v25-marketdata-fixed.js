@@ -666,14 +666,17 @@ const config = {
   ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false',
   MAX_EXPOSURE_RATIO: parseFloat(process.env.MAX_EXPOSURE_RATIO) || 0.6,
   // KuCoin-safe defaults: market-data fan-out is intentionally bounded.
-  // 3 concurrent scan workers keeps each worker's multi-request bundle from
-  // creating a burst of 15m/1h/4h/orderbook/futures calls. Operators can
-  // override this explicitly through Render environment variables.
-  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 6,
-  SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 60000,
-  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 6,
+  // v25.0.12 uses a single bounded gateway with four workers. Higher values
+  // amplify REST bursts because each worker can perform multiple exchange
+  // calls (klines + futures + order book).
+  // v25.0.12: keep scan and market-data limits internally consistent.
+  // A queue wait must never outlive the scan-item timeout; otherwise the
+  // asyncPool reports a timeout while the market-data worker is still queued.
+  SCAN_CONCURRENCY: Math.min(4, Math.max(1, parseInt(process.env.SCAN_CONCURRENCY, 10) || 4)),
+  SCAN_ITEM_TIMEOUT_MS: Math.min(20000, Math.max(10000, parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 20000)),
+  MARKET_DATA_CONCURRENCY: Math.min(4, Math.max(1, parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 4)),
   MARKET_DATA_CACHE_TTL_MS: parseInt(process.env.MARKET_DATA_CACHE_TTL_MS, 10) || 55000,
-  MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 45000,
+  MARKET_DATA_QUEUE_TIMEOUT_MS: Math.min(5000, Math.max(1000, parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 4000)),
   SCAN_WATCHDOG_MS: parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 600000,
   MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,
   LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3,
@@ -830,7 +833,6 @@ client.on('error', (err) => {
 let db = null;
 let tradesCollection, closedTradesCollection, botStateCollection, lockCollection, marketPhaseLogsCollection, filterChangeLogCollection;
 let paperOrdersCollection, executionIdempotencyCollection;
-let dashboardScanHistoryCollection;
 const activeTrades = new Map();
 // ===== Integrated Execution Core (P1-P4) =====
 const symbolExecutionLock = new SymbolExecutionLock();
@@ -1590,8 +1592,6 @@ async function initDatabase() {
     filterChangeLogCollection = db.collection('filterChangeLogs');
     paperOrdersCollection = db.collection('paperOrders');
     executionIdempotencyCollection = db.collection('executionIdempotency');
-    // Durable JARVIS scanner history: survives Render restarts/deploy overlap.
-    dashboardScanHistoryCollection = db.collection('dashboardScanHistory');
 
     // Wire persistence after the DB connection is known to be healthy.
     paperExecutionIdempotency.collection = executionIdempotencyCollection;
@@ -1646,9 +1646,6 @@ async function initDatabase() {
       await filterChangeLogCollection.createIndex({ timestamp: -1 });
       await paperOrdersCollection.createIndex({ symbol: 1, simulatedAt: -1 });
       await executionIdempotencyCollection.createIndex({ createdAt: 1 }, { expireAfterSeconds: 7 * 24 * 3600 });
-      await dashboardScanHistoryCollection.createIndex({ ts: -1 });
-      await dashboardScanHistoryCollection.createIndex({ symbol: 1, ts: -1 });
-      await dashboardScanHistoryCollection.createIndex({ eventId: 1 }, { unique: true, sparse: true });
     } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
 
     if (dbReconnectInterval) { clearInterval(dbReconnectInterval); dbReconnectInterval = null; }
@@ -2473,7 +2470,7 @@ const marketDataInflight = new Map();
 const marketDataSemaphore = {
   active: 0,
   queue: [],
-  limit: Math.max(1, Number(config.MARKET_DATA_CONCURRENCY || 3)),
+  limit: Math.max(1, Number(config.MARKET_DATA_CONCURRENCY || 4)),
   async acquire(timeoutMs = config.MARKET_DATA_QUEUE_TIMEOUT_MS) {
     if (this.active < this.limit) {
       this.active++;
@@ -2503,8 +2500,9 @@ const marketDataSemaphore = {
   }
 };
 const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
-  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 20000, 5000),
-  Math.max(5000, config.SCAN_ITEM_TIMEOUT_MS - 1000)
+  12000,
+  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 12000, 5000),
+  Math.max(5000, config.SCAN_ITEM_TIMEOUT_MS - 2000)
 );
 
 function isKucoinCircuitOpen() {
@@ -5278,7 +5276,6 @@ jarvisEventBus.on('event', (event) => {
 
 function dashboardRecordProductionScanCoin(snapshot, severity = 'INFO') {
   if (!snapshot || !snapshot.symbol) return null;
-
   const event = jarvisEventBus.emitEvent('SCAN:COIN', snapshot, {
     source: 'scanner',
     severity,
@@ -5286,63 +5283,7 @@ function dashboardRecordProductionScanCoin(snapshot, severity = 'INFO') {
     persistReplay: true,
     persistMinIntervalMs: 0
   });
-
-  // Persist every scanner observation asynchronously. The dashboard must not
-  // depend on the lifetime of the Render process or the in-memory EventBus.
-  if (dashboardScanHistoryCollection && isDbConnected) {
-    const doc = {
-      ts: Number(event.ts || Date.now()),
-      eventId: event.eventId,
-      type: event.type,
-      severity: event.severity,
-      source: event.source,
-      symbol: String(event.symbol || snapshot.symbol).toUpperCase(),
-      payload: event.payload || {}
-    };
-    void dashboardScanHistoryCollection.updateOne(
-      { eventId: doc.eventId },
-      { $set: doc },
-      { upsert: true }
-    ).catch(err => {
-      logger.warn?.(`[DASHBOARD HISTORY] persist failed: ${err.message}`);
-    });
-  }
-
   return event;
-}
-
-async function hydrateDashboardLiveSnapshotsFromDb({ limit = 1000 } = {}) {
-  if (dashboardLiveCoinSnapshots.size > 0) return;
-  if (!dashboardScanHistoryCollection || !isDbConnected) return;
-
-  try {
-    const rows = await dashboardScanHistoryCollection
-      .find({ type: 'SCAN:COIN' }, { projection: { _id: 0 } })
-      .sort({ ts: -1 })
-      .limit(Math.min(2000, Math.max(50, Number(limit) || 1000)))
-      .toArray();
-
-    // Keep only the newest observation per symbol.
-    for (const row of rows.reverse()) {
-      const symbol = String(row.symbol || row.payload?.symbol || '').toUpperCase();
-      if (!symbol || dashboardLiveCoinSnapshots.has(symbol)) continue;
-      dashboardLiveCoinSnapshots.set(symbol, {
-        ...(row.payload || {}),
-        symbol,
-        eventTs: Number(row.ts || Date.now()),
-        source: 'mongodb-production-scanner'
-      });
-    }
-
-    if (dashboardLiveCoinSnapshots.size) {
-      dashboardLastLiveScanCounter = Math.max(
-        dashboardLastLiveScanCounter,
-        ...[...dashboardLiveCoinSnapshots.values()].map(x => Number(x.scanCounter || 0))
-      );
-    }
-  } catch (err) {
-    logger.warn?.(`[DASHBOARD HISTORY] hydrate failed: ${err.message}`);
-  }
 }
 
 function dashboardLiveScannerRows() {
@@ -5982,8 +5923,7 @@ app.get('/api/dashboard/supervisor', async (req, res) => {
   }
 });
 
-app.get('/api/dashboard/connection', async (req, res) => {
-  await hydrateDashboardLiveSnapshotsFromDb({ limit: 2000 });
+app.get('/api/dashboard/connection', (req, res) => {
   const rows = dashboardLiveScannerRows();
   res.setHeader('Cache-Control','no-store');
   const newestTs = rows.reduce((max, r) => Math.max(max, Number(r?.eventTs || 0)), 0);
@@ -6000,34 +5940,13 @@ app.get('/api/dashboard/connection', async (req, res) => {
   });
 });
 
-app.get('/api/dashboard/live-scanner', async (req, res) => {
-  try {
-    // Critical for Render: the HTTP/dashboard process may be a new process
-    // while another process previously owned the instance lock. In-memory
-    // EventBus state is not shared between processes, so recover the latest
-    // production observations from MongoDB before returning an empty matrix.
-    await hydrateDashboardLiveSnapshotsFromDb({ limit: 2000 });
-
-    const rows = dashboardLiveScannerRows().map(r => ({
-      ...r,
-      ageMs: Math.max(0, Date.now() - Number(r.eventTs || r.timestamp || Date.now())),
-      live: true
-    }));
-    res.setHeader('Cache-Control','no-store, no-cache, must-revalidate');
-    res.json({
-      timestamp: Date.now(),
-      source: rows.length ? 'PRODUCTION_SCANNER' : 'PRODUCTION_SCANNER_WAITING',
-      scan: {
-        ...dashboardScanState,
-        universe: dashboardScanUniverse,
-        lastLiveScanCounter: dashboardLastLiveScanCounter
-      },
-      rows
-    });
-  } catch (err) {
-    logger.warn?.(`[Dashboard Live Scanner] ${err.message}`);
-    res.status(503).json({ error: 'LIVE_SCANNER_UNAVAILABLE', message: err.message });
-  }
+app.get('/api/dashboard/live-scanner', (req, res) => {
+  const rows = dashboardLiveScannerRows().map(r => ({
+    ...r, ageMs: Math.max(0, Date.now() - Number(r.eventTs || r.timestamp || Date.now())),
+    live: true
+  }));
+  res.setHeader('Cache-Control','no-store');
+  res.json({ timestamp: Date.now(), source: 'PRODUCTION_SCANNER', scan: { ...dashboardScanState, universe: dashboardScanUniverse, lastLiveScanCounter: dashboardLastLiveScanCounter }, rows });
 });
 
 app.get('/api/dashboard/market-overview', async (req, res) => {
