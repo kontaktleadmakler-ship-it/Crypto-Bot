@@ -1,12 +1,25 @@
 {
   "name": "crypto-bot-optimized",
-  "version": "2.1.0",
+  "version": "25.0.16",
   "description": "Optimierter modularer Trading-Signal-Bot mit robustem asyncPool und Timeout-Schutz",
   "main": "index.js",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
-    "start": "node index.js"
+    "start": "node trading-bot-v25.js",
+    "test": "node scripts/run-all-tests.js",
+    "check": "node scripts/production-readiness.js"
   },
   "dependencies": {
-    "dotenv": "^16.4.5"
+    "@google/genai": "^1.9.0",
+    "@tensorflow/tfjs-node": "4.22.0",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "mongodb": "^6.12.0",
+    "node-cron": "^3.0.3",
+    "winston": "^3.17.0",
+    "ws": "^8.18.0"
   }
 }

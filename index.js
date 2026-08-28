@@ -4,7 +4,7 @@
 'use strict';
 
 require('dotenv').config();
-const SignalBotCore = require('./src/core/botCore');
+const SignalBotCore = require('./botCore');
 
 const bot = new SignalBotCore({
     symbol: process.env.SYMBOL || 'RENDER-USDT',

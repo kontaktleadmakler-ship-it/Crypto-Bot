@@ -4,7 +4,7 @@
 'use strict';
 
 const EventEmitter = require('events');
-const asyncPool = require('../utils/asyncPool');
+const asyncPool = require('./asyncPool');
 
 class SignalBotCore extends EventEmitter {
     constructor(config = {}) {

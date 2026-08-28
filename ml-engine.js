@@ -10,7 +10,16 @@
 
 const fs = require('fs');
 const path = require('path');
-const tf = require('@tensorflow/tfjs-node');
+let tf = null;
+try {
+  tf = require('@tensorflow/tfjs-node');
+} catch (e) {
+  // Native module not installed/compatible with the current Node version.
+  // Fall back gracefully: feature extraction and other non-TF helpers still
+  // work, but training/loading/predicting will report themselves unavailable
+  // instead of crashing the whole process at require-time.
+  tf = null;
+}
 
 const FEATURE_NAMES = [
   'adx',
@@ -263,6 +272,7 @@ class TensorFlowSignalModel {
   async trainFromTrades(collection, options = {}) {
     if (this.training) return { trained: false, reason: 'training-in-progress', ...this.getStats() };
     if (!collection) return { trained: false, reason: 'collection-unavailable' };
+    if (!tf) return { trained: false, reason: 'tfjs-unavailable' };
 
     this.training = true;
     try {
@@ -530,6 +540,7 @@ class TensorFlowSignalModel {
   }
 
   async load() {
+    if (!tf) return false;
     const modelPath = path.join(this.modelDir, 'model.json');
     const metadataPath = path.join(this.modelDir, 'metadata.json');
     if (!fs.existsSync(modelPath) || !fs.existsSync(metadataPath)) return false;
