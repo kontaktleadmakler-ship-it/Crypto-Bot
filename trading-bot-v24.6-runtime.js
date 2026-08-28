@@ -33,10 +33,10 @@ const { MongoClient } = require('mongodb');
 const winston = require('winston');
 const { TensorFlowSignalModel } = require('./ml-engine');
 const { DeepQTheTradingAgent } = require('./rl-engine'); // <-- DQN Agent Modul eingebunden
-const { HedgeManager } = require('./hedgeManager');
-const { VolatilitySurfaceManager } = require('./volatilitySurface');
+const HedgeManager = require('./hedgeManager');
+const VolatilitySurfaceManager = require('./volatilitySurface');
 const { OrderFlowAnalyzer } = require('./orderFlowAnalyzer');
-const { MacroFilterEngine } = require('./macroFilter'); // <-- Makro & Sentiment Filter (in v21.1 wiederhergestellt)
+const MacroFilterEngine = require('./macroFilter'); // <-- Makro & Sentiment Filter (in v21.1 wiederhergestellt)
 const { runBacktest, buildConfig: buildBacktestConfig, optimizeHyperparameters } = require('./backtest-engine');
 const {
   calculateEMA, calculateEMASeries, calculateRSI, calculateATR, calculateADX,
@@ -5947,6 +5947,8 @@ app.get('/api/dashboard/intelligence', async (req, res) => {
     const replay = dashboardDecisionReplay.slice(0, 80);
     const current = {
       symbol, timestamp: Date.now(), marketPhase: dashboardRegimeSnapshot(),
+      regime: dashboardRegimeSnapshot(),
+      macro: { value: market.sentiment?.value ?? null, classification: market.sentiment?.classification ?? null, bias: market.sentiment?.bias ?? null, allowed: market.sentiment?.allowed ?? null },
       confidence: agents.confidence, consensus: agents.consensus, vetoes: agents.vetoes, finalAction: agents.finalAction,
       activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, equity: config.CAPITAL_USD + dailyNetPnL,
       risk: market.risk, agents: agents.nodes,
@@ -6313,6 +6315,12 @@ app.get('/api/dashboard/regime-intelligence', async (req,res)=>{
     events.sort((a,b)=>a.ts-b.ts);
     const data=analyzeRegimeIntelligence(events,horizon);
     data.range={from,to}; data.filter={symbol:symbol||'ALL'}; data.dataset={events:events.length};
+    const liveRegime = dashboardRegimeSnapshot();
+    data.currentRegime = liveRegime.phase;
+    data.phase = liveRegime.phase;
+    data.confidence = liveRegime.confidence;
+    data.description = liveRegime.description;
+    data.live = liveRegime;
     jarvisRegimeCache.ts=now; jarvisRegimeCache.key=key; jarvisRegimeCache.data=data;
     res.setHeader('Cache-Control','no-store'); res.json(data);
   } catch(err){res.status(500).json({error:'REGIME_INTELLIGENCE_FAILED',message:err.message,liveExecutionTouched:false});}
