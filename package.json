@@ -1,6 +1,6 @@
 {
   "name": "crypto-bot-institutional",
-  "version": "25.0.12",
+  "version": "25.0.14",
   "private": true,
   "description": "Signal/Paper/Shadow institutional trading platform with fail-closed production gates and JARVIS live scanner dashboard bridge",
   "scripts": {

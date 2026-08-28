@@ -196,8 +196,10 @@ const DAILY_PROFIT_TARGET = parseFloat(process.env.DAILY_PROFIT_TARGET) || 500;
 
 let kucoinErrorCount = 0;
 let kucoinCircuitOpenUntil = 0;
-const KUCOIN_CIRCUIT_THRESHOLD = 3;
-const KUCOIN_CIRCUIT_COOLDOWN_MS = 300000;
+const KUCOIN_CIRCUIT_THRESHOLD = 6;
+const KUCOIN_CIRCUIT_COOLDOWN_MS = 30000;
+const KUCOIN_CIRCUIT_FAILURE_WINDOW_MS = 15000;
+let kucoinFailureTimes = [];
 
 const manualBlacklist = new Set();
 
@@ -735,8 +737,8 @@ const config = {
   ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false',
   MAX_EXPOSURE_RATIO: parseFloat(process.env.MAX_EXPOSURE_RATIO) || 0.6,
   SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 3,
-  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 6,
-  MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 10000,
+  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 3,
+  MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 5000,
   SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 30000,
   SCAN_WATCHDOG_MS: parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 300000,
   MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,
@@ -775,7 +777,7 @@ const config = {
   ENABLE_ORDERBOOK_ANALYSIS: process.env.ENABLE_ORDERBOOK_ANALYSIS !== 'false',
   ENABLE_CORRELATION_LIMITS: process.env.ENABLE_CORRELATION_LIMITS !== 'false',
   ENABLE_MULTI_TF_DERIVATION: process.env.ENABLE_MULTI_TF_DERIVATION !== 'false',
-  ENABLE_PRELOADING: process.env.ENABLE_PRELOADING !== 'false',
+  ENABLE_PRELOADING: process.env.ENABLE_PRELOADING === 'true',
   ENABLE_BATCH_SIGNALS: process.env.ENABLE_BATCH_SIGNALS !== 'false',
   ENABLE_TIME_FILTER: process.env.ENABLE_TIME_FILTER !== 'false',
   ORDERBOOK_DEPTH_LEVELS: parseInt(process.env.ORDERBOOK_DEPTH_LEVELS, 10) || 10,
@@ -1182,32 +1184,56 @@ function predictSignalSuccess(features) {
   return mlModel.predict(features);
 }
 
+function isTransientKucoinError(error) {
+  const status = Number(error?.response?.status || 0);
+  return status === 408 || status === 425 || status === 429 || status >= 500 ||
+    ['ECONNABORTED', 'ETIMEDOUT', 'ECONNRESET', 'ENETUNREACH', 'EAI_AGAIN', 'ECONNREFUSED'].includes(error?.code);
+}
+
+function recordKucoinFailure(error) {
+  if (!isTransientKucoinError(error)) return;
+  const now = Date.now();
+  kucoinFailureTimes = kucoinFailureTimes.filter(ts => now - ts <= KUCOIN_CIRCUIT_FAILURE_WINDOW_MS);
+  kucoinFailureTimes.push(now);
+  kucoinErrorCount = kucoinFailureTimes.length;
+  if (kucoinFailureTimes.length >= KUCOIN_CIRCUIT_THRESHOLD && now >= kucoinCircuitOpenUntil) {
+    kucoinCircuitOpenUntil = now + KUCOIN_CIRCUIT_COOLDOWN_MS;
+    logger.error(`🚨 KuCoin API Schutz aktiv: ${kucoinFailureTimes.length} transiente Fehler in ${KUCOIN_CIRCUIT_FAILURE_WINDOW_MS / 1000}s. Pause ${KUCOIN_CIRCUIT_COOLDOWN_MS / 1000}s.`);
+  }
+}
+
+function recordKucoinSuccess() {
+  kucoinFailureTimes = [];
+  kucoinErrorCount = 0;
+  if (Date.now() >= kucoinCircuitOpenUntil) kucoinCircuitOpenUntil = 0;
+}
+
 async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 1000) {
   if (Date.now() < kucoinCircuitOpenUntil) {
-    throw new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
+    const err = new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
+    err.code = 'KUCOIN_CIRCUIT_OPEN';
+    throw err;
   }
 
   await apiRateLimiter.checkLimit();
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  const effectiveRetries = options.marketDataNoRetry === true ? 0 : Math.max(0, retries);
+  const requestOptions = { ...options };
+  delete requestOptions.marketDataNoRetry;
+
+  for (let attempt = 0; attempt <= effectiveRetries; attempt++) {
     try {
       const startTime = Date.now();
-      const response = await axios.get(url, { timeout: options.timeout || 5000, ...options });
+      const response = await axios.get(url, { timeout: requestOptions.timeout || 5000, ...requestOptions });
       apiLatencyStats.record('kucoin', Date.now() - startTime);
-      kucoinErrorCount = 0;
+      recordKucoinSuccess();
       return response;
     } catch (error) {
-      if (error.response && error.response.status === 429 && attempt < retries) {
-        await sleep(backoffMs * Math.pow(2, attempt));
+      if (error.response?.status === 429 && attempt < effectiveRetries) {
+        const retryAfter = Number(error.response?.headers?.['gw-ratelimit-reset'] || 0);
+        await sleep(Math.max(250, retryAfter || backoffMs * Math.pow(2, attempt)));
         continue;
       }
-      if (attempt === retries) {
-        kucoinErrorCount++;
-        if (kucoinErrorCount >= KUCOIN_CIRCUIT_THRESHOLD) {
-          kucoinCircuitOpenUntil = Date.now() + KUCOIN_CIRCUIT_COOLDOWN_MS;
-          logger.error(`🚨 KuCoin API Fehlerhäufung! Circuit Breaker für 5 Minuten aktiviert.`);
-          sendTelegramAlert(`⚠️ <b>KuCoin API Schutz aktiv:</b> Zu viele Fehler. Scans pausieren für 5 Minuten.`);
-        }
-      }
+      if (attempt === effectiveRetries) recordKucoinFailure(error);
       throw error;
     }
   }
@@ -2285,7 +2311,7 @@ const FUTURES_GRANULARITY_MINUTES = { '1d': 1440, '4h': 240, '1h': 60, '15m': 15
 
 async function fetchKucoinKlines(symbol, timeframe = '15m', limit = 100) {
   try { return await exchangeAdapter.getKlines(symbol, timeframe, limit); }
-  catch (e) { logger.warn(`[ExchangeAdapter] Klines ${symbol}/${timeframe}: ${e.message}`); return null; }
+  catch (e) { logger.warn(`[ExchangeAdapter] Klines ${symbol}/${timeframe}: ${e.message}${e.response?.status ? ` | HTTP ${e.response.status}` : ''}${e.code ? ` | code=${e.code}` : ''}`); return null; }
 }
 
 const ONE_HOUR_MS = 3600000, FOUR_HOUR_MS = 14400000;
@@ -2468,8 +2494,8 @@ async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
 // coalesced and the KuCoin circuit breaker is checked before fan-out.
 const marketDataInflight = new Map();
 const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
-  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 20000, 5000),
-  Math.max(5000, config.SCAN_ITEM_TIMEOUT_MS - 1000)
+  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 10000, 7000),
+  Math.max(7000, config.SCAN_ITEM_TIMEOUT_MS - 2000)
 );
 
 function isKucoinCircuitOpen() {
@@ -3654,10 +3680,6 @@ async function scanMarket() {
           else scanStats.marketDataFailures++;
           if (e?.code === 'KLINES_UNAVAILABLE') scanStats.missingKlines++;
           logger.warn(`[MARKET-DATA] ${symbol}: ${e?.message || e}`);
-          // Do not silently drop the coin from JARVIS. Record the actual
-          // production scanner outcome so the dashboard can show WHY the
-          // neural/gate pipeline never evaluated this symbol.
-          dashboardRecordMarketDataFailure(symbol, scanCounter + 1, e);
           return;
         }
 
@@ -5219,6 +5241,7 @@ app.get('/', (req, res) => {
 // every 2.5s and receives live/closed-candle market data from KuCoin Futures.
 // ---------------------------------------------------------------------------
 const dashboardCache = new Map();
+const dashboardDataInflight = new Map();
 const DASHBOARD_CACHE_MS = 1200;
 let dashboardEventCounter = 0;
 let dashboardScanUniverse = [];
@@ -5288,68 +5311,6 @@ function dashboardLiveScannerRows() {
   return symbols.map(symbol => dashboardLiveCoinSnapshots.get(String(symbol).toUpperCase()))
     .filter(Boolean)
     .sort((a,b) => symbols.indexOf(a.symbol) - symbols.indexOf(b.symbol));
-}
-
-// Always keep the dashboard informed about the scanner stage. A coin that
-// cannot be evaluated is still a real scanner observation and must not simply
-// disappear from the UI. We deliberately do NOT invent RSI/ML/DQN values.
-function dashboardRecordMarketDataFailure(symbol, scanCounter, error) {
-  const sym = String(symbol || '').toUpperCase();
-  if (!sym) return;
-
-  let ticker = null;
-  try {
-    const snapshot = exchangeAdapter?.getCachedTickerSnapshot?.() || [];
-    const row = snapshot.find(x => String(x?.symbol || '').toUpperCase() === sym);
-    if (row) ticker = row;
-  } catch (_) {}
-
-  const reason = String(error?.message || error || 'LIVE_MARKET_DATA_UNAVAILABLE');
-  dashboardRecordProductionScanCoin({
-    symbol: sym,
-    scanCounter: Number(scanCounter || scanCounterGlobal || 0),
-    scanStatus: 'DATA_UNAVAILABLE',
-    dataQuality: 'UNAVAILABLE',
-    price: Number(ticker?.price || 0),
-    changePct: Number(ticker?.changePct || ticker?.change || 0),
-    volume24h: Number(ticker?.volume24hUSD || ticker?.volume24h || 0),
-    gateDirection: null,
-    gateStatus: 'DATA_UNAVAILABLE',
-    gateReason: reason,
-    marketPhase: currentMarketPhase,
-    timestamp: Date.now()
-  }, 'WARN');
-}
-
-function dashboardFallbackAgentNetwork(symbol) {
-  const sym = String(symbol || 'BTC-USDT').toUpperCase();
-  const snap = dashboardLiveCoinSnapshots.get(sym) || {};
-  const dqnStats = typeof dqnAgent?.getStats === 'function' ? dqnAgent.getStats() : {};
-  const dataUnavailable = String(snap.scanStatus || '').toUpperCase() === 'DATA_UNAVAILABLE';
-  return {
-    timestamp: Date.now(),
-    symbol: sym,
-    direction: null,
-    nodes: [
-      { id:'market-data', label:'MARKET DATA', score:0, decision:dataUnavailable ? 'UNAVAILABLE' : 'WAITING', status:'OFFLINE', color:'red' },
-      { id:'technical', label:'TECHNICAL', score:0, decision:'WAITING FOR MARKET DATA', status:'OFFLINE', color:'red' },
-      { id:'sentiment', label:'SENTIMENT', score:0, decision:'WAITING FOR MARKET DATA', status:'OFFLINE', color:'red' },
-      { id:'risk', label:'RISK', score:0, decision:'NOT EVALUATED', status:'MONITOR', color:'gold' },
-      { id:'dqn', label:'DQN / RL CORE', score:0, decision:dqnStats?.initialized ? 'READY / NO OBSERVATION' : 'UNAVAILABLE', status:dqnStats?.initialized ? 'MONITOR' : 'OFFLINE', color:'gold' },
-      { id:'meta-supervisor', label:'META SUPERVISOR', score:0, decision:'WAITING FOR INPUTS', status:'MONITOR', color:'gold' }
-    ],
-    dqn: {
-      ...dqnStats,
-      action: 'UNAVAILABLE',
-      qValues: null
-    },
-    meta: { confidence: 0, decision: 'MONITOR', hardBlock: true },
-    confidence: 0,
-    consensus: 0,
-    vetoes: [{ agent:'MARKET DATA', reason: dataUnavailable ? snap.gateReason : 'LIVE_MARKET_DATA_UNAVAILABLE' }],
-    finalAction: 'MONITOR',
-    raw: { marketData: 'UNAVAILABLE', snapshot: snap }
-  };
 }
 
 const DASHBOARD_REPLAY_MAX = 240;
@@ -5634,8 +5595,11 @@ function dashboardVolatility(closes) {
 async function getDashboardData(symbol) {
   const cached = dashboardCache.get(symbol);
   if (cached && Date.now() - cached.ts < DASHBOARD_CACHE_MS) return cached.data;
+  const existing = dashboardDataInflight.get(symbol);
+  if (existing) return existing;
 
-  const [marketDataResult, tickerResult, macro] = await Promise.allSettled([
+  const task = (async () => {
+    const [marketDataResult, tickerResult, macro] = await Promise.allSettled([
     getMarketDataBundle(symbol),
     fetchKucoinTickerPrice(symbol),
     macroEngine.evaluateMacroEnvironment().catch(() => ({ value: 50, classification: 'Neutral', safe: true, multiplier: 1 }))
@@ -5733,8 +5697,16 @@ async function getDashboardData(symbol) {
     activeTrades: activeTrades.size,
     ticker: `LIVE ${symbol} · KuCoin Futures · ${new Date().toISOString()}`
   };
-  dashboardCache.set(symbol, { ts: Date.now(), data });
-  return data;
+    dashboardCache.set(symbol, { ts: Date.now(), data });
+    return data;
+  })();
+
+  dashboardDataInflight.set(symbol, task);
+  try {
+    return await task;
+  } finally {
+    dashboardDataInflight.delete(symbol);
+  }
 }
 
 app.get('/dashboard', (req, res) => {
@@ -5962,13 +5934,8 @@ app.get('/api/dashboard/agents', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.json(data);
   } catch (e) {
-    // Dashboard must remain observable even when the expensive market-data
-    // path is unavailable. Never fabricate a neural score; return an explicit
-    // offline observation instead.
-    const symbol = String(req.query.symbol || 'BTC-USDT').toUpperCase();
     logger.warn(`[Dashboard Agents] ${e.message}`);
-    res.setHeader('Cache-Control', 'no-store');
-    res.json(dashboardFallbackAgentNetwork(symbol));
+    res.status(503).json({ error: e.message });
   }
 });
 
@@ -6056,32 +6023,8 @@ app.get('/api/dashboard/intelligence', async (req, res) => {
     res.setHeader('Cache-Control','no-store');
     res.json({ timestamp: Date.now(), current, replay, performance, readiness, scanner: { ...dashboardScanState, universe: dashboardScanUniverse, intervalMs: Number(config.SCAN_INTERVAL_MS || config.SCAN_INTERVAL || 0) || null }, regime: dashboardRegimeSnapshot() });
   } catch (e) {
-    const symbol = String(req.query.symbol || 'BTC-USDT').toUpperCase();
     logger.warn(`[Dashboard Intelligence] ${e.message}`);
-    const fallback = dashboardFallbackAgentNetwork(symbol);
-    const mlStats = mlModel.getStats();
-    const dqnStats = dqnAgent.getStats();
-    const readiness = dashboardReadinessSnapshot();
-    res.setHeader('Cache-Control', 'no-store');
-    res.json({
-      timestamp: Date.now(),
-      degraded: true,
-      error: 'LIVE_MARKET_DATA_UNAVAILABLE',
-      current: {
-        symbol, timestamp: Date.now(), marketPhase: dashboardRegimeSnapshot(),
-        confidence: 0, consensus: 0, vetoes: fallback.vetoes, finalAction: 'MONITOR',
-        activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, equity: config.CAPITAL_USD + dailyNetPnL,
-        risk: { allowed: false, level: 'UNKNOWN', reason: 'Market data unavailable' },
-        agents: fallback.nodes, dqn: { ...dqnStats, action: 'UNAVAILABLE', qValues: null },
-        ml: { validationAccuracy: mlStats.validationAccuracy, stats: mlStats },
-        drift: modelDriftMonitor.status(), execution: readiness.execution
-      },
-      replay: dashboardDecisionReplay.slice(0, 80),
-      performance: dashboardAgentPerformance(),
-      readiness,
-      scanner: { ...dashboardScanState, universe: dashboardScanUniverse },
-      regime: dashboardRegimeSnapshot()
-    });
+    res.status(503).json({ error: e.message });
   }
 });
 

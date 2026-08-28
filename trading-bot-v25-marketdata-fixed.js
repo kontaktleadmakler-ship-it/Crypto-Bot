@@ -75,6 +75,7 @@ const { MarketDataReplay } = require('./market-data-replay.js');
 const { buildCoinTimeline } = require('./coin-timeline.js');
 const { downloadOHLCV, writeDataset, GRANULARITY } = require('./scripts/download-ohlcv');
 const fs = require('fs');
+const path = require('path');
 
 // ==========================================
 // OHLCV RESEARCH DATA MANAGER (Telegram)
@@ -666,18 +667,13 @@ const config = {
   ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false',
   MAX_EXPOSURE_RATIO: parseFloat(process.env.MAX_EXPOSURE_RATIO) || 0.6,
   // KuCoin-safe defaults: market-data fan-out is intentionally bounded.
-  // v25.0.12 uses a single bounded gateway with four workers. Higher values
-  // amplify REST bursts because each worker can perform multiple exchange
-  // calls (klines + futures + order book).
-  // v25.0.12: keep scan and market-data limits internally consistent.
-  // A queue wait must never outlive the scan-item timeout; otherwise the
-  // asyncPool reports a timeout while the market-data worker is still queued.
-  SCAN_CONCURRENCY: Math.min(4, Math.max(1, parseInt(process.env.SCAN_CONCURRENCY, 10) || 4)),
-  SCAN_ITEM_TIMEOUT_MS: Math.min(20000, Math.max(10000, parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 20000)),
-  MARKET_DATA_CONCURRENCY: Math.min(4, Math.max(1, parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 4)),
-  MARKET_DATA_CACHE_TTL_MS: parseInt(process.env.MARKET_DATA_CACHE_TTL_MS, 10) || 55000,
-  MARKET_DATA_QUEUE_TIMEOUT_MS: Math.min(5000, Math.max(1000, parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 4000)),
-  SCAN_WATCHDOG_MS: parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 600000,
+  // 3 concurrent scan workers keeps each worker's multi-request bundle from
+  // creating a burst of 15m/1h/4h/orderbook/futures calls. Operators can
+  // override this explicitly through Render environment variables.
+  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 3,
+  SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 75000,
+  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 3,
+  SCAN_WATCHDOG_MS: parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 300000,
   MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,
   LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3,
   MARGIN_MODE: (process.env.MARGIN_MODE || 'ISOLATED').toUpperCase(),
@@ -702,7 +698,7 @@ const config = {
   FUNDING_INTERVAL_HOURS: parseFloat(process.env.FUNDING_INTERVAL_HOURS) || 8,
   SCAN_STATS_TELEGRAM_EVERY_N_SCANS: parseInt(process.env.SCAN_STATS_TELEGRAM_EVERY_N_SCANS, 10) || 4,
   
-  MAX_KLINES_CACHE_SIZE: parseInt(process.env.MAX_KLINES_CACHE_SIZE, 10) || 1000,
+  MAX_KLINES_CACHE_SIZE: parseInt(process.env.MAX_KLINES_CACHE_SIZE, 10) || 200,
   CACHE_CLEANUP_MINUTES: parseInt(process.env.CACHE_CLEANUP_MINUTES, 10) || 5,
   
   RISK_WARNING_ENABLED: process.env.RISK_WARNING_ENABLED !== 'false',
@@ -768,7 +764,7 @@ function validateConfig() {
     'PAPER_EXECUTION_LATENCY_MS', 'PAPER_SPREAD_PERCENT', 'PAPER_SLIPPAGE_PERCENT',
     'PAPER_IMPACT_BPS', 'PAPER_MAKER_FEE_PERCENT', 'PAPER_TAKER_FEE_PERCENT', 'PAPER_FILL_RATIO',
     'TP1_CLOSE_PERCENT', 'MAX_EXPOSURE_RATIO',
-    'SCAN_CONCURRENCY', 'MARKET_DATA_CONCURRENCY', 'MARKET_DATA_CACHE_TTL_MS', 'MARKET_DATA_QUEUE_TIMEOUT_MS', 'MAX_CONSECUTIVE_PRICE_FAILURES', 'LEVERAGE',
+    'SCAN_CONCURRENCY', 'MARKET_DATA_CONCURRENCY', 'MAX_CONSECUTIVE_PRICE_FAILURES', 'LEVERAGE',
     'LOCK_ACQUIRE_RETRIES', 'LOCK_ACQUIRE_RETRY_DELAY_MS', 'LOCK_STALE_AFTER_MS',
     'FUNDING_INTERVAL_HOURS', 'SCAN_STATS_TELEGRAM_EVERY_N_SCANS',
     'TREND_EMA_FAST_15M', 'TREND_EMA_SLOW_15M',
@@ -1169,17 +1165,6 @@ async function futuresApiGetWithRetry(url, options = {}, retries = 3, backoffMs 
   await futuresApiSemaphore.acquire();
   try { return await axiosGetWithRetry(url, options, retries, backoffMs); }
   finally { futuresApiSemaphore.release(); }
-}
-
-// MARKET-DATA FIX v25.0.12: scanning must never inherit the generic
-// 3-retry/backoff policy. A single 5s request can otherwise consume roughly
-// 18s (5s + 1s + 5s + 2s + 5s), and a bundle contains multiple requests.
-// That is the direct cause of the recurring 20s async-pool timeouts.
-// Market-data calls are already protected by the circuit breaker and bounded
-// concurrency, so a scan request gets exactly one bounded attempt.
-async function marketDataFuturesRequest(url, options = {}) {
-  const timeout = Math.min(Number(options.timeout) || 4000, 4500);
-  return futuresApiGetWithRetry(url, { ...options, timeout }, 0, 0);
 }
 
 async function processDbBulkQueue() {
@@ -1985,91 +1970,30 @@ function shouldSkipSignal(symbol, direction, score) {
   return false;
 }
 
-// Dynamic blacklist is a strategy filter, not a reason to perform one MongoDB
-// query per symbol. The old implementation did exactly that inside the scan pool.
-// With ~177 candidates this created a DB request storm and could occupy every
-// scan worker until SCAN_ITEM_TIMEOUT_MS fired.
-//
-// We refresh the blacklist once per scan (one aggregation query), then perform
-// O(1) in-memory lookups for each symbol.
-const dynamicBlacklistCache = new Map();
-const DYNAMIC_BLACKLIST_CACHE_TTL_MS =
-  Math.max(60_000, parseInt(process.env.DYNAMIC_BLACKLIST_CACHE_TTL_MS, 10) || 300_000);
-
-async function refreshDynamicBlacklist(symbols) {
-  const now = Date.now();
-  const result = new Set();
-
-  for (const [symbol, entry] of dynamicBlacklistCache) {
-    if (!entry || now - entry.checkedAt > DYNAMIC_BLACKLIST_CACHE_TTL_MS) {
-      dynamicBlacklistCache.delete(symbol);
-    } else if (entry.blacklisted) {
-      result.add(symbol);
-    }
-  }
-
-  if (!closedTradesCollection || !isDbConnected || !symbols?.length) return result;
-
-  // Only refresh symbols whose cached decision is stale/missing.
-  const staleSymbols = symbols.filter((symbol) => {
-    const entry = dynamicBlacklistCache.get(symbol);
-    return !entry || now - entry.checkedAt > DYNAMIC_BLACKLIST_CACHE_TTL_MS;
-  });
-
-  if (!staleSymbols.length) return result;
-
-  try {
-    const query = closedTradesCollection.aggregate([
-      { $match: { symbol: { $in: staleSymbols } } },
-      { $sort: { symbol: 1, closeTime: -1 } },
-      { $group: { _id: '$symbol', trades: { $push: '$$ROOT' } } },
-      { $project: { trades: { $slice: ['$trades', 3] } } }
-    ]);
-
-    // This is deliberately short. A learning/blacklist lookup must never
-    // stall the market-data scanner.
-    const timeoutMs = Math.max(
-      500,
-      parseInt(process.env.DYNAMIC_BLACKLIST_DB_TIMEOUT_MS, 10) || 3000
-    );
-    const timeout = new Promise((_, reject) =>
-      setTimeout(() => {
-        const err = new Error(`dynamic blacklist DB query timed out after ${timeoutMs}ms`);
-        err.code = 'DYNAMIC_BLACKLIST_DB_TIMEOUT';
-        reject(err);
-      }, timeoutMs)
-    );
-
-    const rows = await Promise.race([query.toArray(), timeout]);
-    const bySymbol = new Map(rows.map((row) => [row._id, row.trades || []]));
-
-    for (const symbol of staleSymbols) {
-      const recentTrades = bySymbol.get(symbol) || [];
-      let blacklisted = false;
-
-      if (recentTrades.length >= 2) {
-        const consecutiveLosses = recentTrades.every((t) => (t.pnlUSD || 0) < 0);
-        if (consecutiveLosses) {
-          const lastCloseTime = new Date(recentTrades[0].closeTime).getTime();
-          const hoursSinceLoss = (Date.now() - lastCloseTime) / (1000 * 60 * 60);
-          blacklisted = Number.isFinite(hoursSinceLoss) && hoursSinceLoss < 12;
-        }
-      }
-
-      dynamicBlacklistCache.set(symbol, { checkedAt: now, blacklisted });
-      if (blacklisted) result.add(symbol);
-    }
-  } catch (e) {
-    // Keep previous cached decisions if MongoDB is temporarily slow/down.
-    logger.warn?.(`[DYNAMIC-BLACKLIST] refresh skipped: ${e?.message || e}`);
-  }
-
-  return result;
-}
-
-function isCoinDynamicallyBlacklisted(symbol) {
+async function isCoinDynamicallyBlacklisted(symbol) {
   if (manualBlacklist.has(symbol)) return true;
-  return dynamicBlacklistCache.get(symbol)?.blacklisted === true;
+  try {
+    if (!closedTradesCollection || !isDbConnected) return false;
+    const recentTrades = await closedTradesCollection
+      .find({ symbol: symbol })
+      .sort({ closeTime: -1 })
+      .limit(3)
+      .toArray();
+
+    if (recentTrades.length < 2) return false;
+
+    const recentConsecutiveLosses = recentTrades.every(t => (t.pnlUSD || 0) < 0);
+    if (recentConsecutiveLosses) {
+      const lastCloseTime = new Date(recentTrades[0].closeTime).getTime();
+      const hoursSinceLoss = (Date.now() - lastCloseTime) / (1000 * 60 * 60);
+
+      if (hoursSinceLoss < 12) {
+        logger.info(`🧠 [AI-Learning] Coin ${symbol} wurde temporär gesperrt wegen 2 Verlusten in Folge.`);
+        return true;
+      }
+    }
+  } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
+  return false;
 }
 
 // ==========================================
@@ -2256,7 +2180,7 @@ function calculateSignalScore(params) {
 const exchangeAdapter = new KuCoinFuturesAdapter({
   logger,
   request: axiosGetWithRetry,
-  futuresRequest: marketDataFuturesRequest,
+  futuresRequest: futuresApiGetWithRetry,
   getFuturesSymbol,
   parseFloatSafe: safeParseFloat,
   config
@@ -2459,7 +2383,7 @@ async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
   const now = Date.now();
   const cacheKey = `${symbol}_${timeframe}`;
   const cached = klinesCache.get(cacheKey);
-  if (cached && cached.timeframe === timeframe && (now - cached.timestamp) < (Number(config.MARKET_DATA_CACHE_TTL_MS) || 55000)) {
+  if (cached && cached.timeframe === timeframe && (now - cached.timestamp) < 55000) {
     return cached.candles;
   }
   const candles = await fetchKucoinKlines(symbol, timeframe, limit);
@@ -2481,8 +2405,8 @@ const marketDataInflight = new Map();
 const marketDataSemaphore = {
   active: 0,
   queue: [],
-  limit: Math.max(1, Number(config.MARKET_DATA_CONCURRENCY || 4)),
-  async acquire(timeoutMs = config.MARKET_DATA_QUEUE_TIMEOUT_MS) {
+  limit: Math.max(1, Number(config.MARKET_DATA_CONCURRENCY || 3)),
+  async acquire(timeoutMs = 10000) {
     if (this.active < this.limit) {
       this.active++;
       return true;
@@ -2511,9 +2435,8 @@ const marketDataSemaphore = {
   }
 };
 const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
-  10000,
-  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 10000, 7000),
-  Math.max(7000, config.SCAN_ITEM_TIMEOUT_MS - 2000)
+  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 20000, 5000),
+  Math.max(5000, config.SCAN_ITEM_TIMEOUT_MS - 1000)
 );
 
 function isKucoinCircuitOpen() {
@@ -2532,9 +2455,9 @@ async function getMarketDataBundle(symbol) {
   if (existing) return existing;
 
   const task = (async () => {
-    const acquired = await marketDataSemaphore.acquire();
+    const acquired = await marketDataSemaphore.acquire(10000);
     if (!acquired) {
-      const err = new Error(`${symbol} market-data concurrency queue timeout after ${config.MARKET_DATA_QUEUE_TIMEOUT_MS}ms`);
+      const err = new Error(`${symbol} market-data concurrency queue timeout after 10000ms`);
       err.code = 'MARKET_DATA_QUEUE_TIMEOUT';
       throw err;
     }
@@ -3263,73 +3186,33 @@ async function getBitcoinTrend() {
 // fulfillment and rejection, and Promise.allSettled so one rejected/
 // timed-out item can never keep the whole pool pending.
 async function asyncPool(concurrency, items, iteratorFn, itemTimeoutMs = config.SCAN_ITEM_TIMEOUT_MS) {
-  const limit = Math.max(1, Number(concurrency) || 1);
-  const results = new Array(items.length);
-  let nextIndex = 0;
-
-  // The previous Promise.race implementation released a worker when the
-  // timeout fired even though iteratorFn was still running. That caused the
-  // actual concurrency to grow beyond the configured limit and amplified
-  // KuCoin/DB contention. A timeout now reports the item, but the worker is
-  // not reused until the underlying task has really settled.
-  async function worker(workerId) {
-    while (true) {
-      const index = nextIndex++;
-      if (index >= items.length) return;
-
-      const item = items[index];
-      const startedAt = Date.now();
-      let timer = null;
-      let task = null;
-
-      try {
-        task = Promise.resolve().then(() => iteratorFn(item));
-
-        if (itemTimeoutMs > 0) {
-          const timeout = new Promise((_, reject) => {
-            timer = setTimeout(() => {
-              const err = new Error(`asyncPool item timed out after ${itemTimeoutMs}ms`);
-              err.code = 'ASYNC_POOL_ITEM_TIMEOUT';
-              reject(err);
-            }, itemTimeoutMs);
-          });
-
-          try {
-            results[index] = await Promise.race([task, timeout]);
-          } catch (e) {
-            logger.warn(
-              `[ASYNC-POOL] item failed/timed out worker=${workerId} symbol=${item} ` +
-              `elapsedMs=${Date.now() - startedAt}: ${e?.message || e}`
-            );
-            results[index] = undefined;
-
-            // Critical: do not start another item while the timed-out task is
-            // still running. This preserves the real concurrency bound.
-            try { await task; } catch (_) {}
-          }
-        } else {
-          results[index] = await task;
-        }
-      } catch (e) {
-        logger.warn(
-          `[ASYNC-POOL] item failed worker=${workerId} symbol=${item} ` +
-          `elapsedMs=${Date.now() - startedAt}: ${e?.message || e}`
-        );
-        results[index] = undefined;
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
+  const results = [];
+  const executing = [];
+  const withTimeout = (item) => {
+    if (!itemTimeoutMs) return Promise.resolve().then(() => iteratorFn(item));
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`asyncPool item timed out after ${itemTimeoutMs}ms`)), itemTimeoutMs);
+    });
+    return Promise.race([Promise.resolve().then(() => iteratorFn(item)), timeout])
+      .finally(() => clearTimeout(timer));
+  };
+  for (const item of items) {
+    const p = withTimeout(item).catch((e) => {
+      logger.warn(`[ASYNC-POOL] item failed/timed out: ${e?.message || e}`);
+      return undefined;
+    });
+    results.push(p);
+    if (concurrency <= items.length) {
+      const e = p.finally(() => {
+        const idx = executing.indexOf(e);
+        if (idx !== -1) executing.splice(idx, 1);
+      });
+      executing.push(e);
+      if (executing.length >= concurrency) await Promise.race(executing);
     }
   }
-
-  await Promise.all(
-    Array.from(
-      { length: Math.min(limit, items.length) },
-      (_, i) => worker(i + 1)
-    )
-  );
-
-  return results.map((value) => ({ status: 'fulfilled', value }));
+  return Promise.allSettled(results);
 }
 
 function evaluateDirectionGates(dir, p, scanStats) {
@@ -3641,9 +3524,6 @@ async function scanMarket() {
 
     let signalsSent = 0;
 
-    // One bounded DB lookup for the whole scan; never query MongoDB per coin.
-    const dynamicBlacklist = await refreshDynamicBlacklist(dynamicWatchlist);
-
     await asyncPool(config.SCAN_CONCURRENCY, dynamicWatchlist, async (symbol) => {
       scanStats.total++;
       dashboardScanState.checked = scanStats.total;
@@ -3653,7 +3533,7 @@ async function scanMarket() {
         return; 
       }
 
-      if (isCoinDynamicallyBlacklisted(symbol) || dynamicBlacklist.has(symbol)) {
+      if (await isCoinDynamicallyBlacklisted(symbol).catch(() => false)) {
         scanStats.skippedDynamicBlacklist++;
         return;
       }
