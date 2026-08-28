@@ -1,63 +1,18 @@
 /**
- * ============================================================================
- * TRADING SIGNAL BOT - CROSS-HEDGING RISK MANAGER
- * (Automatisches Hedging bei Markt-Crashs und Portfolio-Absicherung)
- * ============================================================================
+ * Hedge Manager Modul für Risikosteuerung
  */
+'use strict';
 
 class HedgeManager {
-  constructor(options = {}) {
-    this.logger = options.logger || console;
-    this.hedgeActive = false;
-    this.lastBtcPrice = 0;
-    this.thresholdDropPct = options.thresholdDropPct || -2.5; // -2.5% BTC-Drop löst Hedge aus
-  }
-
-  /**
-   * Überwacht das Portfolio und den Bitcoin-Kurs auf Crash-Gefahr
-   */
-  async evaluateHedgeNeed(activeTrades, btcCurrentPrice) {
-    if (!activeTrades || activeTrades.size === 0) return { shouldHedge: false };
-
-    // Prüfen, ob überhaupt Long-Positionen offen sind, die geschützt werden müssen
-    const longTrades = [...activeTrades.values()].filter(t => t.direction === 'LONG');
-    if (longTrades.length === 0) return { shouldHedge: false };
-
-    if (this.lastBtcPrice === 0) {
-      this.lastBtcPrice = btcCurrentPrice;
-      return { shouldHedge: false };
+    calculateHedge(signal) {
+        if (!signal || !signal.price) {
+            return { action: 'NONE', ratio: 0.0 };
+        }
+        return {
+            action: signal.type === 'SELL_SIGNAL' ? 'INCREASE_HEDGE' : 'MAINTAIN',
+            ratio: 0.25
+        };
     }
-
-    // Kursänderung von BTC berechnen
-    const btcChangePct = ((btcCurrentPrice - this.lastBtcPrice) / this.lastBtcPrice) * 100;
-
-    // Wenn Bitcoin stark fällt und noch kein Hedge aktiv ist
-    if (btcChangePct <= this.thresholdDropPct && !this.hedgeActive) {
-      this.logger.warn(`⚠️ [HedgeManager] Starker BTC-Abfall erkannt (${btcChangePct.toFixed(2)}%). Aktiviere Notfall-Absicherung!`);
-      this.hedgeActive = true;
-
-      // Bugfix: lastBtcPrice muss auch beim Trigger-Tick aktualisiert werden.
-      // Vorher führte der frühe return dazu, dass die Recovery-Prüfung (unten)
-      // fälschlich gegen den alten Vor-Crash-Preis statt gegen den Crash-Preis lief.
-      this.lastBtcPrice = btcCurrentPrice;
-
-      return {
-        shouldHedge: true,
-        reason: 'BTC_FLASH_CRASH',
-        dropPct: btcChangePct,
-        recommendedAction: 'SHORT_BTC_HEDGE'
-      };
-    }
-
-    // Wenn sich der Markt wieder beruhigt hat, Hedge-Status zurücksetzen
-    if (btcChangePct >= 1.0 && this.hedgeActive) {
-      this.logger.info(`✅ [HedgeManager] Markt stabilisiert sich. Deaktiviere Hedge-Modus.`);
-      this.hedgeActive = false;
-    }
-
-    this.lastBtcPrice = btcCurrentPrice;
-    return { shouldHedge: false };
-  }
 }
 
-module.exports = { HedgeManager };
+module.exports = HedgeManager;
