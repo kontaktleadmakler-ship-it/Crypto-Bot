@@ -6109,10 +6109,69 @@ app.get('/api/dashboard/scan', async (req, res) => {
   }
 });
 
+// FIX 2026-08-29 (Neural Core live panel showed only "-"):
+// getDashboardData() re-fetches LIVE KuCoin data on every dashboard load and
+// shares the scanner's own MARKET_DATA_CONCURRENCY semaphore. While a scan is
+// running (or KuCoin is just slow), that live re-fetch can fail/timeout the
+// same way scan candidates do - and this endpoint used Promise.all(), so ONE
+// failed leg (market OR agents) took the whole response down as a 503, wiping
+// state.intel client-side. Separately, even on success, `current` never
+// actually forwarded market/technical/sentiment/decision - the exact fields
+// renderBrain()/renderAgents() in dashboard.html read - so the brain panel
+// stayed on dashes even with a healthy fetch.
+// Fix: use allSettled so one failing leg no longer kills the response, fall
+// back to the last known SCAN:COIN snapshot for that symbol (already
+// populated by the live scanner in dashboardLiveCoinSnapshots) when the live
+// fetch fails, and forward the fields the frontend actually needs.
+function dashboardMarketFromSnapshot(snapshot) {
+  if (!snapshot) return null;
+  return {
+    market: {
+      price: Number(snapshot.price || 0),
+      timestamp: Number(snapshot.timestamp || snapshot.eventTs || Date.now()),
+      change24h: Number(snapshot.changePct || 0),
+      volume24h: Number(snapshot.volume24h || 0),
+      orderBook: snapshot.orderBook || null,
+      contract: { openInterest: Number(snapshot.openInterest || 0), fundingRate: Number(snapshot.fundingRate || 0) }
+    },
+    technical: {
+      rsi: Number(snapshot.rsi || 0),
+      macd: { histogram: Number(snapshot.macdHistogram || 0) },
+      ma20: Number(snapshot.ma20 || 0),
+      ma50: Number(snapshot.ma50 || 0),
+      adx: Number(snapshot.adx || 0),
+      trend: snapshot.trend1h || snapshot.trend15m || 'NEUTRAL',
+      allowed: snapshot.gateStatus === 'PASS',
+      reason: snapshot.gateReason || (snapshot.gateStatus === 'PASS' ? '✓ TECHNICAL PASSED' : 'LETZTER BEKANNTER SCAN')
+    },
+    sentiment: {
+      fundingRate: Number(snapshot.fundingRate || 0),
+      orderFlow: snapshot.orderFlow?.pressure || 'UNKNOWN',
+      value: null, classification: null, allowed: null, bias: null,
+      reason: 'LETZTER BEKANNTER SCAN'
+    },
+    risk: null,
+    decision: {
+      action: snapshot.finalDecision || snapshot.gateDirection || 'REJECT',
+      confidence: Number(snapshot.confidence || (snapshot.mlProbability ? snapshot.mlProbability * 100 : 0) || 0),
+      reason: snapshot.decisionReason || snapshot.gateReason || 'Live-Fetch fehlgeschlagen \u2013 letzter bekannter Scan',
+      eventId: null, approvals: null
+    }
+  };
+}
+
 app.get('/api/dashboard/intelligence', async (req, res) => {
   try {
     const symbol = String(req.query.symbol || dashboardScanUniverse[0] || 'BTC-USDT').toUpperCase();
-    const [market, agents] = await Promise.all([getDashboardData(symbol), getDashboardAgentNetwork(symbol)]);
+    const [marketResult, agentsResult] = await Promise.allSettled([getDashboardData(symbol), getDashboardAgentNetwork(symbol)]);
+    const live = marketResult.status === 'fulfilled' ? marketResult.value : null;
+    const agents = agentsResult.status === 'fulfilled' ? agentsResult.value : null;
+    if (!live) {
+      logger.warn(`[Dashboard Intelligence] Live-Fetch fehlgeschlagen fuer ${symbol}: ${marketResult.reason?.message || 'unbekannt'} \u2013 falle auf letzten Scan-Snapshot zurueck`);
+    }
+    const fallback = live ? null : dashboardMarketFromSnapshot(dashboardLiveCoinSnapshots.get(symbol));
+    const market = live || fallback;
+
     const mlStats = mlModel.getStats();
     const dqnStats = dqnAgent.getStats();
     const drift = modelDriftMonitor.status();
@@ -6122,15 +6181,32 @@ app.get('/api/dashboard/intelligence', async (req, res) => {
     const current = {
       symbol, timestamp: Date.now(), marketPhase: dashboardRegimeSnapshot(),
       regime: dashboardRegimeSnapshot(),
-      macro: { value: market.sentiment?.value ?? null, classification: market.sentiment?.classification ?? null, bias: market.sentiment?.bias ?? null, allowed: market.sentiment?.allowed ?? null },
-      confidence: agents.confidence, consensus: agents.consensus, vetoes: agents.vetoes, finalAction: agents.finalAction,
+      market: market?.market || null,
+      technical: market?.technical || null,
+      sentiment: market?.sentiment || null,
+      decision: market?.decision || null,
+      adx: agents?.adx ?? market?.technical?.adx ?? null,
+      macro: { value: market?.sentiment?.value ?? null, classification: market?.sentiment?.classification ?? null, bias: market?.sentiment?.bias ?? null, allowed: market?.sentiment?.allowed ?? null },
+      confidence: agents?.confidence ?? market?.decision?.confidence ?? null,
+      consensus: agents?.consensus ?? null,
+      vetoes: agents?.vetoes ?? null,
+      finalAction: agents?.finalAction ?? market?.decision?.action ?? null,
       activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, equity: config.CAPITAL_USD + dailyNetPnL,
-      risk: market.risk, agents: agents.nodes,
-      dqn: { ...dqnStats, action: agents.dqn?.action, qValues: agents.dqn?.qValues },
+      risk: (live ? live.risk : null) ?? market?.risk ?? null,
+      agents: agents?.nodes ?? null,
+      dqn: { ...dqnStats, action: agents?.dqn?.action, qValues: agents?.dqn?.qValues },
       ml: { validationAccuracy: mlStats.validationAccuracy, stats: mlStats },
       drift,
-      execution: readiness.execution
+      execution: readiness.execution,
+      live: Boolean(live),
+      dataAge: live ? 0 : Math.max(0, Date.now() - Number(dashboardLiveCoinSnapshots.get(symbol)?.eventTs || dashboardLiveCoinSnapshots.get(symbol)?.timestamp || 0))
     };
+    if (!market) {
+      // Neither a live fetch nor any past scan snapshot exists for this
+      // symbol yet (e.g. right after boot, before the first scan reached
+      // it) - there is genuinely nothing to show, so this stays a 503.
+      throw new Error(marketResult.reason?.message || 'LIVE_MARKET_DATA_UNAVAILABLE');
+    }
     res.setHeader('Cache-Control','no-store');
     res.json({ timestamp: Date.now(), current, replay, performance, readiness, scanner: { ...dashboardScanState, universe: dashboardScanUniverse, intervalMs: Number(config.SCAN_INTERVAL_MS || config.SCAN_INTERVAL || 0) || null }, regime: dashboardRegimeSnapshot() });
   } catch (e) {
