@@ -3367,6 +3367,7 @@ function createEmptyScanStats() {
     universeLoaded: 0, watchlistReturned: 0, tradableCandidates: 0, filteredNonTradable: 0,
     marketDataEvaluated: 0, gatePassed: 0, gateRejected: 0, postGatePassed: 0,
     runtimeErrors: 0, paperExecutionRejected: 0,
+    preRiskBlocked: 0, preRiskReasons: {},
     skippedActiveTrade: 0, skippedMaxSignals: 0, skippedDbDisconnected: 0,
     skippedMaxConcurrentTrades: 0, skippedDailyLossLimit: 0, skippedMaxSameDirection: 0,
     skippedExposureLimit: 0, skippedMaxDrawdown: 0, missingKlines: 0,
@@ -3478,7 +3479,14 @@ async function scanMarket() {
     const adaptiveTP1 = config.TP1_MULT + adaptiveConfig.TP1_MULT_ADJ;
     const adaptiveVolume = config.MIN_RELATIVE_VOLUME * adaptiveConfig.VOLUME_MULT;
 
-    let adaptiveRisk = config.RISK_PERCENT * macroStatus.riskMultiplier;
+    // Risk multiplier compatibility: MacroFilter historically exposed `multiplier`,
+    // while the scanner consumed `riskMultiplier`. Normalize both names and never
+    // allow NaN to enter risk/position sizing.
+    const baseRiskPercent = Number(config.RISK_PERCENT);
+    const macroRiskMultiplier = Number(macroStatus?.riskMultiplier ?? macroStatus?.multiplier ?? 1);
+    const safeBaseRiskPercent = Number.isFinite(baseRiskPercent) && baseRiskPercent >= 0 ? baseRiskPercent : 0;
+    const safeMacroRiskMultiplier = Number.isFinite(macroRiskMultiplier) && macroRiskMultiplier >= 0 ? macroRiskMultiplier : 1;
+    let adaptiveRisk = safeBaseRiskPercent * safeMacroRiskMultiplier;
     if (config.ENABLE_KELLY_SIZING) {
       const weekStats = await getPeriodPerformanceStats(7).catch(() => null);
       if (weekStats && weekStats.totalTrades >= 20) {
@@ -3487,8 +3495,16 @@ async function scanMarket() {
           weekStats.avgWin, 
           Math.abs(weekStats.avgLoss), 
           config.RISK_PERCENT
-        ) * 100 * macroStatus.riskMultiplier;
+        ) * 100 * safeMacroRiskMultiplier;
+        if (!Number.isFinite(adaptiveRisk) || adaptiveRisk < 0) {
+          adaptiveRisk = safeBaseRiskPercent * safeMacroRiskMultiplier;
+        }
       }
+    }
+
+    if (!Number.isFinite(adaptiveRisk) || adaptiveRisk < 0) {
+      adaptiveRisk = safeBaseRiskPercent;
+      logger.warn('[RISK] adaptiveRisk invalid; safe fallback applied');
     }
 
     let timeFilterBlocked = false;
@@ -3549,7 +3565,7 @@ async function scanMarket() {
           dashboardLiveCoinSnapshots.set(symbol, {
             symbol, scanCounter: scanCounter + 1, scanStatus: 'LIVE_TICKER',
             price: t.price, change: t.changePct, changePct: t.changePct,
-            volume24h: t.volume24hUSD, rsi: 0, bidAskRatio: 1, tech: null,
+            volume24h: t.volume24hUSD, rsi: null, bidAskRatio: 1, tech: null,
             eventTs: nowTs, source: 'bulk-ticker-lightweight'
           });
         }
@@ -3601,12 +3617,21 @@ async function scanMarket() {
         return;
       }
 
-      const preCheck = riskEngine.assess({ equity: config.CAPITAL_USD + dailyNetPnL, peakEquity: peakCapital, dailyPnL: dailyNetPnL, openPositions: [...activeTrades.values()] });
+      const preCheck = riskEngine.assess({
+        equity: config.CAPITAL_USD + dailyNetPnL,
+        peakEquity: peakCapital,
+        dailyPnL: dailyNetPnL,
+        openPositions: [...activeTrades.values()]
+      });
       if (!preCheck.allowed) {
-        if (preCheck.reason && scanStats.hasOwnProperty(preCheck.reason)) {
-          scanStats[preCheck.reason]++;
-        } else {
-          scanStats.skippedActiveTrade++;
+        // This is a candidate-level hard risk gate. Keep it separate from
+        // market-data evaluation so diagnostics explain exactly why
+        // candidates never reached indicators/order-book evaluation.
+        scanStats.preRiskBlocked++;
+        const reason = String(preCheck.reason || 'unknown-risk-block');
+        scanStats.preRiskReasons[reason] = (scanStats.preRiskReasons[reason] || 0) + 1;
+        if (Object.prototype.hasOwnProperty.call(scanStats, reason)) {
+          scanStats[reason]++;
         }
         return;
       }
@@ -3631,12 +3656,36 @@ async function scanMarket() {
         }
 
         const { raw15m, raw1h, raw4h, futuresData, orderBookMetrics } = marketData;
-        if (!orderBookMetrics?.valid) {
-          scanStats.orderBookBlocked = (scanStats.orderBookBlocked || 0) + 1;
-          return;
-        }
 
-        const orderFlowEval = orderFlowManager.evaluateOrderFlow(raw15m, orderBookMetrics);
+        // IMPORTANT: Order-book data is an optional downstream input. A missing
+        // L2 snapshot must NOT prevent the symbol from reaching indicator/gate
+        // evaluation, otherwise one unavailable auxiliary endpoint turns an
+        // entire scan into `evaluated=0`. We keep the hard safety decision for
+        // actual signal generation below: a signal requiring L2 is blocked when
+        // no valid/fresh order book is available.
+        const hasValidOrderBook = Boolean(orderBookMetrics?.valid);
+        const effectiveOrderBook = hasValidOrderBook
+          ? orderBookMetrics
+          : {
+              valid: false,
+              bidAskRatio: null,
+              bidVolume: 0,
+              askVolume: 0,
+              spreadPct: null,
+              depthUSD: 0,
+              fetchedAt: 0,
+              source: 'unavailable'
+            };
+
+        let orderFlowEval;
+        try {
+          orderFlowEval = hasValidOrderBook
+            ? orderFlowManager.evaluateOrderFlow(raw15m, effectiveOrderBook)
+            : { score: 50, pressure: 'UNKNOWN', available: false };
+        } catch (e) {
+          orderFlowEval = { score: 50, pressure: 'UNKNOWN', available: false };
+          logger.warn(`[ORDER-FLOW] ${symbol}: evaluation unavailable: ${e.message}`);
+        }
 
         const closes4h = raw4h ? raw4h.map(c => c.close) : [];
         const closes1h = raw1h.map(c => c.close);
@@ -3743,6 +3792,16 @@ async function scanMarket() {
 
         if (direction !== null) {
           scanStats.postGatePassed++;
+
+          // No valid L2/order-book data: allow evaluation for diagnostics and
+          // dashboard visibility, but never allow a signal to proceed to sizing
+          // or paper execution without the required market microstructure data.
+          if (!hasValidOrderBook) {
+            scanStats.orderBookBlocked++;
+            logger.debug?.(`[ORDER-BOOK] ${symbol}: signal blocked because no valid order-book snapshot is available`);
+            return;
+          }
+
           if (direction === 'LONG' && orderFlowEval.pressure === 'BEARISH_DOMINANT' && orderFlowEval.score < 35) {
             scanStats.orderFlowBlocked++;
             return;
@@ -4093,7 +4152,7 @@ async function scanMarket() {
     }
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
-    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
+    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} preRiskBlocked=${scanStats.preRiskBlocked} preRiskReasons=${JSON.stringify(scanStats.preRiskReasons)} evaluated=${scanStats.marketDataEvaluated} orderBookBlocked=${scanStats.orderBookBlocked} missingKlines=${scanStats.missingKlines} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} mlBlocked=${scanStats.mlBlocked} dqnBlocked=${scanStats.dqnBlocked} agentBlocked=${scanStats.agentBlocked || 0} signalHistoryBlocked=${scanStats.signalHistoryBlocked} cooldownActive=${scanStats.cooldownActive} riskEngineBlocked=${scanStats.riskEngineBlocked || 0} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
 
     if (marketPhaseLogsCollection && isDbConnected) {
       await marketPhaseLogsCollection.insertOne({
