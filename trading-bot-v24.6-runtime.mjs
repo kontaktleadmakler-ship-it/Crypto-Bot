@@ -3656,36 +3656,12 @@ async function scanMarket() {
         }
 
         const { raw15m, raw1h, raw4h, futuresData, orderBookMetrics } = marketData;
-
-        // IMPORTANT: Order-book data is an optional downstream input. A missing
-        // L2 snapshot must NOT prevent the symbol from reaching indicator/gate
-        // evaluation, otherwise one unavailable auxiliary endpoint turns an
-        // entire scan into `evaluated=0`. We keep the hard safety decision for
-        // actual signal generation below: a signal requiring L2 is blocked when
-        // no valid/fresh order book is available.
-        const hasValidOrderBook = Boolean(orderBookMetrics?.valid);
-        const effectiveOrderBook = hasValidOrderBook
-          ? orderBookMetrics
-          : {
-              valid: false,
-              bidAskRatio: null,
-              bidVolume: 0,
-              askVolume: 0,
-              spreadPct: null,
-              depthUSD: 0,
-              fetchedAt: 0,
-              source: 'unavailable'
-            };
-
-        let orderFlowEval;
-        try {
-          orderFlowEval = hasValidOrderBook
-            ? orderFlowManager.evaluateOrderFlow(raw15m, effectiveOrderBook)
-            : { score: 50, pressure: 'UNKNOWN', available: false };
-        } catch (e) {
-          orderFlowEval = { score: 50, pressure: 'UNKNOWN', available: false };
-          logger.warn(`[ORDER-FLOW] ${symbol}: evaluation unavailable: ${e.message}`);
+        if (!orderBookMetrics?.valid) {
+          scanStats.orderBookBlocked = (scanStats.orderBookBlocked || 0) + 1;
+          return;
         }
+
+        const orderFlowEval = orderFlowManager.evaluateOrderFlow(raw15m, orderBookMetrics);
 
         const closes4h = raw4h ? raw4h.map(c => c.close) : [];
         const closes1h = raw1h.map(c => c.close);
@@ -3749,7 +3725,7 @@ async function scanMarket() {
         // evaluation is persisted with its complete observable market state.
         // This is the canonical bridge between the live scanner and Historical
         // Intelligence: the same snapshot shown live is replayable later.
-        dashboardRecordProductionScanCoin({
+        const scanRecordEvent = dashboardRecordProductionScanCoin({
           symbol,
           scanCounter: scanCounter + 1,
           scanStatus: 'EVALUATED',
@@ -3792,16 +3768,6 @@ async function scanMarket() {
 
         if (direction !== null) {
           scanStats.postGatePassed++;
-
-          // No valid L2/order-book data: allow evaluation for diagnostics and
-          // dashboard visibility, but never allow a signal to proceed to sizing
-          // or paper execution without the required market microstructure data.
-          if (!hasValidOrderBook) {
-            scanStats.orderBookBlocked++;
-            logger.debug?.(`[ORDER-BOOK] ${symbol}: signal blocked because no valid order-book snapshot is available`);
-            return;
-          }
-
           if (direction === 'LONG' && orderFlowEval.pressure === 'BEARISH_DOMINANT' && orderFlowEval.score < 35) {
             scanStats.orderFlowBlocked++;
             return;
@@ -3859,8 +3825,16 @@ async function scanMarket() {
           });
 
           const mlPrediction = predictSignalSuccess(mlFeatures);
+          dashboardPatchScanRecord(scanRecordEvent, symbol, {
+            mlProbability: Number(mlPrediction.probability),
+            mlTrained: Boolean(mlPrediction.trained)
+          });
           if (mlPrediction.trained && mlPrediction.probability < config.ML_MIN_PREDICTION_PROBABILITY) {
             scanStats.mlBlocked++;
+            dashboardPatchScanRecord(scanRecordEvent, symbol, {
+              finalDecision: 'REJECT',
+              decisionReason: `ML_PROBABILITY_BELOW_THRESHOLD (${(mlPrediction.probability * 100).toFixed(1)}%)`
+            });
             return;
           }
 
@@ -3886,9 +3860,21 @@ async function scanMarket() {
             regime: { confidence: currentMarketPhase === 'RANGING' || currentMarketPhase === 'TRENDING' ? 0.75 : 0.5 },
             oosScore: Number(mlModel.getStats().validationAccuracy || 0), driftScore: Number(modelDriftMonitor.status().score || 0)
           });
+          const agentCount = Object.keys(agentEvaluation).filter(k => k !== 'meta').length;
+          dashboardPatchScanRecord(scanRecordEvent, symbol, {
+            agentCount,
+            confidence: Number.isFinite(agentEvaluation.meta?.confidence)
+              ? Math.round(agentEvaluation.meta.confidence * 100)
+              : null,
+            riskState: agentEvaluation.meta?.hardBlock ? 'BLOCKED' : (agentEvaluation.meta?.decision || 'AVAILABLE')
+          });
           if (agentEvaluation.meta.hardBlock) {
             scanStats.agentBlocked = (scanStats.agentBlocked || 0) + 1;
             logger.warn(`[AGENT-SUPERVISOR] Signal für ${symbol} (${direction}) blockiert: ${agentEvaluation.meta.decision}`);
+            dashboardPatchScanRecord(scanRecordEvent, symbol, {
+              finalDecision: 'REJECT',
+              decisionReason: `AGENT_SUPERVISOR_BLOCK (${agentEvaluation.meta.decision})`
+            });
             return;
           }
 
@@ -3903,12 +3889,27 @@ async function scanMarket() {
               spreadPct: orderBookMetrics.spreadPct, volatilityRatio: btcATR > 0 ? atr / btcATR : 1,
               mlProbability: mlPrediction.probability
             });
-            const dqnAction = dqnAgent.act(dqnState);
+            // actWithMetadata() is the same underlying call act() makes
+            // internally (act() just discards the metadata) - switching to
+            // it changes no trading behaviour, it only lets us capture the
+            // Q-values/epsilon/model for the dashboard.
+            const dqnMeta = dqnAgent.actWithMetadata(dqnState);
+            const dqnAction = dqnMeta.action;
+            dashboardPatchScanRecord(scanRecordEvent, symbol, {
+              dqnAction: dqnMeta.actionName,
+              dqnEpsilon: dqnAgent.epsilon,
+              dqnModel: dqnMeta.modelVersion,
+              dqnQValues: dqnMeta.qValues
+            });
 
             // Wenn Action = 0 (Veto/Ablehnen) und außerhalb der Exploration (Epsilon)
             if (dqnAgent.shouldVetoCandidate(dqnAction, direction) && Math.random() >= dqnAgent.epsilon) {
               scanStats.dqnBlocked++;
               logger.info(`[DQN-VETO] Trade für ${symbol} (${direction}) vom DQN-Agenten blockiert (${dqnAgent.actions[dqnAction] || dqnAction}).`);
+              dashboardPatchScanRecord(scanRecordEvent, symbol, {
+                finalDecision: 'REJECT',
+                decisionReason: `DQN_VETO (${dqnMeta.actionName})`
+              });
               return;
             }
           }
@@ -4056,6 +4057,12 @@ async function scanMarket() {
           scanStats.signalsSent++;
           scanStats.totalSignalScore += signalScore;
 
+          dashboardPatchScanRecord(scanRecordEvent, symbol, {
+            finalDecision: direction,
+            decisionReason: 'SIGNAL_CONFIRMED',
+            signalScore: Number(signalScore || 0)
+          });
+
           const dynamicLeverage = calculateDynamicLeverage(atr, currentPrice, config.LEVERAGE);
 
           await upsertTrade(symbol, {
@@ -4152,7 +4159,7 @@ async function scanMarket() {
     }
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
-    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} preRiskBlocked=${scanStats.preRiskBlocked} preRiskReasons=${JSON.stringify(scanStats.preRiskReasons)} evaluated=${scanStats.marketDataEvaluated} orderBookBlocked=${scanStats.orderBookBlocked} missingKlines=${scanStats.missingKlines} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} mlBlocked=${scanStats.mlBlocked} dqnBlocked=${scanStats.dqnBlocked} agentBlocked=${scanStats.agentBlocked || 0} signalHistoryBlocked=${scanStats.signalHistoryBlocked} cooldownActive=${scanStats.cooldownActive} riskEngineBlocked=${scanStats.riskEngineBlocked || 0} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
+    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} preRiskBlocked=${scanStats.preRiskBlocked} preRiskReasons=${JSON.stringify(scanStats.preRiskReasons)} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
 
     if (marketPhaseLogsCollection && isDbConnected) {
       await marketPhaseLogsCollection.insertOne({
@@ -5307,6 +5314,42 @@ function dashboardRecordProductionScanCoin(snapshot, severity = 'INFO') {
   }
 
   return event;
+}
+
+// ---------------------------------------------------------------------------
+// SCAN HISTORY ENRICHMENT (DASHBOARD-FIX-v2)
+// The initial dashboardRecordProductionScanCoin() snapshot only carries raw
+// market-data/indicator fields, because ML/DQN/agent evaluation happens
+// LATER in the scan pipeline (and is skipped entirely for coins rejected at
+// the gate stage). Without a follow-up patch, every persisted scan-history
+// row is permanently missing mlProbability, dqnAction, confidence, agent
+// count, risk state and the real decision reason - which is why the
+// Scanner Dashboard's history/live panels showed "-" for those columns.
+// This patches BOTH the live in-memory snapshot (dashboardLiveCoinSnapshots)
+// and the durable MongoDB row (matched by eventId) with whatever additional
+// fields become known as the pipeline progresses for that symbol.
+// ---------------------------------------------------------------------------
+function dashboardPatchScanRecord(scanRecordEvent, symbol, patch) {
+  if (!symbol || !patch) return;
+  const key = String(symbol).toUpperCase();
+
+  const existingLive = dashboardLiveCoinSnapshots.get(key);
+  if (existingLive) {
+    dashboardLiveCoinSnapshots.set(key, { ...existingLive, ...patch });
+  }
+
+  if (dashboardScanHistoryCollection && isDbConnected && scanRecordEvent?.eventId) {
+    const setFields = {};
+    for (const [k, v] of Object.entries(patch)) {
+      setFields[`payload.${k}`] = v;
+    }
+    void dashboardScanHistoryCollection.updateOne(
+      { eventId: scanRecordEvent.eventId },
+      { $set: setFields }
+    ).catch(err => {
+      logger.warn?.(`[DASHBOARD HISTORY] patch failed: ${err.message}`);
+    });
+  }
 }
 
 function dashboardLiveScannerRows() {

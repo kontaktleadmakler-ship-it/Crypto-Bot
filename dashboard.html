@@ -242,8 +242,8 @@ function renderNeuralDetail(){
 function renderScanHistory(){
  const rows=Array.isArray(state.scanHistory)?state.scanHistory:[];
  $('scanHistory').innerHTML=rows.slice().reverse().slice(0,40).map(e=>{
-   const p=e.payload||{}, action=p.gateDirection||p.action||'NO SIGNAL', status=p.gateStatus||p.scanStatus||'—';
-   const why=p.gateReason||p.reason||'—';
+   const p=e.payload||{}, action=(p.finalDecision&&p.finalDecision!=='REJECT')?p.finalDecision:(p.gateDirection||p.action||'NO SIGNAL'), status=p.finalDecision==='REJECT'?'REJECT':(p.gateStatus||p.scanStatus||'—');
+   const why=p.decisionReason||p.gateReason||p.reason||'—';
    const q=String(action).toUpperCase();
    const cls=q==='LONG'||q==='SHORT'||q==='BUY'||q==='SELL'?'good':status==='REJECT'?'bad':'warn';
    return `<div style="border-bottom:1px solid #102536;padding:5px 2px"><b>${new Date(e.ts||Date.now()).toLocaleTimeString()}</b> · <b>${esc(e.symbol)}</b> · <span class="${cls}">${esc(action)}</span><br><span style="color:var(--muted)">RSI ${n(p.rsi,1)} · ADX ${n(p.adx,1)} · ML ${p.mlProbability==null?'—':n(Number(p.mlProbability)*100,1)+'%'} · DQN ${esc(p.dqnAction||'—')} · ${esc(why)}</span></div>`;
