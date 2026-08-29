@@ -17,6 +17,15 @@ class OrderBookEngine extends EventEmitter {
     this.onTradingPause = onTradingPause;
     this.books = new Map();
     this.pausedSymbols = new Set();
+    // FIX 2026-08-29: no websocket feed is currently wired to this engine in
+    // production (SequencedOrderBookBridge is never instantiated), so every
+    // symbol's book stays permanently empty. Without this tracking, the very
+    // first isTradable() call on any never-fed symbol self-poisons it into
+    // pausedSymbols (see metrics() below) and callers give up instead of
+    // using the REST fallback - meaning orderBookMetrics is always null for
+    // every symbol, forever. fedSymbols lets callers distinguish "genuinely
+    // paused after a real feed/gap" from "never had a feed to begin with".
+    this.fedSymbols = new Set();
   }
 
   get(symbol) {
@@ -29,6 +38,12 @@ class OrderBookEngine extends EventEmitter {
     return this.books.get(symbol);
   }
 
+  // True once this symbol has received at least one real snapshot/delta from
+  // a live feed. False for a symbol nobody has ever pushed data for.
+  hasFeed(symbol) {
+    return this.fedSymbols.has(symbol);
+  }
+
   _pause(info) {
     this.pausedSymbols.add(info.symbol);
     this.emit('gap', info);
@@ -36,6 +51,7 @@ class OrderBookEngine extends EventEmitter {
   }
 
   installSnapshot(symbol, snapshot) {
+    this.fedSymbols.add(symbol);
     const ok = this.get(symbol).applySnapshot(snapshot);
     if (!ok) { this._pause({ symbol, reason: this.get(symbol).reason }); return false; }
     this.pausedSymbols.delete(symbol);
@@ -53,7 +69,11 @@ class OrderBookEngine extends EventEmitter {
   metrics(symbol) {
     const book = this.get(symbol);
     const metrics = book.metrics(this.depth);
-    if (!metrics.valid) this.pausedSymbols.add(symbol);
+    // Only latch a symbol into pausedSymbols on invalid metrics if it has
+    // actually been fed real data at some point. A symbol nobody ever fed
+    // is simply "no data yet", not "paused due to a gap/failure" - treating
+    // it as paused permanently blocks the REST fallback for no reason.
+    if (!metrics.valid && this.fedSymbols.has(symbol)) this.pausedSymbols.add(symbol);
     return { ...metrics, tradingPaused: this.pausedSymbols.has(symbol) };
   }
 
@@ -63,6 +83,9 @@ class OrderBookEngine extends EventEmitter {
   }
 
   isPaused(symbol) {
+    // Never fed -> not "paused", just has no WS data. Lets callers fall
+    // back to REST instead of giving up.
+    if (!this.fedSymbols.has(symbol)) return false;
     return this.pausedSymbols.has(symbol);
   }
 
