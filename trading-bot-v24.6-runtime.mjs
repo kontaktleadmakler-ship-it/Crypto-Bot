@@ -177,6 +177,30 @@ const logger = winston.createLogger({
   ]
 });
 
+// DIAGNOSE (2026-08-29): Event-Loop-Lag-Monitor. Hintergrund: massenhafte,
+// exakt gleichzeitige "asyncPool item timed out"-Meldungen bei mehreren
+// Symbolen sind nicht zwingend Netzwerk-/Queue-Kongestion - sie treten auch
+// auf, wenn der Node-Event-Loop durch synchrone CPU-Last (z.B. Indikator-
+// Berechnung, ML/DQN-Inferenz über viele Symbole) blockiert wird, sodass
+// selbst die kürzeren inneren Timeouts (Market-Data-Bundle, Semaphore) nicht
+// pünktlich feuern und alles gemeinsam erst im äußeren 75s-Timeout auffliegt.
+// Rein additiv, per Default an, per Env-Var abschaltbar; nur ein warn-Log,
+// keine Verhaltensänderung an der Trading-/Scan-Logik.
+const ENABLE_EVENTLOOP_LAG_LOG = process.env.ENABLE_EVENTLOOP_LAG_LOG !== 'false';
+const EVENTLOOP_LAG_CHECK_MS = 1000;
+const EVENTLOOP_LAG_WARN_THRESHOLD_MS = 1000;
+if (ENABLE_EVENTLOOP_LAG_LOG) {
+  let lastLagCheck = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    const drift = now - lastLagCheck - EVENTLOOP_LAG_CHECK_MS;
+    lastLagCheck = now;
+    if (drift > EVENTLOOP_LAG_WARN_THRESHOLD_MS) {
+      logger.warn(`⏱️ [EVENT-LOOP] Verzögerung erkannt: Timer war ${drift}ms zu spät dran (Event-Loop war blockiert/überlastet). Das kann kurz vor "asyncPool item timed out"-Meldungen auf CPU-Blockierung statt Netzwerk-Kongestion hindeuten.`);
+    }
+  }, EVENTLOOP_LAG_CHECK_MS).unref?.();
+}
+
 let isShuttingDown = false;
 let currentMarketPhase = 'RANGING';
 let adaptiveConfig = null;
@@ -1193,6 +1217,12 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
   if (Date.now() < kucoinCircuitOpenUntil) {
     throw new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
   }
+  // FIX (2026-08-29): erlaubt Aufrufern, Retries pro Request abzuschalten
+  // (options.retries: 0), statt dass ein einzelner 5s-Timeout im Scan-Pfad
+  // bis zu ~15s zusätzlicher Retry-Zeit anhäuft und den Market-Data-Pool/
+  // das Futures-Semaphore verstopft. Ohne options.retries bleibt das alte
+  // Default-Verhalten unverändert.
+  if (typeof options.retries === 'number') retries = options.retries;
 
   await apiRateLimiter.checkLimit();
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -2498,9 +2528,14 @@ const marketDataInflight = new Map();
 // SCAN_CONCURRENCY/MARKET_DATA_CONCURRENCY now 3 instead of 8, contention on
 // futuresApiSemaphore is far lower, so bundles should rarely need the full
 // budget - this just gives a bit more slack for genuinely slow symbols.
+// FIX (2026-08-29): war hart auf max. 20000ms gedeckelt (siehe historischer
+// Kommentar oben: v25.0.13 wollte 10s als Default). Env-Var-Override bleibt
+// erhalten, aber der Fallback-Default ist jetzt 10000ms statt 20000ms, damit
+// ein hängender Bundle-Fetch deutlich vor dem äußeren 75s asyncPool-Timeout
+// auffliegt und einzeln geloggt wird statt im gleichen Moment mitzutimen.
 const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
   20000,
-  Math.max(8000, parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 20000),
+  Math.max(8000, parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 10000),
   Math.max(8000, config.SCAN_ITEM_TIMEOUT_MS - 2000)
 );
 
@@ -3392,7 +3427,8 @@ function createEmptyScanStats() {
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
     timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0,
-    marketDataTimeouts: 0, marketDataQueueTimeouts: 0, marketDataFailures: 0, circuitBreakerSkips: 0
+    marketDataTimeouts: 0, marketDataQueueTimeouts: 0, marketDataFailures: 0, circuitBreakerSkips: 0,
+    mlGateSkippedLowQuality: 0
   };
 }
 
@@ -3844,7 +3880,23 @@ async function scanMarket() {
             mlProbability: Number(mlPrediction.probability),
             mlTrained: Boolean(mlPrediction.trained)
           });
-          if (mlPrediction.trained && mlPrediction.probability < config.ML_MIN_PREDICTION_PROBABILITY) {
+          // FIX (2026-08-29): Ein Modell mit validationQuality LOW_SAMPLE
+          // oder WEAK_POSITIVE_DETECTION hat auf dem eigenen Validierungsset
+          // nicht einen einzigen Erfolgsfall korrekt erkannt (Precision/
+          // Recall 0%, siehe Trainings-Log) - es sagt de facto immer "nein".
+          // Bisher durfte so ein erkennbar unbrauchbares Modell trotzdem
+          // JEDES Signal blockieren (postGatePassed>0, signals=0 über Tage).
+          // Das Qualitäts-Label wurde beim Training zwar schon berechnet und
+          // geloggt, aber nirgends zur Gate-Entscheidung herangezogen. Bis
+          // genug Trades für ein verlässliches Modell da sind, wird das
+          // ML-Gate jetzt übersprungen (nicht "bestanden" - nur nicht als
+          // Blocker missbraucht); alle anderen Gates (Gate-Score, DQN,
+          // Risk-Engine etc.) greifen unverändert weiter.
+          const mlQualityUnreliable = mlPrediction.trained &&
+            (mlPrediction.validationQuality === 'LOW_SAMPLE' || mlPrediction.validationQuality === 'WEAK_POSITIVE_DETECTION');
+          if (mlQualityUnreliable) {
+            scanStats.mlGateSkippedLowQuality = (scanStats.mlGateSkippedLowQuality || 0) + 1;
+          } else if (mlPrediction.trained && mlPrediction.probability < config.ML_MIN_PREDICTION_PROBABILITY) {
             scanStats.mlBlocked++;
             dashboardPatchScanRecord(scanRecordEvent, symbol, {
               finalDecision: 'REJECT',
@@ -4175,6 +4227,11 @@ async function scanMarket() {
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
     logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} preRiskBlocked=${scanStats.preRiskBlocked} preRiskReasons=${JSON.stringify(scanStats.preRiskReasons)} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
+    // FIX (2026-08-29): postGatePassed>0 aber signals==0 über mehrere Tage
+    // gemeldet - die Zähler für alles zwischen Gate-Pass und Signalversand
+    // wurden zwar schon mitgezählt, tauchten aber nie in diesem Log auf.
+    // Ergänzt, damit sichtbar ist, WELCHER Block die Kandidaten schluckt.
+    logger.info(`[SCAN-DIAGNOSTICS-POSTGATE] orderFlowBlocked=${scanStats.orderFlowBlocked} fundingBlocked=${scanStats.fundingBlocked} cooldownActive=${scanStats.cooldownActive} correlationBlocked=${scanStats.correlationBlocked} orderBookBlocked=${scanStats.orderBookBlocked} mlBlocked=${scanStats.mlBlocked} mlGateSkippedLowQuality=${scanStats.mlGateSkippedLowQuality || 0} agentBlocked=${scanStats.agentBlocked || 0} dqnBlocked=${scanStats.dqnBlocked} signalHistoryBlocked=${scanStats.signalHistoryBlocked} positionTooSmallForLot=${scanStats.positionTooSmallForLot} reconciliationBlocked=${scanStats.reconciliationBlocked || 0} riskEngineBlocked=${scanStats.riskEngineBlocked || 0}`);
 
     if (marketPhaseLogsCollection && isDbConnected) {
       await marketPhaseLogsCollection.insertOne({
