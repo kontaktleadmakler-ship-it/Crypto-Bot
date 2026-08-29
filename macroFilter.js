@@ -64,6 +64,7 @@ class MacroFilter {
             value: sentimentValue,
             classification: sentimentClass,
             multiplier,
+            riskMultiplier: multiplier,
             regime,
             allowedToTrade: safe
         };
