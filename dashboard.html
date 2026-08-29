@@ -30,9 +30,33 @@
 @keyframes brainScan{to{top:105%}}
 .brain-chip{position:absolute;z-index:5;left:50%;top:50%;transform:translate(-50%,-50%);padding:5px 9px;border:1px solid rgba(0,240,255,.35);background:rgba(3,12,20,.68);backdrop-filter:blur(3px);font:700 8px Orbitron;color:var(--cyan);letter-spacing:2px;text-shadow:0 0 9px rgba(0,240,255,.8);box-shadow:0 0 22px rgba(0,240,255,.12)}
 .brain-decision-list{position:absolute;right:10px;top:32px;z-index:5;width:150px;display:grid;gap:4px;pointer-events:none}.brain-decision-item{padding:4px 6px;border:1px solid rgba(0,240,255,.16);background:rgba(4,11,18,.68);font-size:6px;color:#7899a8;backdrop-filter:blur(3px)}.brain-decision-item b{color:#d9f9ff}.brain-decision-item.good{border-color:rgba(0,255,136,.3)}.brain-decision-item.bad{border-color:rgba(255,51,102,.3)}
+/* DASHBOARD-AUTH-FIX: inline key gate (replaces window.prompt, which many
+   in-app/embedded browsers silently block, and an explicit auth-error
+   banner so a bad/missing key doesn't just look like "no data yet"). */
+#authOverlay{position:fixed;inset:0;z-index:999;background:rgba(4,9,16,.86);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(2px)}
+#authOverlay.hidden{display:none}
+#authBox{width:min(360px,90vw);border:1px solid #0e4258;border-radius:8px;background:linear-gradient(145deg,#0a1220f5,#070d17f2);box-shadow:0 0 30px #00f0ff22;padding:20px}
+#authBox h2{font:700 13px Orbitron;letter-spacing:1.5px;color:var(--cyan);margin:0 0 6px}
+#authBox p{font-size:10px;color:var(--muted);margin:0 0 12px;line-height:1.5}
+#authBox input{width:100%;background:#08131e;color:#d8f9ff;border:1px solid #123e53;border-radius:5px;padding:8px;font:11px 'JetBrains Mono';margin-bottom:10px}
+#authBox button{width:100%;background:#0b1622;border:1px solid var(--cyan);color:#fff;border-radius:5px;padding:8px;font:10px 'JetBrains Mono';cursor:pointer;letter-spacing:1px}
+#authBox button:hover{box-shadow:0 0 10px #00f0ff55}
+#authError{color:var(--red);font-size:9px;margin:-4px 0 10px;min-height:11px}
+#authBanner{display:none;position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:998;background:#2a0b13;border:1px solid var(--red);color:#ffd7de;font:10px 'JetBrains Mono';padding:6px 14px;border-radius:6px;cursor:pointer}
+#authBanner.show{display:block}
 </style>
 </head>
 <body>
+<div id="authOverlay" class="hidden">
+  <div id="authBox">
+    <h2>◉ DASHBOARD AUTH</h2>
+    <p>API-Key für dieses Dashboard eingeben (X-API-Key). Wird lokal in diesem Browser gespeichert.</p>
+    <div id="authError"></div>
+    <input id="authInput" type="password" placeholder="API Key" autocomplete="off">
+    <button id="authSubmit">CONNECT</button>
+  </div>
+</div>
+<div id="authBanner" onclick="showKeyModal(true)">⚠ API-KEY UNGÜLTIG ODER FEHLT — KLICKEN ZUM NEU EINGEBEN</div>
 <div class="app">
 <header class="header">
   <div><div class="brand">◉ JARVIS <span style="color:var(--cyan)">6.11</span></div><small>NEURAL COMMAND CENTER</small></div>
@@ -81,22 +105,48 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&
 const n=(v,d=2)=>Number.isFinite(Number(v))?Number(v).toFixed(d):'—';
 const pct=v=>v==null?'—':`${Number(v)>=0?'+':''}${n(v,2)}%`;
 const colorClass=v=>Number(v)>0?'good':Number(v)<0?'bad':'warn';
+// DASHBOARD-AUTH-FIX: window.prompt() is a synchronous dialog that many
+// in-app/embedded browsers (e.g. webviews used by chat apps) silently block
+// or auto-dismiss - it then returns null/'' with no visible error, every
+// API call 401s, and the page just sits on its placeholder dashes forever.
+// This replaces it with an inline HTML form and stores the key in
+// localStorage (survives across sessions/tabs, unlike sessionStorage).
 function dashboardApiKey(){
-  let key=sessionStorage.getItem('DASHBOARD_API_KEY');
-  if(!key){
-    const urlKey=new URLSearchParams(location.search).get('apiKey');
-    if(urlKey){sessionStorage.setItem('DASHBOARD_API_KEY',urlKey);return urlKey;}
-    key=prompt('API-Key für das Dashboard eingeben (X-API-Key):')||'';
-    sessionStorage.setItem('DASHBOARD_API_KEY',key);
-  }
-  return key;
+  const urlKey=new URLSearchParams(location.search).get('apiKey');
+  if(urlKey){localStorage.setItem('DASHBOARD_API_KEY',urlKey);return urlKey;}
+  return localStorage.getItem('DASHBOARD_API_KEY')||'';
 }
+function showKeyModal(isRetry){
+  $('authBanner').classList.remove('show');
+  $('authError').textContent=isRetry===true?'Key wurde abgelehnt (401). Bitte erneut eingeben.':'';
+  $('authInput').value=dashboardApiKey();
+  $('authOverlay').classList.remove('hidden');
+  $('authInput').focus();
+}
+function hideKeyModal(){$('authOverlay').classList.add('hidden');}
+$('authSubmit').addEventListener('click',()=>{
+  const v=$('authInput').value.trim();
+  if(!v){$('authError').textContent='Key darf nicht leer sein.';return;}
+  localStorage.setItem('DASHBOARD_API_KEY',v);
+  hideKeyModal();
+  load();
+});
+$('authInput').addEventListener('keydown',e=>{if(e.key==='Enter')$('authSubmit').click();});
 function withApiKey(path){
   const key=dashboardApiKey();
   if(!key)return path;
   return path+(path.includes('?')?'&':'?')+'apiKey='+encodeURIComponent(key);
 }
-async function api(path){const r=await fetch(path,{cache:'no-store',headers:{'X-API-Key':dashboardApiKey()}});if(r.status===401){sessionStorage.removeItem('DASHBOARD_API_KEY');}if(!r.ok)throw new Error(`${r.status} ${path}`);return r.json()}
+let dashboardAuthFailed=false;
+async function api(path){
+  const key=dashboardApiKey();
+  if(!key){dashboardAuthFailed=true;throw Object.assign(new Error(`NO_API_KEY ${path}`),{authError:true});}
+  const r=await fetch(path,{cache:'no-store',headers:{'X-API-Key':key}});
+  if(r.status===401){dashboardAuthFailed=true;throw Object.assign(new Error(`401 ${path}`),{authError:true});}
+  dashboardAuthFailed=dashboardAuthFailed&&false;
+  if(!r.ok)throw new Error(`${r.status} ${path}`);
+  return r.json();
+}
 function focusPanel(id){$(id)?.scrollIntoView?.({behavior:'smooth',block:'nearest'});$(id)?.classList.add('flash');setTimeout(()=>$(id)?.classList.remove('flash'),700)}
 function formatPrice(v){const x=Number(v);if(!Number.isFinite(x))return '—';if(x>=1000)return x.toLocaleString(undefined,{maximumFractionDigits:2});if(x>=1)return x.toFixed(4);return x.toFixed(6)}
 function renderMarket(){const rows=state.market||[];$('marketRows').innerHTML=rows.map(r=>{const ch=Number(r.change||0);const flow=Number(r.bidAskRatio||1);const gate=r.tech===false?'VETO':(r.tech===true?'PASS':'—');const bars=Math.max(1,Math.min(5,Math.round(Math.abs(ch)*1.5)+1));return `<tr><td class="sym">${esc(r.symbol)}</td><td>${formatPrice(r.price)}</td><td class="${colorClass(ch)}">${pct(ch)}</td><td>${n(r.rsi,1)}</td><td class="bars">${'▮'.repeat(bars)}<span style="color:${flow>1.05?'var(--green)':flow<.95?'var(--red)':'var(--cyan)'}"> ${n(flow,2)}</span></td><td class="signal ${gate==='PASS'?'good':gate==='VETO'?'bad':''}">${gate}</td></tr>`}).join('')||'<tr><td colspan="6">WAITING FOR SCANNER MARKET DATA…</td></tr>';$('scanState').textContent=state.scan?.isScanning?'SCANNING':(state.liveSource==='PRODUCTION_SCANNER'?'LIVE SCANNER':'WAITING');}
@@ -253,7 +303,14 @@ function renderScanHistory(){
 async function load(){try{const marketResult=await Promise.allSettled([api('/api/dashboard/live-scanner')]);const market=marketResult[0].status==='fulfilled'?marketResult[0].value:null;state.market=market?.rows||state.market||[];state.scan=market?.scan||state.scan||{};state.liveSource=market?.source||state.liveSource||'WAITING';fetch('/api/dashboard/connection',{cache:'no-store',headers:{'X-API-Key':dashboardApiKey()}}).then(r=>r.json()).then(c=>{state.connection=c; $('eventCount').textContent=c.connected?'LIVE':'WAITING'; $('footerStatus').textContent=c.connected?'JARVIS 6.15 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.15 // WAITING FOR PRODUCTION SCANNER';}).catch(()=>{});renderMarket();renderHeat();const syms=state.market.map(r=>r.symbol).filter(Boolean);const sel=$('coinSelect');const current=state.symbol;sel.innerHTML=syms.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');if(syms.includes(current))sel.value=current;else if(syms[0]){state.symbol=syms[0];sel.value=syms[0]}
 const [intel,agents,portfolio,regime,router,timeline,scanHistory,execution,connection,marketOverview]=await Promise.allSettled([api(`/api/dashboard/intelligence?symbol=${encodeURIComponent(state.symbol)}`),api(`/api/dashboard/agents?symbol=${encodeURIComponent(state.symbol)}`),api('/api/dashboard/portfolio-learning'),api('/api/dashboard/regime-intelligence'),api(`/api/dashboard/adaptive-router?symbol=${encodeURIComponent(state.symbol)}`),api(`/api/dashboard/coin-timeline?symbol=${encodeURIComponent(state.symbol)}&limit=160`),api(`/api/dashboard/scan-history?symbol=${encodeURIComponent(state.symbol)}&limit=120`),api(`/api/dashboard/execution?symbol=${encodeURIComponent(state.symbol)}`),api('/api/dashboard/connection'),api('/api/dashboard/market-overview')]);
 state.intel=intel.status==='fulfilled'?intel.value:null;state.agents=agents.status==='fulfilled'?agents.value:null;state.portfolio=portfolio.status==='fulfilled'?portfolio.value:null;state.regime=regime.status==='fulfilled'?regime.value:null;state.router=router.status==='fulfilled'?router.value:null;state.execution=execution.status==='fulfilled'?execution.value:null;state.connection=connection.status==='fulfilled'?connection.value:null;state.marketOverview=marketOverview.status==='fulfilled'?marketOverview.value:null;if(timeline.status==='fulfilled'){state.timeline=timeline.value.timeline||[];state.timelineSummary=timeline.value.summary||{}}
-$('heroSymbol').textContent=state.symbol;$('chartSymbol').textContent=state.symbol;$('regime').textContent=state.regime?.currentRegime||state.regime?.phase||state.regime?.live?.phase||state.intel?.regime?.phase||state.intel?.current?.marketPhase?.phase||state.intel?.current?.marketPhase||'—';$('regimeLarge').textContent=$('regime').textContent;$('regimeDesc').textContent=state.regime?.description||state.intel?.regime?.description||'Adaptive regime intelligence';$('riskHead').textContent=state.portfolio?.portfolio?.risk?.level||state.intel?.current?.risk?.level||'—';$('riskHead').className=(String($('riskHead').textContent).includes('HIGH')?'bad':String($('riskHead').textContent).includes('LOW')?'good':'warn');const pnl=state.portfolio?.portfolio?.dailyPnL; $('pnlHead').textContent=pnl==null?'—':pct(pnl);$('pnlHead').className=colorClass(pnl);renderAgents();renderLiveControl();renderBrain();renderNeuralDetail();renderScanHistory();renderForensics();renderOutcomeChart();renderRouter();$('lastUpdate').textContent=new Date().toLocaleTimeString();$('footerStatus').textContent=state.liveSource==='PRODUCTION_SCANNER'&&state.market.length?'JARVIS 6.15 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.15 // WAITING FOR PRODUCTION SCANNER';}catch(e){$('footerStatus').textContent='JARVIS // DATA LINK DEGRADED · '+e.message}}
+$('heroSymbol').textContent=state.symbol;$('chartSymbol').textContent=state.symbol;$('regime').textContent=state.regime?.currentRegime||state.regime?.phase||state.regime?.live?.phase||state.intel?.regime?.phase||state.intel?.current?.marketPhase?.phase||state.intel?.current?.marketPhase||'—';$('regimeLarge').textContent=$('regime').textContent;$('regimeDesc').textContent=state.regime?.description||state.intel?.regime?.description||'Adaptive regime intelligence';$('riskHead').textContent=state.portfolio?.portfolio?.risk?.level||state.intel?.current?.risk?.level||'—';$('riskHead').className=(String($('riskHead').textContent).includes('HIGH')?'bad':String($('riskHead').textContent).includes('LOW')?'good':'warn');const pnl=state.portfolio?.portfolio?.dailyPnL; $('pnlHead').textContent=pnl==null?'—':pct(pnl);$('pnlHead').className=colorClass(pnl);renderAgents();renderLiveControl();renderBrain();renderNeuralDetail();renderScanHistory();renderForensics();renderOutcomeChart();renderRouter();$('lastUpdate').textContent=new Date().toLocaleTimeString();$('footerStatus').textContent=state.liveSource==='PRODUCTION_SCANNER'&&state.market.length?'JARVIS 6.15 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.15 // WAITING FOR PRODUCTION SCANNER';
+if(dashboardAuthFailed){$('authBanner').classList.add('show');$('footerStatus').textContent='JARVIS // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';}
+else{$('authBanner').classList.remove('show');}
+}catch(e){
+  if(e&&e.authError){$('authBanner').classList.add('show');$('footerStatus').textContent='JARVIS // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';}
+  else{$('footerStatus').textContent='JARVIS // DATA LINK DEGRADED · '+e.message}
+}}
+if(!dashboardApiKey())showKeyModal(false);
 $('coinSelect').addEventListener('change',e=>{state.symbol=e.target.value;load()});setInterval(()=>{$('clock').textContent=new Date().toLocaleTimeString('de-DE');},1000);$('clock').textContent=new Date().toLocaleTimeString('de-DE');
 
 // ---------------------------------------------------------------------------

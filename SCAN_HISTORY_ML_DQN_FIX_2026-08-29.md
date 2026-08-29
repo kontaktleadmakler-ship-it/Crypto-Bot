@@ -53,6 +53,38 @@ loads via dynamic import)
 and the "WHY" line reflect the real ML/agent/DQN outcome instead of only the
 early market-data gate result.
 
+## Second fix (same day): dashboard shows zero live data at all
+
+Separate from the above, the live `/dashboard` page was showing nothing but
+placeholder dashes (`—`, `--:--:--`) — not wrong data, no data at all.
+
+Root cause: every dashboard API call requires an `X-API-Key` header
+(`req.get('X-API-Key') !== config.API_KEY` → `401`), and the *only* way
+`dashboard.html` obtained that key was a blocking `window.prompt()` dialog.
+Many in-app/embedded browsers (webviews used by chat apps, some mobile
+browsers) silently block or auto-dismiss synchronous `prompt()` calls,
+returning `null`/`''` with no visible error — so the key was never entered,
+every API call 401'd, and the page just stayed on its default placeholders
+forever. Worse, `load()`'s error handling treated that failure identically
+to "backend has no data yet," so there was no visible signal that anything
+was wrong.
+
+Fix (`dashboard.html`):
+- Replaced `prompt()`-based key entry with an inline HTML overlay/form
+  (`#authOverlay`) that works in any browser, including webviews that block
+  synchronous dialogs. The key is now stored in `localStorage` (persists
+  across sessions) instead of `sessionStorage`.
+- The overlay auto-appears on first load if no key is stored yet, and the
+  `?apiKey=...` URL parameter still works exactly as before as a shortcut.
+- `api()` now tags 401/missing-key failures distinctly (`err.authError`),
+  and `load()` surfaces that as a visible red "API-KEY UNGÜLTIG ODER FEHLT"
+  banner (click to re-enter) instead of silently reporting
+  "WAITING FOR PRODUCTION SCANNER".
+
+If you're deploying this: your existing `?apiKey=` links keep working
+unchanged; on a fresh browser/device you'll now get an on-page prompt
+instead of a popup.
+
 ## Not changed
 
 - No trading/risk logic was touched — only observability. `act()` vs
