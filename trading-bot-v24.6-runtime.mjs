@@ -766,7 +766,7 @@ const config = {
   // validated in trading-bot-v25-marketdata-fixed.mjs. Operators can still
   // override via Render environment variables.
   SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 3,
-  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 3,
+  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 2,
   MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 0,
   SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 75000,
   SCAN_WATCHDOG_MS: Math.max(180000, Math.min(300000, parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 240000)),
@@ -2535,7 +2535,7 @@ const marketDataInflight = new Map();
 // auffliegt und einzeln geloggt wird statt im gleichen Moment mitzutimen.
 const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
   20000,
-  Math.max(8000, parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 10000),
+  Math.max(8000, parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 16000),
   Math.max(8000, config.SCAN_ITEM_TIMEOUT_MS - 2000)
 );
 
