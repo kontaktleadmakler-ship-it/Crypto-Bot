@@ -74,7 +74,13 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     return { ok: true, latencyMs: Date.now() - started, contracts: res.data.data.length };
   }
 
-  async getKlines(symbol, timeframe = '15m', limit = 100) {
+  // FIX (Regression von v25.0.13 rückgängig gemacht, 2026-08-29): optionaler
+  // 4. Parameter { noRetry } - Default true, damit ein einzelner hängender
+  // Kline-Request im Live-Scan fail-fast passiert (5s) statt bis zu ~15s
+  // Retry-Zeit anzuhäufen und den Market-Data-Pool zu verstopfen. Aufrufer
+  // außerhalb des Scans (z.B. explizite Backfills) können weiterhin
+  // { noRetry: false } übergeben, um das alte Retry-Verhalten zu behalten.
+  async getKlines(symbol, timeframe = '15m', limit = 100, { noRetry = true } = {}) {
     const granularity = this.granularityMinutes[timeframe];
     const futuresSymbol = this.getFuturesSymbol(symbol);
     if (!granularity || !futuresSymbol) return null;
@@ -84,7 +90,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     const from = now - (limit + 10) * timeframeMs;
     const to = now;
     const url = `https://api-futures.kucoin.com/api/v1/kline/query?symbol=${futuresSymbol}&granularity=${granularity}&from=${from}&to=${to}`;
-    const res = await this.futuresRequest(url, { timeout: 5000 });
+    const res = await this.futuresRequest(url, { timeout: 5000, ...(noRetry ? { retries: 0 } : {}) });
     if (res?.data?.code !== '200000' || !Array.isArray(res.data.data)) return null;
 
     const context = `${futuresSymbol}/${timeframe}`;

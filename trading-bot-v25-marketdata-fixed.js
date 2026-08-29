@@ -176,6 +176,30 @@ const logger = winston.createLogger({
   ]
 });
 
+// DIAGNOSE (2026-08-29): Event-Loop-Lag-Monitor. Hintergrund: massenhafte,
+// exakt gleichzeitige "asyncPool item timed out"-Meldungen bei mehreren
+// Symbolen sind nicht zwingend Netzwerk-/Queue-Kongestion - sie treten auch
+// auf, wenn der Node-Event-Loop durch synchrone CPU-Last (z.B. Indikator-
+// Berechnung, ML/DQN-Inferenz über viele Symbole) blockiert wird, sodass
+// selbst die kürzeren inneren Timeouts (Market-Data-Bundle, Semaphore) nicht
+// pünktlich feuern und alles gemeinsam erst im äußeren 75s-Timeout auffliegt.
+// Rein additiv, per Default an, per Env-Var abschaltbar; nur ein warn-Log,
+// keine Verhaltensänderung an der Trading-/Scan-Logik.
+const ENABLE_EVENTLOOP_LAG_LOG = process.env.ENABLE_EVENTLOOP_LAG_LOG !== 'false';
+const EVENTLOOP_LAG_CHECK_MS = 1000;
+const EVENTLOOP_LAG_WARN_THRESHOLD_MS = 1000;
+if (ENABLE_EVENTLOOP_LAG_LOG) {
+  let lastLagCheck = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    const drift = now - lastLagCheck - EVENTLOOP_LAG_CHECK_MS;
+    lastLagCheck = now;
+    if (drift > EVENTLOOP_LAG_WARN_THRESHOLD_MS) {
+      logger.warn(`⏱️ [EVENT-LOOP] Verzögerung erkannt: Timer war ${drift}ms zu spät dran (Event-Loop war blockiert/überlastet). Das kann kurz vor "asyncPool item timed out"-Meldungen auf CPU-Blockierung statt Netzwerk-Kongestion hindeuten.`);
+    }
+  }, EVENTLOOP_LAG_CHECK_MS).unref?.();
+}
+
 let isShuttingDown = false;
 let currentMarketPhase = 'RANGING';
 let adaptiveConfig = null;
@@ -709,7 +733,12 @@ const config = {
   ENABLE_ORDERBOOK_ANALYSIS: process.env.ENABLE_ORDERBOOK_ANALYSIS !== 'false',
   ENABLE_CORRELATION_LIMITS: process.env.ENABLE_CORRELATION_LIMITS !== 'false',
   ENABLE_MULTI_TF_DERIVATION: process.env.ENABLE_MULTI_TF_DERIVATION !== 'false',
-  ENABLE_PRELOADING: process.env.ENABLE_PRELOADING !== 'false',
+  // FIX (Regression von v25.0.13 rückgängig gemacht, 2026-08-29): Preloading
+  // lief unbeobachtet parallel zum Scan und hat sich mit ihm um dieselbe
+  // Rate-Limiter-/Futures-Semaphore-Kapazität gestritten -> Kongestion ->
+  // asyncPool item timeout auf breiter Front. War laut
+  // MARKET_DATA_ROOT_CAUSE_FIX_V25.0.13.md bereits als opt-in vorgesehen.
+  ENABLE_PRELOADING: process.env.ENABLE_PRELOADING === 'true',
   ENABLE_BATCH_SIGNALS: process.env.ENABLE_BATCH_SIGNALS !== 'false',
   ENABLE_TIME_FILTER: process.env.ENABLE_TIME_FILTER !== 'false',
   ORDERBOOK_DEPTH_LEVELS: parseInt(process.env.ORDERBOOK_DEPTH_LEVELS, 10) || 10,
@@ -1120,6 +1149,13 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
   if (Date.now() < kucoinCircuitOpenUntil) {
     throw new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
   }
+  // FIX (Regression von v25.0.13 rückgängig gemacht, 2026-08-29): erlaubt
+  // Aufrufern, Retries pro Request abzuschalten (options.retries: 0), statt
+  // dass ein einzelner 5s-Timeout im Scan-Pfad bis zu ~15s zusätzlicher
+  // Retry-Zeit anhäuft und den Market-Data-Pool/das Futures-Semaphore
+  // verstopft. Ohne options.retries bleibt das alte Default-Verhalten
+  // unverändert.
+  if (typeof options.retries === 'number') retries = options.retries;
 
   await apiRateLimiter.checkLimit();
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -2214,8 +2250,8 @@ logger.info('🧪 Phase-B Execution aktiv | PaperOnly + Idempotency + Reconcilia
 // ==========================================
 const FUTURES_GRANULARITY_MINUTES = { '1d': 1440, '4h': 240, '1h': 60, '15m': 15, '5m': 5, '1m': 1 };
 
-async function fetchKucoinKlines(symbol, timeframe = '15m', limit = 100) {
-  try { return await exchangeAdapter.getKlines(symbol, timeframe, limit); }
+async function fetchKucoinKlines(symbol, timeframe = '15m', limit = 100, noRetry = true) {
+  try { return await exchangeAdapter.getKlines(symbol, timeframe, limit, { noRetry }); }
   catch (e) { logger.warn(`[ExchangeAdapter] Klines ${symbol}/${timeframe}: ${e.message}`); return null; }
 }
 
@@ -2433,8 +2469,13 @@ const marketDataSemaphore = {
     if (next) next();
   }
 };
+// FIX (Regression von v25.0.13 rückgängig gemacht, 2026-08-29): Default war
+// wieder auf 20000ms hochgezogen worden; der dokumentierte Fix verlangt eine
+// 10s-Deckelung, damit ein hängender Bundle-Fetch deutlich vor dem äußeren
+// 75s asyncPool-Timeout auffliegt und geloggt wird, statt im selben Moment
+// unauffällig mitzutimen.
 const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
-  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 20000, 5000),
+  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 10000, 5000),
   Math.max(5000, config.SCAN_ITEM_TIMEOUT_MS - 1000)
 );
 
