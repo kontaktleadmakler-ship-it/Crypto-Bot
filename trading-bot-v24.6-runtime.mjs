@@ -734,10 +734,17 @@ const config = {
   TP1_CLOSE_PERCENT: parseFloat(process.env.TP1_CLOSE_PERCENT) || 60,
   ENABLE_SHORT_SIGNALS: process.env.ENABLE_SHORT_SIGNALS !== 'false',
   MAX_EXPOSURE_RATIO: parseFloat(process.env.MAX_EXPOSURE_RATIO) || 0.6,
-  SCAN_CONCURRENCY: Math.max(6, Math.min(12, parseInt(process.env.SCAN_CONCURRENCY, 10) || 8)),
-  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 8,
+  // FIX 2026-08-29: previous defaults (8/8, 45-60s) created a burst of up
+  // to 8 concurrent symbol bundles, each firing several sequential/parallel
+  // KuCoin requests. That overran the futuresApiSemaphore (6-10 slots) and
+  // KuCoin's own rate limits, causing bundle timeouts across the whole
+  // watchlist (not just one symbol). Aligned with the values already
+  // validated in trading-bot-v25-marketdata-fixed.mjs. Operators can still
+  // override via Render environment variables.
+  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 3,
+  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 3,
   MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 0,
-  SCAN_ITEM_TIMEOUT_MS: Math.max(45000, Math.min(60000, parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 45000)),
+  SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 75000,
   SCAN_WATCHDOG_MS: Math.max(180000, Math.min(300000, parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 240000)),
   MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,
   LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3,
@@ -1231,7 +1238,10 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
 const futuresApiSemaphore = {
   active: 0, queue: [],
   async acquire() {
-    const limit = Math.max(6, Math.min(10, Number(config.MARKET_DATA_CONCURRENCY) || 6));
+    // FIX 2026-08-29: this used to floor the limit at 6 regardless of
+    // config.MARKET_DATA_CONCURRENCY, silently overriding a lower operator
+    // setting and defeating the point of reducing scan concurrency.
+    const limit = Math.max(1, Math.min(10, Number(config.MARKET_DATA_CONCURRENCY) || 3));
     if (this.active < limit) { this.active++; return; }
     await new Promise(resolve => this.queue.push(resolve));
     this.active++;
@@ -2483,9 +2493,14 @@ async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
 // One bounded request bundle per symbol. Duplicate in-flight requests are
 // coalesced and the KuCoin circuit breaker is checked before fan-out.
 const marketDataInflight = new Map();
+// FIX 2026-08-29: ceiling raised 18000 -> 20000ms, in line with the
+// already-validated defaults in trading-bot-v25-marketdata-fixed.mjs. With
+// SCAN_CONCURRENCY/MARKET_DATA_CONCURRENCY now 3 instead of 8, contention on
+// futuresApiSemaphore is far lower, so bundles should rarely need the full
+// budget - this just gives a bit more slack for genuinely slow symbols.
 const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
-  18000,
-  Math.max(8000, parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 18000),
+  20000,
+  Math.max(8000, parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 20000),
   Math.max(8000, config.SCAN_ITEM_TIMEOUT_MS - 2000)
 );
 
