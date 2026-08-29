@@ -3656,36 +3656,12 @@ async function scanMarket() {
         }
 
         const { raw15m, raw1h, raw4h, futuresData, orderBookMetrics } = marketData;
-
-        // IMPORTANT: Order-book data is an optional downstream input. A missing
-        // L2 snapshot must NOT prevent the symbol from reaching indicator/gate
-        // evaluation, otherwise one unavailable auxiliary endpoint turns an
-        // entire scan into `evaluated=0`. We keep the hard safety decision for
-        // actual signal generation below: a signal requiring L2 is blocked when
-        // no valid/fresh order book is available.
-        const hasValidOrderBook = Boolean(orderBookMetrics?.valid);
-        const effectiveOrderBook = hasValidOrderBook
-          ? orderBookMetrics
-          : {
-              valid: false,
-              bidAskRatio: null,
-              bidVolume: 0,
-              askVolume: 0,
-              spreadPct: null,
-              depthUSD: 0,
-              fetchedAt: 0,
-              source: 'unavailable'
-            };
-
-        let orderFlowEval;
-        try {
-          orderFlowEval = hasValidOrderBook
-            ? orderFlowManager.evaluateOrderFlow(raw15m, effectiveOrderBook)
-            : { score: 50, pressure: 'UNKNOWN', available: false };
-        } catch (e) {
-          orderFlowEval = { score: 50, pressure: 'UNKNOWN', available: false };
-          logger.warn(`[ORDER-FLOW] ${symbol}: evaluation unavailable: ${e.message}`);
+        if (!orderBookMetrics?.valid) {
+          scanStats.orderBookBlocked = (scanStats.orderBookBlocked || 0) + 1;
+          return;
         }
+
+        const orderFlowEval = orderFlowManager.evaluateOrderFlow(raw15m, orderBookMetrics);
 
         const closes4h = raw4h ? raw4h.map(c => c.close) : [];
         const closes1h = raw1h.map(c => c.close);
@@ -3792,16 +3768,6 @@ async function scanMarket() {
 
         if (direction !== null) {
           scanStats.postGatePassed++;
-
-          // No valid L2/order-book data: allow evaluation for diagnostics and
-          // dashboard visibility, but never allow a signal to proceed to sizing
-          // or paper execution without the required market microstructure data.
-          if (!hasValidOrderBook) {
-            scanStats.orderBookBlocked++;
-            logger.debug?.(`[ORDER-BOOK] ${symbol}: signal blocked because no valid order-book snapshot is available`);
-            return;
-          }
-
           if (direction === 'LONG' && orderFlowEval.pressure === 'BEARISH_DOMINANT' && orderFlowEval.score < 35) {
             scanStats.orderFlowBlocked++;
             return;
@@ -4152,7 +4118,7 @@ async function scanMarket() {
     }
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
-    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} preRiskBlocked=${scanStats.preRiskBlocked} preRiskReasons=${JSON.stringify(scanStats.preRiskReasons)} evaluated=${scanStats.marketDataEvaluated} orderBookBlocked=${scanStats.orderBookBlocked} missingKlines=${scanStats.missingKlines} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} mlBlocked=${scanStats.mlBlocked} dqnBlocked=${scanStats.dqnBlocked} agentBlocked=${scanStats.agentBlocked || 0} signalHistoryBlocked=${scanStats.signalHistoryBlocked} cooldownActive=${scanStats.cooldownActive} riskEngineBlocked=${scanStats.riskEngineBlocked || 0} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
+    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} preRiskBlocked=${scanStats.preRiskBlocked} preRiskReasons=${JSON.stringify(scanStats.preRiskReasons)} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
 
     if (marketPhaseLogsCollection && isDbConnected) {
       await marketPhaseLogsCollection.insertOne({
