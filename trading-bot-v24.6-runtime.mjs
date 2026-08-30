@@ -1313,20 +1313,25 @@ const futuresApiSemaphore = {
       return;
     }
     let timer;
+    let queueEntry;
     const waitPromise = new Promise((resolve, reject) => {
       timer = setTimeout(() => {
         reject(new Error('Semaphore acquire timeout'));
       }, timeoutMs);
-      this.queue.push(() => {
+      queueEntry = () => {
         clearTimeout(timer);
         resolve();
-      });
+      };
+      this.queue.push(queueEntry);
     });
     try {
       await waitPromise;
       this.active++;
     } catch (e) {
-      const idx = this.queue.indexOf(resolve);
+      // The Promise resolver is scoped to the Promise callback and is not
+      // available here. Remove the actual queued waiter instead of referencing
+      // the out-of-scope `resolve` symbol (ReferenceError).
+      const idx = this.queue.indexOf(queueEntry);
       if (idx !== -1) this.queue.splice(idx, 1);
       throw e;
     }
