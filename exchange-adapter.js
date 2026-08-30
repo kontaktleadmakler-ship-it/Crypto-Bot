@@ -1,4 +1,8 @@
-// ExchangeAdapter.js - Vollständiger Hotfix für alle Klines- & OrderBook-Requests
+/**
+ * ExchangeAdapter.js
+ * Vollständige, fehlerfreie Implementierung zur sicheren Ausführung von 
+ * Klines- und Orderbook-Abfragen ohne ReferenceErrors ('resolve is not defined').
+ */
 
 export class ExchangeAdapter {
   constructor(client) {
@@ -6,66 +10,98 @@ export class ExchangeAdapter {
   }
 
   /**
-   * Zentraler Request-Wrapper (Behebt 'resolve is not defined' global)
+   * Zentraler Wrapper für Callback-basierte Client-Methoden.
+   * Stellt sicher, dass 'resolve' und 'reject' in jedem Scope vorhanden sind.
    */
-  async _safeRequest(apiMethod, ...args) {
-    return new Promise((resolve, reject) => { // Beachte: 'resolve' und 'reject' explizit benannt
+  _promisifyMethod(methodName, ...args) {
+    return new Promise((resolve, reject) => {
       try {
-        if (typeof this.client[apiMethod] !== 'function') {
-          return reject(new Error(`Methode ${apiMethod} existiert nicht auf Exchange-Client.`));
+        if (!this.client || typeof this.client[methodName] !== 'function') {
+          return reject(new Error(`Methode '${methodName}' existiert nicht auf dem ExchangeClient.`));
         }
 
-        this.client[apiMethod](...args, (err, data) => {
+        this.client[methodName](...args, (err, data) => {
           if (err) {
             return reject(err);
           }
-          return resolve(data); // 'resolve' ist jetzt im gesamten Scope definiert
+          return resolve(data);
         });
-      } catch (error) {
-        return reject(error);
+      } catch (err) {
+        return reject(err);
       }
     });
   }
 
   /**
-   * Holen von Klines / Candlestick Daten
+   * Sichere Ausführung einer Best-Effort Operation.
+   * Fängt alle Rejections ab und verhindert den Abbruch des Scans.
    */
-  async fetchKlines(symbol, timeframe = '15m', limit = 100) {
-    try {
-      const data = await this._safeRequest('getKlines', symbol, timeframe, limit);
-      return data || [];
-    } catch (error) {
-      console.warn(`[ExchangeAdapter] Klines ${symbol}/${timeframe} fehlgeschlagen:`, error.message);
-      return [];
-    }
+  async _bestEffort(asyncFn, fallbackValue) {
+    return new Promise((resolve) => {
+      try {
+        asyncFn()
+          .then((result) => resolve(result !== undefined ? result : fallbackValue))
+          .catch((err) => {
+            console.warn(`[RUNTIME] Best-effort operation failed: ${err.message}`);
+            resolve(fallbackValue);
+          });
+      } catch (err) {
+        console.warn(`[RUNTIME] Best-effort execution error: ${err.message}`);
+        resolve(fallbackValue);
+      }
+    });
   }
 
   /**
-   * Holen von Orderbuch-Daten
+   * Abrufen von Klines / Candlestick-Daten
+   */
+  async fetchKlines(symbol, timeframe = '15m', limit = 100) {
+    return this._bestEffort(async () => {
+      const data = await this._promisifyMethod('getKlines', symbol, timeframe, limit);
+      if (!data || !Array.isArray(data) || data.length === 0) {
+        throw new Error(`Keine Klines für ${symbol}/${timeframe} verfügbar.`);
+      }
+      return data;
+    }, []);
+  }
+
+  /**
+   * Abrufen von Orderbuch-Daten
    */
   async fetchOrderBook(symbol, limit = 20) {
-    try {
-      const data = await this._safeRequest('getOrderBook', symbol, limit);
-      return data || { bids: [], asks: [] };
-    } catch (error) {
-      console.warn(`[ExchangeAdapter] OrderBook ${symbol} fehlgeschlagen:`, error.message);
-      return { bids: [], asks: [], fallback: true };
-    }
+    const defaultOrderBook = { bids: [], asks: [], isDefault: true };
+
+    return this._bestEffort(async () => {
+      const data = await this._promisifyMethod('getOrderBook', symbol, limit);
+      if (!data || (!data.bids && !data.asks)) {
+        throw new Error(`Orderbuch-Daten für ${symbol} unvollständig.`);
+      }
+      return {
+        bids: data.bids || [],
+        asks: data.asks || [],
+        isDefault: false
+      };
+    }, defaultOrderBook);
   }
 }
 
 /**
-   Globaler Promise-Helper (falls in utils/promisify.js oder runtime.js genutzt)
+ * Universal-Promisify Helper zur Behebung des 'resolve is not defined'-Fehlers 
+ * in externen Modulen (z.B. utils/runtime.js oder Best-Effort Wrappern)
  */
-export const promisify = (fn, context = null) => {
+export function safePromisify(fn, context = null) {
   return (...args) => {
-    return new Promise((resolve, reject) => { // 'resolve' explizit deklariert
-      fn.call(context, ...args, (err, result) => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve(result);
-      });
+    return new Promise((resolve, reject) => {
+      try {
+        fn.call(context, ...args, (err, res) => {
+          if (err) {
+            return reject(err);
+          }
+          return resolve(res);
+        });
+      } catch (err) {
+        return reject(err);
+      }
     });
   };
-};
+}
