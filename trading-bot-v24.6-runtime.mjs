@@ -1304,15 +1304,32 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
 }
 
 const futuresApiSemaphore = {
-  active: 0, queue: [],
-  async acquire() {
-    // FIX 2026-08-29: this used to floor the limit at 6 regardless of
-    // config.MARKET_DATA_CONCURRENCY, silently overriding a lower operator
-    // setting and defeating the point of reducing scan concurrency.
+  active: 0,
+  queue: [],
+  async acquire(timeoutMs = 30000) {
     const limit = Math.max(1, Math.min(10, Number(config.MARKET_DATA_CONCURRENCY) || 3));
-    if (this.active < limit) { this.active++; return; }
-    await new Promise(resolve => this.queue.push(resolve));
-    this.active++;
+    if (this.active < limit) {
+      this.active++;
+      return;
+    }
+    let timer;
+    const waitPromise = new Promise((resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error('Semaphore acquire timeout'));
+      }, timeoutMs);
+      this.queue.push(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    try {
+      await waitPromise;
+      this.active++;
+    } catch (e) {
+      const idx = this.queue.indexOf(resolve);
+      if (idx !== -1) this.queue.splice(idx, 1);
+      throw e;
+    }
   },
   release() {
     this.active--;
@@ -1321,9 +1338,13 @@ const futuresApiSemaphore = {
 };
 
 async function futuresApiGetWithRetry(url, options = {}, retries = 3, backoffMs = 1000) {
-  await futuresApiSemaphore.acquire();
-  try { return await axiosGetWithRetry(url, options, retries, backoffMs); }
-  finally { futuresApiSemaphore.release(); }
+  // Semaphore mit Timeout (max. 15s warten)
+  await futuresApiSemaphore.acquire(15000);
+  try {
+    return await axiosGetWithRetry(url, options, retries, backoffMs);
+  } finally {
+    futuresApiSemaphore.release();
+  }
 }
 
 async function processDbBulkQueue() {
@@ -2696,6 +2717,95 @@ async function getMarketDataBundle(symbol) {
     err.code = 'KUCOIN_CIRCUIT_OPEN';
     throw err;
   }
+
+  const key = `bundle:${symbol}`;
+  const existing = marketDataInflight.get(key);
+  if (existing) return existing;
+
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => {
+    abortController.abort();
+    marketDataInflight.delete(key);
+  }, MARKET_DATA_BUNDLE_TIMEOUT_MS || 20000);
+
+  const task = (async () => {
+    try {
+      // Jeder einzelne Aufruf mit eigenem Timeout
+      const fetchKlines = async (timeframe, limit) => {
+        return withTimeout(
+          fetchKucoinKlinesCached(symbol, timeframe, limit),
+          15000,
+          `${symbol} ${timeframe} klines timeout`
+        );
+      };
+
+      const raw15m = await fetchKlines('15m', 100);
+      if (!raw15m || raw15m.length < 20) {
+        throw new Error(`${symbol}/15m market data unavailable`);
+      }
+
+      let raw1h = config.ENABLE_MULTI_TF_DERIVATION
+        ? deriveHigherTimeframes(raw15m, '1h')
+        : await fetchKlines('1h', 50);
+      if (!raw1h) {
+        throw new Error(`${symbol}/1h market data unavailable`);
+      }
+      raw1h = raw1h.filter(c => c.time + ONE_HOUR_MS <= Date.now());
+      if (raw1h.length === 0) {
+        throw new Error(`${symbol}/1h closed candles unavailable`);
+      }
+
+      let raw4h = null;
+      if (config.REQUIRE_4H_TREND) {
+        raw4h = config.ENABLE_MULTI_TF_DERIVATION
+          ? deriveHigherTimeframes(raw15m, '4h')
+          : await fetchKlines('4h', 50);
+        if (raw4h) raw4h = raw4h.filter(c => c.time + FOUR_HOUR_MS <= Date.now());
+      }
+
+      // Optional sources mit Timeout
+      const [futuresResult, orderBookResult] = await Promise.allSettled([
+        withTimeout(fetchFuturesData(symbol), 5000, `${symbol} futures timeout`),
+        withTimeout(fetchOrderBookMetrics(symbol), 5000, `${symbol} orderbook timeout`)
+      ]);
+
+      return {
+        symbol,
+        raw15m,
+        raw1h,
+        raw4h,
+        futuresData: futuresResult.status === 'fulfilled' ? futuresResult.value : null,
+        orderBookMetrics: orderBookResult.status === 'fulfilled' ? orderBookResult.value : null,
+        fetchedAt: Date.now()
+      };
+    } catch (e) {
+      throw e;
+    } finally {
+      clearTimeout(timeoutId);
+      marketDataInflight.delete(key);
+    }
+  })();
+
+  // Äusserer Timeout für den gesamten Bundle
+  const wrappedTask = Promise.race([
+    task,
+    new Promise((_, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error(`${symbol} market-data bundle timed out after ${MARKET_DATA_BUNDLE_TIMEOUT_MS}ms`));
+      }, MARKET_DATA_BUNDLE_TIMEOUT_MS || 20000);
+      task.finally(() => clearTimeout(timeout));
+    })
+  ]);
+
+  marketDataInflight.set(key, wrappedTask);
+  try {
+    return await wrappedTask;
+  } catch (e) {
+    throw e;
+  } finally {
+    marketDataInflight.delete(key);
+  }
+}
 
   const key = `bundle:${symbol}`;
   const existing = marketDataInflight.get(key);
