@@ -1,13 +1,10 @@
 'use strict';
 const assert=require('assert');
-// Bugfix: this file lives at the project root, not inside tests/, so the
-// original '../src/...' paths pointed one directory too high and threw
-// MODULE_NOT_FOUND. Corrected to './src/...'.
 const {
   calculateRSI, calculateATR, calculateMACD, calculateEMA, calculateADX,
   calculateChoppinessIndex, calculateHurstExponent
-}=require('./src/indicators');
-const {evaluateDirectionGates,selectDirection}=require('./src/filter-system');
+}=require('../src/indicators');
+const {evaluateDirectionGates,selectDirection}=require('../src/filter-system');
 
 function candlesFrom(closes) {
   return closes.map((close,i)=>({time:1700000000000+i*900000,open:close-0.5,high:close+1,low:close-1,close,volume:10+i}));

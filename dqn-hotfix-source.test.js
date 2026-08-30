@@ -1,0 +1,11 @@
+'use strict';
+const fs=require('fs');
+const assert=require('assert');
+const s=fs.readFileSync(require('path').join(__dirname,'..','rl-engine.js'),'utf8');
+assert(!s.includes('tf.layers.subtract()'),'RL engine must not call unavailable tf.layers.subtract()');
+assert(s.includes('const meanAdv = meanLayer.apply(advOut);'),'Mean advantage layer must be applied before setWeights');
+assert(s.includes('meanLayer.setWeights([meanKernel]);'),'Mean layer weights must be set after apply');
+assert(s.includes('const negativeMeanRep = negativeMeanRepLayer.apply(meanAdv);'),'Negative mean representation must be applied before setWeights');
+assert(s.includes('negativeMeanRepLayer.setWeights([negativeOnesKernel]);'),'Negative mean layer weights must be set after apply');
+assert(s.includes('const centeredAdv = tf.layers.add().apply([advOut, negativeMeanRep]);'),'RL engine must center advantage with supported add layer');
+console.log('DQN source hotfix tests: OK');

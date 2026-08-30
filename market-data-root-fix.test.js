@@ -11,10 +11,6 @@ assert.equal(pkg.version, '25.0.16');
 assert.equal((runtime.match(/if \(isKucoinCircuitOpen\(\)\)/g) || []).length, 2);
 assert.match(runtime, /async function getMarketDataBundle\(symbol\) \{/);
 assert.doesNotMatch(runtime, /async function getMarketDataBundle\(symbol\) \{\s*if \(isKucoinCircuitOpen\(\)\) \{\s*if \(isKucoinCircuitOpen\(\)\)/);
-// NOTE: default lowered 8 -> 2 by the documented Market-Data Worker Pool Fix
-// (see MARKET_DATA_POOL_FIX.md) to reduce KuCoin API contention that was
-// itself contributing to the "scan succeeds, zero signals" symptom. This
-// assertion was left checking the pre-fix default and never updated.
 assert.match(runtime, /MARKET_DATA_CONCURRENCY: parseInt\(process\.env\.MARKET_DATA_CONCURRENCY, 10\) \|\| 2/);
 assert.match(runtime, /MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt\(process\.env\.MARKET_DATA_QUEUE_TIMEOUT_MS, 10\) \|\| 0/);
 assert.match(runtime, /ENABLE_PRELOADING: process\.env\.ENABLE_PRELOADING === 'true'/);

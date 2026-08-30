@@ -45,6 +45,7 @@ const {
   findSwingStop, aggregate, trend
 } = require('./src/indicators');
 const { KuCoinFuturesAdapter } = require('./exchange-adapter');
+const { evaluateDirectionGates: evaluateCentralDirectionGates } = require('./src/filter-system');
 const { ExecutionSimulator } = require('./execution-simulator');
 const { ExecutionIdempotency } = require('./execution-idempotency');
 const { PaperExecutionAdapter } = require('./paper-execution-adapter');
@@ -3546,96 +3547,9 @@ async function asyncPool(concurrency, items, iteratorFn, itemTimeoutMs = config.
 }
 
 function evaluateDirectionGates(dir, p, scanStats) {
-  const isLong = dir === 'LONG';
-
-  // --- Hard gates: structural preconditions. Without trend alignment and a
-  // break of structure this isn't the strategy the bot claims to trade, so
-  // these still reject immediately.
-  if (filterState.trend4h.enabled && config.REQUIRE_4H_TREND) {
-    const trendOk4h = isLong ? p.trend4h === 'BULLISH' : p.trend4h === 'BEARISH';
-    if (!trendOk4h) return 'trendMismatch4h';
-  }
-
-  const trend1hOk = isLong ? p.trend1h === 'BULLISH' : p.trend1h === 'BEARISH';
-  if (!trend1hOk) return 'trendMismatch1h';
-
-  if (filterState.btctrend.enabled && !config.ALLOW_COUNTER_BTC_TREND) {
-    const against = (p.btcTrend === 'BEARISH' && isLong) || (p.btcTrend === 'BULLISH' && !isLong);
-    if (against) return 'btcCounterTrendBlocked';
-  }
-
-  if (filterState.bos.enabled) {
-    const bos = isLong ? p.bosBullish : p.bosBearish;
-    if (!bos) return 'noBOS';
-  }
-
-  const fundingOk = isLong ? p.fundingRate <= config.MAX_FUNDING_RATE : p.fundingRate >= config.MIN_FUNDING_RATE;
-  if (!fundingOk) return 'fundingBlocked';
-
-  // --- Soft gates: previously a rigid AND-chain of ADX / Hurst / Chop / RSI
-  // zone / POC-VWAP location / MACD / relative volume. Several of these
-  // measure overlapping information (ADX, Hurst and Chop are all proxies for
-  // "is this trending"), so stacking them as hard booleans rejected valid
-  // setups on noise in any single one. They now contribute a weighted
-  // confluence score; the setup passes if enabled filters clear
-  // config.MIN_GATE_SCORE (default 65/100). Per-filter counters are still
-  // recorded for the existing /filter Telegram diagnostics, but no longer
-  // singularly veto a setup.
-  let score = 0, max = 0;
-
-  // --- Punkt 10 - Trend Quality Score: ADX, Hurst und Chop maßen bisher alle
-  // "Trendstärke" getrennt (25+20+15 = 60% der maximal erreichbaren Punkte)
-  // und verdoppelten damit effektiv dieselbe Information im Confluence-Score.
-  // Sie werden jetzt zu einem einzigen gewichteten Score zusammengefasst:
-  //   trendQuality = (adx/100 * 0.5) + (hurst * 0.3) + ((100-chop)/100 * 0.2)
-  // Ergebnis liegt zwischen 0 und 1 und ersetzt die drei separaten Blöcke.
-  // Die einzelnen Filter bleiben über die FILTER_REGISTRY ein-/ausschaltbar;
-  // ist einer deaktiviert, wird sein Gewichtsanteil unter den verbleibenden
-  // aktiven neu verteilt, damit z.B. "nur ADX aus" nicht automatisch auch
-  // Hurst/Chop unwirksam macht.
-  const chopUsable = filterState.chop.enabled && p.chop;
-  let trendRaw = 0, trendWeightSum = 0;
-  if (filterState.adx.enabled) { trendRaw += Math.max(0, Math.min(1, p.adx / 100)) * 0.5; trendWeightSum += 0.5; }
-  if (filterState.hurst.enabled) { trendRaw += Math.max(0, Math.min(1, p.hurst)) * 0.3; trendWeightSum += 0.3; }
-  if (chopUsable) { trendRaw += Math.max(0, Math.min(1, (100 - p.chop) / 100)) * 0.2; trendWeightSum += 0.2; }
-
-  if (trendWeightSum > 0) {
-    max += 60;
-    const trendQuality = trendRaw / trendWeightSum; // renormalisiert auf 0..1
-    score += 60 * trendQuality;
-    const effectiveADX = p.adaptiveADX || config.ADX_MIN;
-    const belowThreshold =
-      (filterState.adx.enabled && p.adx < effectiveADX) ||
-      (filterState.hurst.enabled && p.hurst < config.MIN_HURST_EXPONENT) ||
-      (chopUsable && p.chop > config.MAX_CHOP_INDEX);
-    if (belowThreshold) scanStats.trendQualityLow++;
-  }
-
-  max += 15;
-  const rsiInZone = isLong
-    ? (!filterState.rsi_long_min.enabled || p.rsi >= config.RSI_LONG_MIN) && p.rsi <= config.RSI_LONG_MAX
-    : p.rsi >= config.RSI_SHORT_MIN && (!filterState.rsi_short_max.enabled || p.rsi <= config.RSI_SHORT_MAX);
-  if (rsiInZone) score += 15;
-  else scanStats[isLong ? (p.rsi < config.RSI_LONG_MIN ? 'rsiTooLow' : 'rsiTooHigh') : (p.rsi < config.RSI_SHORT_MIN ? 'rsiTooLow' : 'rsiTooHigh')]++;
-
-  max += 10;
-  const priceOk = p.poc && p.vwap && (isLong ? (p.currentPrice >= p.poc && p.currentPrice >= p.vwap) : (p.currentPrice <= p.poc && p.currentPrice <= p.vwap));
-  if (priceOk) score += 10; else scanStats.pocVwapFail++;
-
-  max += 10;
-  const macdOk = isLong ? p.macd.histogram >= 0 : p.macd.histogram <= 0;
-  if (macdOk) score += 10; else scanStats.macdFail++;
-
-  if (filterState.relvol.enabled) {
-    max += 5;
-    const effectiveVolume = p.adaptiveVolume || config.MIN_RELATIVE_VOLUME;
-    if (effectiveVolume <= 0 || p.relativeVolume >= effectiveVolume) score += 5;
-    else { score += Math.max(0, 5 * (p.relativeVolume / effectiveVolume)); scanStats.relVolTooLow++; }
-  }
-
-  const gateScore = max > 0 ? Math.round(100 * score / max) : 100;
-  if (gateScore < config.MIN_GATE_SCORE) return 'lowConfluenceScore';
-  return null;
+  // Canonical filter implementation; prevents the live runtime from drifting
+  // away from the modular filter system.
+  return evaluateCentralDirectionGates(dir, p, scanStats, config, filterState);
 }
 
 function createEmptyScanStats() {
@@ -4016,6 +3930,60 @@ async function scanMarket() {
         // while marketDataEvaluated means the symbol reached the strategy gates.
         scanStats.marketDataEvaluated++;
 
+        // Always publish live agent telemetry after validated market data,
+        // even when the directional strategy gate later rejects the candidate.
+        // This keeps Neural Core observability independent from signal frequency.
+        try {
+          const telemetryDirection = trend1h === 'BEARISH' ? 'SHORT' : 'LONG';
+          const telemetryScore = calculateSignalScore({
+            adx, rsi, relativeVolume, trend1h, trend4h,
+            direction: telemetryDirection, marketPhase: currentMarketPhase,
+            macdHistogram: macd.histogram
+          });
+          const ev = agentSuite.evaluate({
+            symbol, direction: telemetryDirection,
+            spreadPct: Number(orderBookMetrics.spreadPct || 0),
+            depthUSD: Number(orderBookMetrics.depthUSD || futuresData?.volume24h || 0),
+            orderSizeUSD: Math.max(1, Number(currentPrice || 0) * 0.001),
+            apiLatencyMs: apiLatencyStats.getAverage('kucoin'),
+            candleDelayMs: Math.max(0, Date.now() - new Date(raw15m?.at(-1)?.time || Date.now()).getTime()),
+            exposurePct: (() => {
+              const eq = Math.max(config.CAPITAL_USD + dailyNetPnL, 1);
+              const gross = [...activeTrades.values()].reduce((sum,t) => sum + Math.abs(Number(t.notionalUSD || 0)), 0);
+              return gross / eq * 100;
+            })(),
+            maxExposurePct: Math.max(0, Number(config.MAX_EXPOSURE_RATIO || 0)) * Math.max(1, Number(config.LEVERAGE || 1)) * 100,
+            drawdownPct: Math.max(0, peakCapital > 0 ? ((peakCapital - (config.CAPITAL_USD + dailyNetPnL)) / peakCapital) * 100 : 0),
+            maxDrawdownPct: MAX_DRAWDOWN_PERCENT,
+            expectancy: agentExpectancy, sharpe: agentSharpe,
+            dailyLossPct: Math.max(0, -(dailyNetPnL / Math.max(config.CAPITAL_USD, 1)) * 100),
+            maxDailyLossPct: Math.max(0, Number(config.MAX_DAILY_LOSS_USD || 0) / Math.max(config.CAPITAL_USD, 1) * 100),
+            killSwitch: safetyController.isActive('kill-switch') || isPaused,
+            circuitBreaker: Date.now() < kucoinCircuitOpenUntil,
+            regime: { confidence: currentMarketPhase === 'RANGING' || currentMarketPhase === 'TRENDING' ? 0.75 : 0.5 },
+            oosScore: Number(mlModel.getStats().validationAccuracy || 0),
+            driftScore: Number(modelDriftMonitor.status().score || 0)
+          });
+          const nodes = [
+            ['risk-supervisor','RISK SUPERVISOR',ev.riskSupervisor.score,ev.riskSupervisor.decision,ev.riskSupervisor.hardBlock?'BLOCK':'PASS'],
+            ['portfolio-allocation','PORTFOLIO',Math.min(1,Number(ev.portfolioAllocation.scale||0)),'ALLOCATE','PASS'],
+            ['anomaly-detection','ANOMALY',1-Number(ev.anomaly.score||0),ev.anomaly.severity,ev.anomaly.severity==='HIGH'?'VETO':'PASS'],
+            ['liquidity','LIQUIDITY',ev.liquidity.score,ev.liquidity.decision,ev.liquidity.decision==='BLOCK'?'VETO':'PASS'],
+            ['exit-evaluation','EXIT EVALUATOR',ev.exit.score,ev.exit.decision,'MONITOR'],
+            ['strategy-evaluation','STRATEGY',ev.strategy.score,ev.strategy.health,ev.strategy.health==='DISABLED'?'VETO':'PASS'],
+            ['meta-supervisor','META SUPERVISOR',ev.meta.confidence,ev.meta.decision,ev.meta.hardBlock?'VETO':'PASS']
+          ].map(([id,label,score,decision,status])=>({id,label,score,decision,status}));
+          const consensus = nodes.filter(n=>['PASS','MONITOR'].includes(String(n.status))).length;
+          const vetoes = nodes.filter(n=>String(n.status).includes('VETO')||String(n.status).includes('BLOCK')).map(n=>({agent:n.label,reason:n.decision}));
+          jarvisEventBus.emitEvent('AGENTS:EVALUATED',{
+            symbol,direction:telemetryDirection,nodes,dqn:{enabled:Boolean(config.DQN_ENABLED),initialized:Boolean(dqnAgent.isInitialized),action:'OBSERVATION',epsilon:dqnAgent.epsilon},
+            confidence:Math.round(Math.max(0,Math.min(1,Number(ev.meta.confidence||0)*0.7+(consensus/Math.max(1,nodes.length))*0.3))*100),
+            consensus,vetoes,finalAction:ev.meta.hardBlock?'NO_TRADE':'OBSERVE',phase:currentMarketPhase,gateStage:'PRE_GATE',signalScore:telemetryScore
+          },{source:'agent-suite',severity:vetoes.length?'WARN':'INFO',persist:false,persistReplay:true});
+        } catch (telemetryError) {
+          logger.warn(`[AGENT-TELEMETRY] ${symbol}: ${telemetryError.message || telemetryError}`);
+        }
+
         var direction = null;
         const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
         let primaryFail = evaluateDirectionGates(primaryDir, gateParams, scanStats);
@@ -4335,6 +4303,35 @@ async function scanMarket() {
             logger.warn(`[RISK-ENGINE] Signal blockiert: ${riskCheck.reason}`); return;
           }
 
+          // A valid signal is a strategy + risk decision. Paper execution is
+          // downstream simulation and must not erase a generated signal.
+          const signalId = `${symbol}:${direction}:${Date.now()}:${scanCounter}`;
+          const safeSymbol = escapeHtml(symbol);
+          const signalText =
+            `🚀 <b>NEUES SIGNAL: ${safeSymbol} (${direction})</b> [Score: ${signalScore}/100]\n` +
+            `Entry Zone: $${entryZoneLow.toFixed(6)} - $${entryZoneHigh.toFixed(6)} (Mitte: $${entryPrice.toFixed(6)}) | SL: $${stopLoss.toFixed(6)}\n` +
+            `TP1: $${tp1.toFixed(6)} | TP2: $${tp2.toFixed(6)}\n` +
+            `Größe: ${sizing.contracts} Kontrakte | Risk: $${sizing.riskAmountUSD.toFixed(2)}\n` +
+            `ADX: ${adx} | Hurst: ${hurst} | CVD-Score: ${orderFlowEval.score}\n` +
+            `🧠 TensorFlow.js: ${mlPrediction.trained ? (mlPrediction.probability * 100).toFixed(1) + '% Erfolgswahrscheinlichkeit' : 'noch nicht trainiert'}\n` +
+            `🤖 DQN Epsilon: ${dqnAgent.getStats().epsilon}`;
+
+          await persistAlertHistoryEntry(cooldownKey, Date.now());
+          signalsSent++;
+          scanStats.signalsSent++;
+          scanStats.totalSignalScore += signalScore;
+          dashboardPatchScanRecord(scanRecordEvent, symbol, {
+            finalDecision: direction, decisionReason: 'SIGNAL_GENERATED',
+            signalScore: Number(signalScore || 0), signalId
+          });
+          jarvisEventBus.emitEvent('SIGNAL:GENERATED',{
+            symbol,direction,signalId,signalScore:Number(signalScore||0),
+            entryPrice:Number(entryPrice),stopLoss:Number(stopLoss),tp1:Number(tp1),tp2:Number(tp2),
+            paperExecution:'PENDING'
+          },{source:'scanner',severity:'INFO',persist:true,persistReplay:true,persistMinIntervalMs:0});
+          if (config.ENABLE_BATCH_SIGNALS) signalBatch.push({text:signalText});
+          else await sendTelegramAlert(signalText);
+
           let paperOrder = null;
           if (config.PAPER_EXECUTION_ENABLED) {
             const signalId = `${symbol}:${direction}:${Date.now()}:${scanCounter}`;
@@ -4389,22 +4386,11 @@ async function scanMarket() {
             }
           }
 
-          await persistAlertHistoryEntry(cooldownKey, Date.now());
-          signalsSent++;
-          scanStats.signalsSent++;
-          scanStats.totalSignalScore += signalScore;
-
-          dashboardPatchScanRecord(scanRecordEvent, symbol, {
-            finalDecision: direction,
-            decisionReason: 'SIGNAL_CONFIRMED',
-            signalScore: Number(signalScore || 0)
-          });
-
           const dynamicLeverage = calculateDynamicLeverage(atr, currentPrice, config.LEVERAGE);
 
           await upsertTrade(symbol, {
             symbol, direction, entry: entryPrice, stopLoss, tp1, tp2,
-            signalId: paperOrder?.signalId || `${symbol}:${direction}:${Date.now()}:${scanCounter}`,
+            signalId: paperOrder?.signalId || signalId,
             paperOrderId: paperOrder?.orderId || null,
             executionStatus: paperOrder?.status || 'SIGNAL_ONLY',
             executionLatencyMs: paperOrder?.latencyMs || 0,
@@ -4465,21 +4451,7 @@ async function scanMarket() {
             mlModelVersionAtEntry: mlModel.getStats().modelVersion || null
           });
 
-          const safeSymbol = escapeHtml(symbol);
-          const signalText = 
-            `🚀 <b>NEUES SIGNAL: ${safeSymbol} (${direction})</b> [Score: ${signalScore}/100]\n` +
-            `Entry Zone: $${entryZoneLow.toFixed(6)} - $${entryZoneHigh.toFixed(6)} (Mitte: $${entryPrice.toFixed(6)}) | SL: $${stopLoss.toFixed(6)}\n` +
-            `TP1: $${tp1.toFixed(6)} | TP2: $${tp2.toFixed(6)}\n` +
-            `Größe: ${sizing.contracts} Kontrakte | Risk: $${sizing.riskAmountUSD.toFixed(2)}\n` +
-            `ADX: ${adx} | Hurst: ${hurst} | CVD-Score: ${orderFlowEval.score}\n` +
-            `🧠 TensorFlow.js: ${mlPrediction.trained ? (mlPrediction.probability * 100).toFixed(1) + '% Erfolgswahrscheinlichkeit' : 'noch nicht trainiert'}\n` +
-            `🤖 DQN Epsilon: ${dqnAgent.getStats().epsilon}`;
 
-          if (config.ENABLE_BATCH_SIGNALS) {
-            signalBatch.push({ text: signalText });
-          } else {
-            await sendTelegramAlert(signalText);
-          }
         }
       } catch (e) {
         scanStats.runtimeErrors++;
