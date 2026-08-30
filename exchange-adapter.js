@@ -132,11 +132,22 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     return null;
   }
 
+  // FIX (2026-08-30): getContract/getOrderBook run per scanned candidate
+  // and share the 3-slot futuresApiSemaphore with the klines fetch. Unlike
+  // getKlines (already noRetry-by-default), these still retried up to 3x
+  // with exponential 429-backoff (up to ~7s) WHILE HOLDING the semaphore
+  // slot. Under any sustained rate-limiting this pinned all slots in
+  // backoff sleeps simultaneously, so every other candidate's request
+  // (including the klines fetch itself) queued behind them and blew past
+  // the 16s bundle timeout - for every symbol uniformly, regardless of
+  // liquidity. Both callers already tolerate a null/failed result
+  // (getMarketDataBundle uses Promise.allSettled), so a single fast
+  // failure is strictly better than holding a scarce slot hostage.
   async getContract(symbol) {
     const futuresSymbol = this.getFuturesSymbol(symbol);
     if (!futuresSymbol) return null;
     const url = `https://api-futures.kucoin.com/api/v1/contracts/${futuresSymbol}`;
-    const res = await this.futuresRequest(url, { timeout: 4000 });
+    const res = await this.futuresRequest(url, { timeout: 4000, retries: 0 });
     if (res?.data?.code !== '200000' || !res.data.data) return null;
     const oi = this.parseFloatSafe(res.data.data.openInterestVal ?? res.data.data.openInterest, 'openInterest', symbol);
     const funding = this.parseFloatSafe(res.data.data.fundingFeeRate, 'fundingRate', symbol);
@@ -147,7 +158,7 @@ class KuCoinFuturesAdapter extends ExchangeAdapter {
     const futuresSymbol = this.getFuturesSymbol(symbol);
     if (!futuresSymbol) return null;
     const url = `https://api-futures.kucoin.com/api/v1/level2/snapshot?symbol=${futuresSymbol}`;
-    const res = await this.futuresRequest(url, { timeout: 3000 });
+    const res = await this.futuresRequest(url, { timeout: 3000, retries: 0 });
     if (res?.data?.code !== '200000' || !res.data.data) return null;
     const bids = res.data.data.bids || [];
     const asks = res.data.data.asks || [];
