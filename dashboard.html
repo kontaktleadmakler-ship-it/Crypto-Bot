@@ -151,11 +151,11 @@ function focusPanel(id){$(id)?.scrollIntoView?.({behavior:'smooth',block:'neares
 function formatPrice(v){const x=Number(v);if(!Number.isFinite(x))return '—';if(x>=1000)return x.toLocaleString(undefined,{maximumFractionDigits:2});if(x>=1)return x.toFixed(4);return x.toFixed(6)}
 function renderMarket(){const rows=state.market||[];$('marketRows').innerHTML=rows.map(r=>{const ch=Number(r.change||0);const flow=Number(r.bidAskRatio||1);const gate=r.tech===false?'VETO':(r.tech===true?'PASS':'—');const bars=Math.max(1,Math.min(5,Math.round(Math.abs(ch)*1.5)+1));return `<tr><td class="sym">${esc(r.symbol)}</td><td>${formatPrice(r.price)}</td><td class="${colorClass(ch)}">${pct(ch)}</td><td>${n(r.rsi,1)}</td><td class="bars">${'▮'.repeat(bars)}<span style="color:${flow>1.05?'var(--green)':flow<.95?'var(--red)':'var(--cyan)'}"> ${n(flow,2)}</span></td><td class="signal ${gate==='PASS'?'good':gate==='VETO'?'bad':''}">${gate}</td></tr>`}).join('')||'<tr><td colspan="6">WAITING FOR SCANNER MARKET DATA…</td></tr>';$('scanState').textContent=state.scan?.isScanning?'SCANNING':(state.liveSource==='PRODUCTION_SCANNER'?'LIVE SCANNER':'WAITING');}
 function renderHeat(){const rows=state.market||[];$('heatmap').innerHTML=rows.map(r=>{const ch=Number(r.change||0);const c=ch>.15?'heatpos':ch<-.15?'heatneg':'heatneu';return `<div class="heatcell ${c}" title="${esc(r.symbol)} · Price ${formatPrice(r.price)} · RSI ${n(r.rsi,1)}"><b>${esc(r.symbol?.replace('-USDT',''))}</b><span class="${colorClass(ch)}">${pct(ch)}</span></div>`}).join('')||'<div style="color:var(--muted);font-size:8px">NO MARKET DATA</div>';}
-function renderAgents(){const nodes=state.agents?.nodes||state.intel?.agents?.nodes||[];const names=nodes.length?nodes.map(x=>({name:x.name||x.agent||x.id,score:Number(x.score??x.confidence??x.value??0),status:x.status||x.decision||'—'})):[];const fallback=[['TECHNICAL',state.intel?.current?.technical?.allowed?84:45],['SENTIMENT',state.intel?.current?.sentiment?.allowed?76:42],['LIQUIDITY',Number(state.intel?.current?.market?.orderBook?.bidAskRatio||1)*50],['RISK',state.intel?.current?.risk?.allowed?88:35],['DQN',Number(state.intel?.current?.dqn?.confidence||state.intel?.current?.dqn?.score||50)],['SUPERVISOR',Number(state.intel?.current?.meta?.confidence||state.intel?.current?.supervisor?.confidence||50)]];const list=names.length?names.map(x=>[String(x.name).toUpperCase(),x.score]):fallback;$('agentMini').innerHTML=list.slice(0,8).map(([name,score])=>`<div class="agent-row"><span>${esc(name).slice(0,17)}</span><div class="bar"><i style="width:${Math.max(0,Math.min(100,score))}%"></i></div><b>${n(score,0)}%</b></div>`).join('');}
+function renderAgents(){const nodes=state.agents?.nodes||state.agents?.agents||state.intel?.agents?.nodes||[];const names=nodes.length?nodes.map(x=>({name:x.name||x.agent||x.id,score:Number(x.score??x.confidence??x.value??0),status:x.status||x.decision||'—'})):[];const fallback=[['TECHNICAL',state.intel?.current?.technical?.allowed?84:45],['SENTIMENT',state.intel?.current?.sentiment?.allowed?76:42],['LIQUIDITY',Number(state.intel?.current?.market?.orderBook?.bidAskRatio||1)*50],['RISK',state.intel?.current?.risk?.allowed?88:35],['DQN',Number(state.intel?.current?.dqn?.confidence||state.intel?.current?.dqn?.score||50)],['SUPERVISOR',Number(state.intel?.current?.meta?.confidence||state.intel?.current?.supervisor?.confidence||50)]];const list=names.length?names.map(x=>[String(x.name).toUpperCase(),x.score<=1?x.score*100:x.score]):fallback;$('agentMini').innerHTML=list.slice(0,8).map(([name,score])=>`<div class="agent-row"><span>${esc(name).slice(0,17)}</span><div class="bar"><i style="width:${Math.max(0,Math.min(100,score))}%"></i></div><b>${n(score,0)}%</b></div>`).join('');}
 function renderLiveControl(){
  const e=state.execution||{}, c=state.connection||{}, s=state.scan||{}, d=state.intel?.current?.dqn||{}, rows=state.market||[];
  const age=c.ageMs==null?'—':(c.ageMs<1000?`${c.ageMs}ms`:`${Math.round(c.ageMs/1000)}s`);
- const items=[['MODE',e.execution?.mode||'PAPER / SHADOW',e.execution?.liveOrders?'bad':'good'],['RISK GATE',e.execution?.ready?'APPROVED':'BLOCKED',e.execution?.ready?'good':'bad'],['CIRCUIT',e.execution?.circuitBreaker?'OPEN / BLOCK':'CLEAR',e.execution?.circuitBreaker?'bad':'good'],['RECON',e.execution?.reconciliation?'PASS':'FAIL',e.execution?.reconciliation?'good':'bad'],['EQUITY',e.portfolio?.equity==null?'—':'$'+n(e.portfolio.equity,2),''],['EXPOSURE',e.portfolio?.exposurePct==null?'—':n(e.portfolio.exposurePct,1)+'%',''],['POSITIONS',e.portfolio?.openPositions??0,''],['DQN',d.action||'—',''],['LIVE FEED',c.connected?'CONNECTED':'WAITING',c.connected?'good':'warn'],['EVENT AGE',age,''],['SCANNED',s.evaluated??s.scanned??rows.length,''],['SIGNALS',s.signals??0,Number(s.signals||0)>0?'good':'warn']];
+ const items=[['MODE',e.execution?.mode||'PAPER / SHADOW',e.execution?.liveOrders?'bad':'good'],['RISK GATE',e.execution?.ready?'APPROVED':'BLOCKED',e.execution?.ready?'good':'bad'],['CIRCUIT',e.execution?.circuitBreaker?'OPEN / BLOCK':'CLEAR',e.execution?.circuitBreaker?'bad':'good'],['RECON',e.execution?.reconciliation?'PASS':'FAIL',e.execution?.reconciliation?'good':'bad'],['EQUITY',e.portfolio?.equity==null?'—':'$'+n(e.portfolio.equity,2),''],['EXPOSURE',e.portfolio?.exposurePct==null?'—':n(e.portfolio.exposurePct,1)+'%',''],['POSITIONS',e.portfolio?.openPositions??0,''],['DQN',d.action||'—',''],['LIVE FEED',c.connected?'CONNECTED':'WAITING',c.connected?'good':'warn'],['EVENT AGE',age,''],['SCANNED',s.evaluated??s.scanned??rows.length,''],['SIGNALS',s.signalsGenerated??s.signals??0,Number(s.signalsGenerated ?? s.signals ?? 0)>0?'good':'warn']];
  $('liveControl').innerHTML=items.map(([k,v,cl])=>`<div class="control-box"><span>${k}</span><b class="${cl}">${esc(v)}</b></div>`).join('')+`<div class="diag-line"><span>UNIVERSE ${esc(s.universeCount??s.universe?.length??'—')}</span><span>ROWS ${rows.length}</span><span>EVAL ${esc(s.evaluated??s.marketDataEvaluated??'—')}</span><span>RISK BLOCK ${esc(s.preRiskBlocked??'—')}</span><span>PHASE ${esc(s.phase||state.regime?.currentRegime||'—')}</span></div>`;
 }
 
@@ -167,7 +167,7 @@ function renderBrain(){
   const cur=state.intel?.current||{};
   const d=cur.decision||{};
   const tech=cur.technical||{}, sent=cur.sentiment||{}, risk=cur.risk||{};
-  const action=String(d.action||'REJECT').toUpperCase();
+  const action=String(d.action||state.agents?.finalAction||state.agents?.supervisor?.recommendation||'REJECT').toUpperCase();
   const t=Array.isArray(state.timeline)?state.timeline:[];
   const latest=t[t.length-1]||{};
   const inputs={
@@ -348,10 +348,32 @@ function applyProductionEvent(evt){
     scheduleLiveRefresh();
     return;
   }
-  if(['AGENTS:EVALUATED','RISK:EVALUATED','SUPERVISOR:EVALUATED','DECISION:REPLAY','EXECUTION:STATE','COUNTERFACTUAL:EVALUATED','ROUTER:EVALUATED'].includes(evt.type)){
-    $('eventCount').textContent='LIVE';
-    scheduleLiveRefresh();
-  }
+    if(evt.type==='AGENTS:EVALUATED'){
+     state.agents={...(evt.payload||{}),live:true,updatedAt:Number(evt.ts||Date.now())};
+     $('eventCount').textContent='LIVE';
+     renderAgents();renderNeuralDetail();renderBrain();
+     return;
+   }
+   if(evt.type==='SIGNAL:GENERATED'){
+     const p=evt.payload||{}, sym=String(evt.symbol||p.symbol||'').toUpperCase();
+     if(sym){
+       const row={...(state.market.find(x=>String(x.symbol).toUpperCase()===sym)||{}),...p,symbol:sym,eventTs:Number(evt.ts||Date.now()),live:true,source:'PRODUCTION_SCANNER'};
+       const idx=state.market.findIndex(x=>String(x.symbol).toUpperCase()===sym);
+       if(idx>=0) state.market[idx]=row; else state.market.push(row);
+       state.market.sort((a,b)=>String(a.symbol).localeCompare(String(b.symbol)));
+       state.scan={...(state.scan||{}),signals:Number(state.scan?.signals||0)+1};
+       state.scanHistory.push({ts:Number(evt.ts||Date.now()),eventId:evt.eventId,type:evt.type,symbol:sym,payload:p});
+       if(state.scanHistory.length>240)state.scanHistory=state.scanHistory.slice(-240);
+       renderMarket();renderLiveControl();renderScanHistory();
+       if(sym===String(state.symbol).toUpperCase())renderBrain();
+     }
+     $('eventCount').textContent='LIVE';
+     return;
+   }
+   if(['RISK:EVALUATED','SUPERVISOR:EVALUATED','DECISION:REPLAY','EXECUTION:STATE','COUNTERFACTUAL:EVALUATED','ROUTER:EVALUATED'].includes(evt.type)){
+     $('eventCount').textContent='LIVE';
+     scheduleLiveRefresh();
+   }
 }
 function connectProductionStream(){
   if(liveEventSource) liveEventSource.close();

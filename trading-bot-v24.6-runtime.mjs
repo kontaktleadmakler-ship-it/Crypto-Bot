@@ -3635,7 +3635,7 @@ function evaluateDirectionGates(dir, p, scanStats) {
 
 function createEmptyScanStats() {
   return {
-    total: 0, signalsSent: 0, totalSignalScore: 0, avgSignalScore: 0,
+    total: 0, signalsGenerated: 0, signalsSent: 0, totalSignalScore: 0, avgSignalScore: 0,
     universeLoaded: 0, watchlistReturned: 0, tradableCandidates: 0, filteredNonTradable: 0,
     marketDataEvaluated: 0, gatePassed: 0, gateRejected: 0, postGatePassed: 0,
     runtimeErrors: 0, paperExecutionRejected: 0,
@@ -4246,6 +4246,43 @@ async function scanMarket() {
             }
           }
 
+          // LIVE NEURAL CORE BRIDGE: publish the complete per-candidate agent
+          // decision after DQN observation/veto evaluation. The dashboard must
+          // consume the same production decision stream; it must not need to
+          // re-run a second market-data request just to visualize the agents.
+          const neuralDqn = (config.DQN_ENABLED && dqnAgent.isInitialized)
+            ? {
+                enabled: true,
+                initialized: true,
+                action: typeof dqnMeta !== 'undefined' ? dqnMeta.actionName : 'UNAVAILABLE',
+                actionIndex: typeof dqnMeta !== 'undefined' ? dqnMeta.action : null,
+                qValues: typeof dqnMeta !== 'undefined' ? dqnMeta.qValues : null,
+                epsilon: dqnAgent.epsilon,
+                modelVersion: typeof dqnMeta !== 'undefined' ? dqnMeta.modelVersion : dqnAgent.modelVersion
+              }
+            : { enabled: Boolean(config.DQN_ENABLED), initialized: false, action: 'UNAVAILABLE', actionIndex: null, qValues: null, epsilon: dqnAgent.epsilon, modelVersion: dqnAgent.modelVersion };
+          const neuralNodes = [
+            { id:'risk-supervisor', label:'RISK SUPERVISOR', score:agentEvaluation.riskSupervisor.score, decision:agentEvaluation.riskSupervisor.decision, status:agentEvaluation.riskSupervisor.hardBlock?'BLOCK':'PASS' },
+            { id:'portfolio-allocation', label:'PORTFOLIO', score:agentEvaluation.portfolioAllocation.scale, decision:'ALLOCATE', status:'PASS' },
+            { id:'anomaly-detection', label:'ANOMALY', score:1-agentEvaluation.anomaly.score, decision:agentEvaluation.anomaly.severity, status:agentEvaluation.anomaly.severity==='HIGH'?'VETO':'PASS' },
+            { id:'liquidity', label:'LIQUIDITY', score:agentEvaluation.liquidity.score, decision:agentEvaluation.liquidity.decision, status:agentEvaluation.liquidity.decision==='BLOCK'?'VETO':'PASS' },
+            { id:'exit-evaluation', label:'EXIT EVALUATOR', score:agentEvaluation.exit.score, decision:agentEvaluation.exit.decision, status:'MONITOR' },
+            { id:'strategy-evaluation', label:'STRATEGY', score:agentEvaluation.strategy.score, decision:agentEvaluation.strategy.health, status:agentEvaluation.strategy.health==='DISABLED'?'VETO':'PASS' },
+            { id:'dqn', label:'DQN / RL CORE', score:neuralDqn.qValues?.length ? 1 : 0, decision:neuralDqn.action, status:neuralDqn.initialized?'LIVE':'OFFLINE' },
+            { id:'meta-supervisor', label:'META SUPERVISOR', score:agentEvaluation.meta.confidence, decision:agentEvaluation.meta.decision, status:agentEvaluation.meta.hardBlock?'VETO':'PASS' }
+          ];
+          const neuralConfidence = Math.round(Math.max(0, Math.min(1,
+            Number(agentEvaluation.meta.confidence || 0)
+          )) * 100);
+          jarvisEventBus.emitEvent('AGENTS:EVALUATED', {
+            symbol, nodes: neuralNodes, dqn: neuralDqn,
+            confidence: neuralConfidence,
+            consensus: neuralNodes.filter(n => ['PASS','LIVE','MONITOR'].includes(n.status)).length,
+            vetoes: neuralNodes.filter(n => String(n.status).includes('VETO') || String(n.status).includes('BLOCK')).map(n => ({agent:n.label, reason:n.decision})),
+            meta: agentEvaluation.meta,
+            finalAction: agentEvaluation.meta.decision
+          }, { source:'agent-suite', severity:agentEvaluation.meta.hardBlock?'WARN':'INFO', persist:false, persistReplay:true, persistMinIntervalMs:0 });
+
           if (shouldSkipSignal(symbol, direction, signalScore)) {
             scanStats.signalHistoryBlocked++;
             return;
@@ -4330,9 +4367,34 @@ async function scanMarket() {
             logger.warn(`[RISK-ENGINE] Signal blockiert: ${riskCheck.reason}`); return;
           }
 
+          // SIGNAL GENERATION IS DISTINCT FROM PAPER EXECUTION. A paper-fill
+          // or reconciliation failure must never erase an otherwise valid
+          // strategy signal from the system/dashboard. No live-order path is
+          // introduced here: this is an observability/signal event only.
+          const generatedSignalId = `${symbol}:${direction}:${Date.now()}:${scanCounter}`;
+          scanStats.signalsGenerated = (scanStats.signalsGenerated || 0) + 1;
+           jarvisEventBus.emitEvent('SIGNAL:GENERATED', {
+            symbol, direction, signalId: generatedSignalId,
+            signalScore: Number(signalScore || 0),
+            confidence: Number(mlPrediction.confidence || 0),
+            mlProbability: Number(mlPrediction.probability || 0),
+            dqnAction: (typeof dqnMeta !== 'undefined' && dqnMeta) ? dqnMeta.actionName : 'UNAVAILABLE',
+            entryZoneLow, entryZoneHigh, referencePrice: entryZoneMid,
+            stopLoss, tp1, tp2,
+            riskAmountUSD: sizing.riskAmountUSD,
+            paperExecutionEnabled: Boolean(config.PAPER_EXECUTION_ENABLED),
+            timestamp: Date.now()
+          }, { source:'scanner', severity:'INFO', persist:true, persistReplay:true, persistMinIntervalMs:0 });
+          dashboardPatchScanRecord(scanRecordEvent, symbol, {
+            finalDecision: direction,
+            decisionReason: 'SIGNAL_GENERATED',
+            signalScore: Number(signalScore || 0),
+            signalId: generatedSignalId
+          });
+
           let paperOrder = null;
           if (config.PAPER_EXECUTION_ENABLED) {
-            const signalId = `${symbol}:${direction}:${Date.now()}:${scanCounter}`;
+            const signalId = generatedSignalId;
             try {
               const executionResult = await executePaperExecutionThroughCore({
                 symbol,
@@ -4491,7 +4553,7 @@ async function scanMarket() {
     }
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
-    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} preRiskBlocked=${scanStats.preRiskBlocked} preRiskReasons=${JSON.stringify(scanStats.preRiskReasons)} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
+    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} preRiskBlocked=${scanStats.preRiskBlocked} preRiskReasons=${JSON.stringify(scanStats.preRiskReasons)} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signalsGenerated=${scanStats.signalsGenerated || 0} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
     // FIX (2026-08-29): postGatePassed>0 aber signals==0 über mehrere Tage
     // gemeldet - die Zähler für alles zwischen Gate-Pass und Signalversand
     // wurden zwar schon mitgezählt, tauchten aber nie in diesem Log auf.
@@ -4512,7 +4574,7 @@ async function scanMarket() {
 
     lastScanStats = scanStats;
     scanCounter++;
-    dashboardScanState = { scanning: false, startedAt: dashboardScanState.startedAt, finishedAt: Date.now(), counter: scanCounter, checked: scanStats.total, signals: signalsSent };
+    dashboardScanState = { scanning: false, startedAt: dashboardScanState.startedAt, finishedAt: Date.now(), counter: scanCounter, checked: scanStats.total, signals: signalsSent, signalsGenerated: scanStats.signalsGenerated || 0 };
     dashboardScanCache.ts = 0;
     jarvisEventBus.emitEvent('SCAN:COMPLETE', { scanCounter, checked: scanStats.total, signals: signalsSent, universeSize: dashboardScanUniverse.length, marketPhase: currentMarketPhase }, { source: 'scanner', persist: true, persistMinIntervalMs: 500 });
 
