@@ -88,7 +88,7 @@ class StrategyEvaluationAgent {
   evaluate(ctx = {}) {
     const expectancy = num(ctx.expectancy);
     const sharpe = num(ctx.sharpe);
-    const drawdown = Math.abs(num(ctx.maxDrawdownPct));
+    const drawdown = Math.abs(num(ctx.drawdownPct));
     const oos = clamp(ctx.oosScore, 0, 1);
     const drift = clamp(ctx.driftScore, 0, 1);
     const score = clamp(0.30 * clamp((expectancy + 1) / 2) + 0.20 * clamp((sharpe + 1) / 3) + 0.20 * (1 - clamp(drawdown / 30)) + 0.20 * oos + 0.10 * (1 - drift));

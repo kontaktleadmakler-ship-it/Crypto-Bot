@@ -3520,6 +3520,32 @@ async function scanMarket() {
     const btcPrice = btcKlines ? btcKlines[btcKlines.length - 1].close : 0;
     const btcVolatility = btcPrice > 0 ? btcATR / btcPrice : 0.02;
 
+    // FIX (2026-08-30): agentSuite.evaluate() (Institutional Agent Suite /
+    // StrategyEvaluationAgent) requires `expectancy` and `sharpe` as part of
+    // its contract (see tests/agent-suite.test.js), but the live scan call
+    // never provided them - both silently defaulted to 0 on every single
+    // evaluation, regardless of actual bot performance. Combined with an
+    // early-stage/untrained ML model (oosScore~0) and any measured drift,
+    // the resulting strategy score frequently fell below the DISABLED
+    // threshold, permanently tripping meta-supervisor.hardBlock and
+    // blocking every signal after a fully successful scan. Computed once
+    // per scan (not per-candidate) to avoid redundant DB round trips.
+    let agentExpectancy = 0;
+    let agentSharpe = 0;
+    try {
+      const perfStats = await getPeriodPerformanceStats(7);
+      if (perfStats && perfStats.totalTrades > 0) {
+        const winRateFrac = (parseFloat(perfStats.winRate) || 0) / 100;
+        const avgLossAbs = Math.abs(perfStats.avgLoss) || 0;
+        const rMultiple = avgLossAbs > 0 ? (perfStats.avgWin / avgLossAbs) : (perfStats.avgWin > 0 ? 2 : 0);
+        // Standard R-multiple expectancy: E[R] = win% * avgWinR - loss% * 1R
+        agentExpectancy = (winRateFrac * rMultiple) - (1 - winRateFrac);
+        agentSharpe = parseFloat(perfStats.sharpeRatio) || 0;
+      }
+    } catch (e) {
+      logger.warn?.(`[AGENT-SUPERVISOR] Performance-Stats für expectancy/sharpe nicht verfügbar: ${e.message}`);
+    }
+
     currentMarketPhase = detectMarketPhase(btcTrend, btcADX, btcVolatility);
     adaptiveConfig = config.ENABLE_ADAPTIVE_PARAMS 
       ? getAdaptiveConfig(currentMarketPhase) 
@@ -3921,6 +3947,8 @@ async function scanMarket() {
             maxExposurePct: Math.max(0, Number(config.MAX_EXPOSURE_RATIO || 0)) * Math.max(1, Number(config.LEVERAGE || 1)) * 100,
             drawdownPct: Math.max(0, peakCapital > 0 ? ((peakCapital - (config.CAPITAL_USD + dailyNetPnL)) / peakCapital) * 100 : 0),
             maxDrawdownPct: MAX_DRAWDOWN_PERCENT,
+            expectancy: agentExpectancy,
+            sharpe: agentSharpe,
             dailyLossPct: Math.max(0, -(dailyNetPnL / Math.max(config.CAPITAL_USD, 1)) * 100),
             maxDailyLossPct: Math.max(0, Number(config.MAX_DAILY_LOSS_USD || 0) / Math.max(config.CAPITAL_USD, 1) * 100),
             killSwitch: safetyController.isActive('kill-switch') || isPaused, circuitBreaker: Date.now() < kucoinCircuitOpenUntil,
