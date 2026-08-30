@@ -2741,18 +2741,24 @@ async function getMarketDataBundle(symbol) {
 
       const raw15m = await fetchKlines('15m', 100);
       if (!raw15m || raw15m.length < 20) {
-        throw new Error(`${symbol}/15m market data unavailable`);
+        const err = new Error(`${symbol}/15m market data unavailable`);
+        err.code = 'KLINES_UNAVAILABLE';
+        throw err;
       }
 
       let raw1h = config.ENABLE_MULTI_TF_DERIVATION
         ? deriveHigherTimeframes(raw15m, '1h')
         : await fetchKlines('1h', 50);
       if (!raw1h) {
-        throw new Error(`${symbol}/1h market data unavailable`);
+        const err = new Error(`${symbol}/1h market data unavailable`);
+        err.code = 'KLINES_UNAVAILABLE';
+        throw err;
       }
       raw1h = raw1h.filter(c => c.time + ONE_HOUR_MS <= Date.now());
       if (raw1h.length === 0) {
-        throw new Error(`${symbol}/1h closed candles unavailable`);
+        const err = new Error(`${symbol}/1h closed candles unavailable`);
+        err.code = 'KLINES_UNAVAILABLE';
+        throw err;
       }
 
       let raw4h = null;
@@ -2802,64 +2808,6 @@ async function getMarketDataBundle(symbol) {
     return await wrappedTask;
   } catch (e) {
     throw e;
-  } finally {
-    marketDataInflight.delete(key);
-  }
-}
-
-  const key = `bundle:${symbol}`;
-  const existing = marketDataInflight.get(key);
-  if (existing) return existing;
-
-  const task = (async () => {
-    const raw15m = await fetchKucoinKlinesCached(symbol, '15m', 100);
-    if (!raw15m || raw15m.length < 20) {
-      const err = new Error(`${symbol}/15m market data unavailable`);
-      err.code = 'KLINES_UNAVAILABLE';
-      throw err;
-    }
-
-    let raw1h = config.ENABLE_MULTI_TF_DERIVATION
-      ? deriveHigherTimeframes(raw15m, '1h')
-      : await fetchKucoinKlinesCached(symbol, '1h', 50);
-    if (!raw1h) {
-      const err = new Error(`${symbol}/1h market data unavailable`);
-      err.code = 'KLINES_UNAVAILABLE';
-      throw err;
-    }
-    raw1h = raw1h.filter(c => c.time + ONE_HOUR_MS <= Date.now());
-    if (raw1h.length === 0) {
-      const err = new Error(`${symbol}/1h closed candles unavailable`);
-      err.code = 'KLINES_UNAVAILABLE';
-      throw err;
-    }
-
-    let raw4h = null;
-    if (config.REQUIRE_4H_TREND) {
-      raw4h = config.ENABLE_MULTI_TF_DERIVATION
-        ? deriveHigherTimeframes(raw15m, '4h')
-        : await fetchKucoinKlinesCached(symbol, '4h', 50);
-      if (raw4h) raw4h = raw4h.filter(c => c.time + FOUR_HOUR_MS <= Date.now());
-    }
-
-    // Independent optional sources run concurrently. A failed optional source
-    // is handled by the existing strategy gate instead of blocking the bundle.
-    const [futuresResult, orderBookResult] = await Promise.allSettled([
-      fetchFuturesData(symbol),
-      fetchOrderBookMetrics(symbol)
-    ]);
-
-    return {
-      symbol, raw15m, raw1h, raw4h,
-      futuresData: futuresResult.status === 'fulfilled' ? futuresResult.value : null,
-      orderBookMetrics: orderBookResult.status === 'fulfilled' ? orderBookResult.value : null,
-      fetchedAt: Date.now()
-    };
-  })();
-
-  marketDataInflight.set(key, task);
-  try {
-    return await task;
   } finally {
     marketDataInflight.delete(key);
   }
@@ -6642,6 +6590,18 @@ const jarvisHistoricalReplay = new MarketDataReplay({
   logger: console
 });
 
+// FIX (2026-08-30 / follow-up): this endpoint fed the dashboard's "Neural
+// Core" panel (renderBrain() -> state.timeline) exclusively from
+// jarvisHistoricalReplay, which reads the *.jsonl replay files under
+// MARKET_DATA_DIR on local disk. On Render (and any restart/redeploy) that
+// filesystem is ephemeral - see the comment on dashboardRecordProductionScanCoin()
+// - so this endpoint served an empty timeline forever in production even
+// though the exact same SCAN:COIN events were already being written to
+// MongoDB and to the in-memory jarvisEventBus for every scan. The sibling
+// /api/dashboard/scan-history endpoint was already fixed to prefer MongoDB;
+// this endpoint never got the same treatment. Mongo docs and in-memory
+// jarvisEventBus events share the same {ts,eventId,type,symbol,payload}
+// shape buildCoinTimeline() expects, so both can be fed into it directly.
 app.get('/api/dashboard/coin-timeline', async (req, res) => {
   try {
     const now = Date.now();
@@ -6649,10 +6609,48 @@ app.get('/api/dashboard/coin-timeline', async (req, res) => {
     const toTs = Number.isFinite(Number(req.query.to)) ? Number(req.query.to) : now;
     const symbol = String(req.query.symbol || dashboardScanUniverse[0] || 'BTC-USDT').toUpperCase();
     const limit = Math.min(300, Math.max(10, Number(req.query.limit || 120)));
-    const events = [];
-    await jarvisHistoricalReplay.run({ fromTs, toTs, onEvent: async e => {
-      if (String(e.symbol || '').toUpperCase() === symbol) events.push(e);
-    }});
+
+    let events = [];
+    let source = 'LOCAL_REPLAY_FALLBACK';
+    let durable = false;
+
+    if (dashboardScanHistoryCollection && isDbConnected) {
+      const rows = await dashboardScanHistoryCollection
+        .find({ symbol, ts: { $gte: fromTs, $lte: toTs } }, { projection: { _id: 0 } })
+        .sort({ ts: 1 })
+        .limit(Math.max(limit * 12, 500))
+        .toArray();
+      events = rows.map(row => ({
+        ts: row.ts, eventId: row.eventId, type: row.type || 'SCAN:COIN',
+        symbol: row.symbol, severity: row.severity || 'INFO',
+        source: row.source || 'scanner', payload: row.payload || {}
+      }));
+      source = 'MONGODB_PRODUCTION_SCANNER_HISTORY';
+      durable = true;
+    }
+
+    if (!events.length) {
+      // Mongo unreachable or has nothing in range yet (e.g. right after a
+      // fresh deploy) - the in-memory event bus still holds the most recent
+      // live scans for this process even with an empty disk/Mongo history.
+      const live = jarvisEventBus.recent({ limit: 500, symbol, types: null })
+        .filter(e => Number(e.ts) >= fromTs && Number(e.ts) <= toTs)
+        .reverse();
+      if (live.length) {
+        events = live;
+        source = 'LIVE_EVENT_BUS';
+        durable = false;
+      }
+    }
+
+    if (!events.length) {
+      // Last-resort fallback for local dev, where the replay directory is a
+      // real persistent path rather than an ephemeral container filesystem.
+      await jarvisHistoricalReplay.run({ fromTs, toTs, onEvent: async e => {
+        if (String(e.symbol || '').toUpperCase() === symbol) events.push(e);
+      }});
+    }
+
     const timeline = buildCoinTimeline(events, symbol).slice(-limit);
     const scans = timeline.length;
     const decisions = timeline.filter(x => x.decision).length;
@@ -6663,7 +6661,7 @@ app.get('/api/dashboard/coin-timeline', async (req, res) => {
     const positiveReactionRate = reactions.length ? reactions.filter(x=>x>0).length/reactions.length*100 : null;
     res.setHeader('Cache-Control','no-store');
     res.json({
-      timestamp: now, mode: 'READ_ONLY_COIN_FORENSICS', symbol,
+      timestamp: now, mode: 'READ_ONLY_COIN_FORENSICS', symbol, source, durable,
       range: { from: fromTs, to: toTs },
       summary: { scans, decisions, passes, rejects, avgDirectedReactionPct: avgReaction, positiveReactionRate },
       timeline
@@ -7155,6 +7153,23 @@ intervalTimers.push(setInterval(async () => {
   try { await checkActiveTrades(); }
   catch (e) { logger.error(`[TRACKER INTERVAL ERROR] ${e.message}\n${e.stack}`); }
 }, config.FAST_TRACK_INTERVAL_SECONDS * 1000));
+
+// FIX (2026-08-30 / follow-up): clearStatePersistenceKillSwitch() only runs
+// inside persistDailyPnLState()/persistPeakCapital()/persistBotControlState(),
+// which are themselves only called when a trade opens/closes or at the
+// midnight cron. With zero open positions (exactly what a permanently
+// blocked scanner produces) none of those call sites ever fire again, so a
+// kill-switch latched by a single transient Mongo hiccup never got a chance
+// to self-heal - the scanner kept running and completing normally while
+// every signal stayed blocked forever. This probes the persistence layer on
+// a fixed cadence, independent of trade activity, so recovery is detected
+// as soon as MongoDB is reachable again instead of never.
+intervalTimers.push(setInterval(async () => {
+  if (!riskEngine.killSwitch) return;
+  if (!/^state-(persistence|load)-(unavailable|failed)/.test(String(riskEngine.killReason || ''))) return;
+  try { await persistPeakCapital(); }
+  catch (e) { logger.warn?.(`[RISK-ENGINE] Kill-Switch Recovery-Check fehlgeschlagen: ${e.message}`); }
+}, 60000));
 
 intervalTimers.push(setInterval(() => {
   try { klinesCache.cleanup(config.CACHE_CLEANUP_MINUTES * 60 * 1000); }
