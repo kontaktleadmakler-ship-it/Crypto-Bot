@@ -3954,7 +3954,8 @@ async function scanMarket() {
           return;
         }
 
-        const { raw15m, raw1h, raw4h, futuresData, orderBookMetrics } = marketData;
+        const { raw15m, raw1h, raw4h, futuresData, orderBookMetrics: rawOrderBookMetrics } = marketData;
+        let orderBookMetrics = rawOrderBookMetrics;
      if (!orderBookMetrics || !orderBookMetrics.valid) {
     logger.warn(`[MARKET-DATA] OrderBook metrics unavailable for ${symbol}, using defaults.`);
     const defaultOrderBook = {
