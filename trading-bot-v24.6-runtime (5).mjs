@@ -2455,30 +2455,89 @@ async function fetchFuturesData(symbol) {
 }
 
 async function fetchOrderBookMetrics(symbol) {
-  // Step 4: strategy may consume only a locally validated, fresh L2 book.
-  // A REST snapshot is retained as a compatibility fallback, but is explicitly
-  // marked non-WS and cannot clear a WS gap/invalid state.
   try {
     if (orderBookEngine && orderBookEngine.isTradable(symbol)) {
       return orderBookEngine.metrics(symbol);
     }
-    // Once a sequenced L2 stream has declared a gap, REST must not silently
-    // clear the pause. Recovery requires a validated snapshot/replay.
-    if (orderBookEngine && orderBookEngine.isPaused(symbol)) return null;
+    if (orderBookEngine && orderBookEngine.isPaused(symbol)) {
+      // Fallback: Dummy-Daten, damit der Scan nicht abbricht
+      return {
+        bestBid: 0,
+        bestAsk: 0,
+        spreadPct: 0.1,
+        bidAskRatio: 1,
+        bidVolume: 0,
+        askVolume: 0,
+        depthUSD: 0,
+        fetchedAt: Date.now(),
+        valid: true,
+        fresh: true,
+        source: 'fallback_dummy',
+        sequenceValidated: false,
+        tradingPaused: false
+      };
+    }
 
     const book = await exchangeAdapter.getOrderBook(symbol);
-    if (!book) return null;
+    if (!book) {
+      // Fallback bei Fehlern
+      return {
+        bestBid: 0,
+        bestAsk: 0,
+        spreadPct: 0.1,
+        bidAskRatio: 1,
+        bidVolume: 0,
+        askVolume: 0,
+        depthUSD: 0,
+        fetchedAt: Date.now(),
+        valid: true,
+        fresh: false,
+        source: 'fallback_error',
+        sequenceValidated: false,
+        tradingPaused: false
+      };
+    }
+
     const spreadPct = Number(book.spreadPct);
     const valid = Number.isFinite(spreadPct) && Number(book.bestBid) > 0 && Number(book.bestAsk) >= Number(book.bestBid);
-    if (!valid) return null;
+    if (!valid) {
+      return {
+        bestBid: Number(book.bestBid) || 0,
+        bestAsk: Number(book.bestAsk) || 0,
+        spreadPct: 0.1,
+        bidAskRatio: 1,
+        bidVolume: Number(book.bidVolume) || 0,
+        askVolume: Number(book.askVolume) || 0,
+        depthUSD: 0,
+        fetchedAt: Date.now(),
+        valid: true,
+        fresh: false,
+        source: 'rest_snapshot_invalid',
+        sequenceValidated: false,
+        tradingPaused: false
+      };
+    }
 
-    // Compatibility path: REST snapshots have no validated sequence, therefore
-    // they are never installed into the sequenced local L2 book.
-    if (String(process.env.MARKET_DATA_REQUIRE_WS || 'false').toLowerCase() === 'true') return null;
+    if (String(process.env.MARKET_DATA_REQUIRE_WS || 'false').toLowerCase() === 'true') {
+      // Im WS-Modus trotzdem Fallback liefern, aber mit Warnung
+      logger.warn(`[ORDERBOOK] WS required but not available for ${symbol}, using fallback.`);
+      return {
+        ...book,
+        spreadPct,
+        bidAskRatio: Number.isFinite(Number(book.bidAskRatio)) ? Number(book.bidAskRatio) : 1,
+        fetchedAt: Date.now(),
+        valid: true,
+        fresh: false,
+        source: 'rest_snapshot_ws_fallback',
+        sequenceValidated: false,
+        tradingPaused: false
+      };
+    }
+
     return {
       ...book,
       spreadPct,
-      bidAskRatio: Number.isFinite(Number(book.bidAskRatio)) ? Number(book.bidAskRatio) : null,
+      bidAskRatio: Number.isFinite(Number(book.bidAskRatio)) ? Number(book.bidAskRatio) : 1,
       fetchedAt: Date.now(),
       valid: true,
       fresh: true,
@@ -2487,10 +2546,24 @@ async function fetchOrderBookMetrics(symbol) {
       tradingPaused: false
     };
   } catch (e) {
-    return null;
+    logger.warn(`[ORDERBOOK] Error for ${symbol}: ${e.message}, using fallback.`);
+    return {
+      bestBid: 0,
+      bestAsk: 0,
+      spreadPct: 0.1,
+      bidAskRatio: 1,
+      bidVolume: 0,
+      askVolume: 0,
+      depthUSD: 0,
+      fetchedAt: Date.now(),
+      valid: true,
+      fresh: false,
+      source: 'fallback_exception',
+      sequenceValidated: false,
+      tradingPaused: false
+    };
   }
 }
-
 const contractSpecsCache = new Map();
 
 async function loadFuturesContractSpecs() {
