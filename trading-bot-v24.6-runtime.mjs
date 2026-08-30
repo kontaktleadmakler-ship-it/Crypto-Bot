@@ -2711,6 +2711,24 @@ function isKucoinCircuitOpen() {
 // valid timeouts. Concurrency is now enforced at the exchange-request layer
 // (futuresApiSemaphore) instead.
 
+// FIX (2026-08-30): getMarketDataBundle() called withTimeout(promise, ms,
+// label) for every fetch, but no function of that name/signature was ever
+// defined at module scope - the only two `withTimeout` identifiers in this
+// file are unrelated locals scoped inside asyncPool() and the shutdown
+// handler, neither reachable here. Every single call therefore threw
+// "ReferenceError: withTimeout is not defined" as an unhandled rejection,
+// which crashed the process before the very first scan could evaluate a
+// single candidate. This is the shared, module-level version the bundle
+// fetches actually need: rejects with a "timed out" message so the existing
+// /timed out/i.test(e.message) classification in scanMarket() keeps working.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label || 'operation'} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function getMarketDataBundle(symbol) {
   if (isKucoinCircuitOpen()) {
     const err = new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
