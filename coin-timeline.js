@@ -36,10 +36,17 @@ function buildCoinTimeline(events, symbol) {
     const execution = related.find(e => e.type === 'EXECUTION:STATE');
 
     const basePrice = Number(p.price || 0);
+    // p.finalDecision/p.confidence are patched directly onto the SCAN:COIN
+    // payload by dashboardPatchScanRecord() as the scan pipeline progresses
+    // (see trading-bot-v24.6-runtime.mjs). When the source is MongoDB or the
+    // live event bus there are no separate DECISION:REPLAY/AGENTS:EVALUATED
+    // events to join against, so those patched fields are the only place the
+    // real outcome (vs. the early gate-only direction) is recorded.
     const action = String(
       decision?.payload?.action ||
       decision?.payload?.finalAction ||
       decision?.payload?.recommendation ||
+      p.finalDecision ||
       p.gateDirection ||
       'REJECT'
     ).toUpperCase();
@@ -89,7 +96,7 @@ function buildCoinTimeline(events, symbol) {
       decision: decision?.payload || null,
       execution: execution?.payload || null,
       action,
-      confidence: Number(decision?.payload?.confidence ?? decision?.payload?.score ?? p.confidence ?? 0),
+      confidence: Number(decision?.payload?.confidence ?? decision?.payload?.score ?? p.confidence ?? (p.mlProbability != null ? p.mlProbability * 100 : 0) ?? 0),
       nextObserved: nextScan ? { ts: nextScan.ts, price: nextPrice } : null,
       reactionPct,
       directedReactionPct: directed(reactionPct, action),
