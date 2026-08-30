@@ -2817,7 +2817,15 @@ async function getMarketDataBundle(symbol) {
       const timeout = setTimeout(() => {
         reject(new Error(`${symbol} market-data bundle timed out after ${MARKET_DATA_BUNDLE_TIMEOUT_MS}ms`));
       }, MARKET_DATA_BUNDLE_TIMEOUT_MS || 20000);
-      task.finally(() => clearTimeout(timeout));
+      // FIX (2026-08-30): task.finally() returns a NEW promise that adopts
+      // task's rejection. That new promise was never stored or awaited, so
+      // whenever task rejected (e.g. "market data unavailable") Node saw a
+      // second, completely unhandled rejection for the exact same error -
+      // on top of the one already caught properly via wrappedTask below -
+      // and crashed the whole process on it. The clearTimeout side effect
+      // still runs; only the resulting promise's rejection is discarded here,
+      // since the real error is already propagated through wrappedTask.
+      task.finally(() => clearTimeout(timeout)).catch(() => {});
     })
   ]);
 
