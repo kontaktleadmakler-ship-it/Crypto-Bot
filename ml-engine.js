@@ -595,7 +595,17 @@ class TensorFlowSignalModel {
             ? 'NO_TRADE'
             : 'NEUTRAL';
 
-    return { probability, class: className, confidence, trained: true };
+    // FIX (2026-08-30): predict() never returned `validationQuality`, even
+    // though it is computed and stored on `this.stats` right after training
+    // (see trainFromTrades()). The live scan gate's ML-quality-skip check
+    // (trading-bot-v24.6-runtime.mjs) reads `mlPrediction.validationQuality`
+    // to detect a demonstrably unreliable model (LOW_SAMPLE /
+    // WEAK_POSITIVE_DETECTION - 0% precision/recall on its own validation
+    // set) and skip using it as a blocker. Since that field was always
+    // `undefined` here, the skip-check could never trigger, so an
+    // unreliable model kept hard-blocking every single signal exactly as
+    // before the 2026-08-29 fix was supposed to prevent.
+    return { probability, class: className, confidence, trained: true, validationQuality: this.stats.validationQuality };
   }
 
   /**
