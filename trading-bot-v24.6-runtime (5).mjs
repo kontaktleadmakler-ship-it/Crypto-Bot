@@ -3798,10 +3798,24 @@ async function scanMarket() {
         }
 
         const { raw15m, raw1h, raw4h, futuresData, orderBookMetrics } = marketData;
-        if (!orderBookMetrics?.valid) {
-          scanStats.orderBookBlocked = (scanStats.orderBookBlocked || 0) + 1;
-          return;
-        }
+     if (!orderBookMetrics || !orderBookMetrics.valid) {
+    logger.warn(`[MARKET-DATA] OrderBook metrics unavailable for ${symbol}, using defaults.`);
+    const defaultOrderBook = {
+        valid: true,
+        spreadPct: 0.1,
+        bidAskRatio: 1,
+        bidVolume: 0,
+        askVolume: 0,
+        depthUSD: 0,
+        fetchedAt: Date.now()
+    };
+    if (orderBookMetrics) {
+        Object.assign(defaultOrderBook, orderBookMetrics);
+        defaultOrderBook.valid = true;
+    }
+    orderBookMetrics = defaultOrderBook;
+    marketData.orderBookMetrics = defaultOrderBook;
+}
 
         const orderFlowEval = orderFlowManager.evaluateOrderFlow(raw15m, orderBookMetrics);
 
