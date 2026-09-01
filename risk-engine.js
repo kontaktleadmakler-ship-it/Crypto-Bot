@@ -90,7 +90,21 @@ class RiskEngine {
         dailyLoss >= maxDaily * this._cfg('RISK_GOVERNOR_REDUCED_DAILY_LOSS_RATIO', 0.75) ||
         (maxExposureMargin > 0 && exposureMargin / maxExposureMargin >= this._cfg('RISK_GOVERNOR_REDUCED_EXPOSURE_RATIO', 0.85));
       if (reduced) this.transition('REDUCED', 'risk-headroom-low');
-      else if (this.state === 'NORMAL') this.transition('NORMAL', 'risk-within-limits', { force: true });
+      // BUGFIX (signal-drought root cause): this branch used to only reset
+      // to NORMAL when the engine was already NORMAL ("this.state ===
+      // 'NORMAL'"), i.e. it never downgraded out of HALT or (non-kill-switch)
+      // EMERGENCY once every hard/catastrophic condition had cleared again
+      // (e.g. after the nightly dailyPnL reset). transition() itself refuses
+      // non-forced downgrades ("target < current"), so a single bad day that
+      // ever tripped HALT/EMERGENCY left `stateAllows` (and therefore every
+      // candidate's preCheck.allowed) permanently false - silently discarding
+      // every signal on every future scan even though nothing was currently
+      // wrong. Forcing the transition unconditionally here re-evaluates and
+      // downgrades the state every time the *current* numbers are clean,
+      // while the kill switch (checked separately above, still needs
+      // clearKillSwitch()) and the hard/reduced branches above still block
+      // immediately the moment a real limit is breached again.
+      else this.transition('NORMAL', 'risk-within-limits', { force: true });
     }
     const stateAllows = this.state === 'NORMAL' || this.state === 'REDUCED';
     const allowed = stateAllows && hard.length === 0;
