@@ -3546,10 +3546,12 @@ async function asyncPool(concurrency, items, iteratorFn, itemTimeoutMs = config.
   return Promise.allSettled(results);
 }
 
-function evaluateDirectionGates(dir, p, scanStats) {
+function evaluateDirectionGates(dir, p, scanStats, gateConfig) {
   // Canonical filter implementation; prevents the live runtime from drifting
-  // away from the modular filter system.
-  return evaluateCentralDirectionGates(dir, p, scanStats, config, filterState);
+  // away from the modular filter system. `gateConfig` optionally overrides
+  // the global config (e.g. a per-scan, temporarily raised MIN_GATE_SCORE
+  // from the time-of-day throttle) without mutating global state.
+  return evaluateCentralDirectionGates(dir, p, scanStats, gateConfig || config, filterState);
 }
 
 function createEmptyScanStats() {
@@ -3567,7 +3569,7 @@ function createEmptyScanStats() {
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0,
+    timeBlocked: 0, timeThrottled: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0,
     marketDataTimeouts: 0, marketDataQueueTimeouts: 0, marketDataFailures: 0, circuitBreakerSkips: 0,
     mlGateSkippedLowQuality: 0
   };
@@ -3725,7 +3727,20 @@ async function scanMarket() {
       logger.warn('[RISK] adaptiveRisk invalid; safe fallback applied');
     }
 
-    let timeFilterBlocked = false;
+    // BUGFIX (2026-09-01, signal drought #2): this used to set
+    // `timeFilterBlocked = true` and then `return` for EVERY candidate in
+    // the scan (see the per-symbol loop below) as soon as a SINGLE hour or
+    // day had >=3/>=5 historically negative trades - a hard 100% block for
+    // the whole scan cycle, not the "throttling" the log message claimed.
+    // Because the stats are drawn from the last 30 days and a slot that
+    // never gets new (winning) trades never recovers on its own, this is
+    // self-reinforcing: one bad stretch can zero out every future scan
+    // during that UTC hour/weekday indefinitely. It now requires a larger,
+    // more reliable sample and raises the required gate score for this scan
+    // instead of suppressing every candidate outright - genuinely strong
+    // setups still get through, weak ones don't, which is what "throttle"
+    // is supposed to mean.
+    let timeFilterConfig = config;
     if (filterState.timetrend.enabled && config.ENABLE_TIME_FILTER) {
       const timeStats = await getTimeBasedAnalysis();
       if (timeStats) {
@@ -3733,9 +3748,18 @@ async function scanMarket() {
         const currentDay = new Date().getUTCDay();
         const hStat = timeStats.hourlyStats[currentHour];
         const dStat = timeStats.dailyStats[currentDay];
-        if ((hStat && hStat.trades >= 3 && hStat.pnl < 0) || (dStat && dStat.trades >= 5 && dStat.pnl < 0)) {
-          timeFilterBlocked = true;
-          logger.info(`⏰ [Time-Filter] Aktuelle Stunde (${currentHour} UTC) oder Wochentag (${currentDay}) historisch im Minus. Signale werden gedrosselt.`);
+        const hourBad = hStat && hStat.trades >= 5 && hStat.pnl < 0;
+        const dayBad = dStat && dStat.trades >= 8 && dStat.pnl < 0;
+        if (hourBad && dayBad) {
+          const penalty = Number(config.TIME_FILTER_SCORE_PENALTY ?? 15);
+          timeFilterConfig = { ...config, MIN_GATE_SCORE: config.MIN_GATE_SCORE + penalty };
+          scanStats.timeThrottled = (scanStats.timeThrottled || 0) + 1;
+          logger.info(`⏰ [Time-Filter] Stunde (${currentHour} UTC) UND Wochentag (${currentDay}) historisch im Minus. Gate-Score-Anforderung um ${penalty} erhöht (Drosselung statt Vollsperre).`);
+        } else if (hourBad || dayBad) {
+          const penalty = Number(config.TIME_FILTER_SCORE_PENALTY_SOFT ?? 7);
+          timeFilterConfig = { ...config, MIN_GATE_SCORE: config.MIN_GATE_SCORE + penalty };
+          scanStats.timeThrottled = (scanStats.timeThrottled || 0) + 1;
+          logger.info(`⏰ [Time-Filter] Stunde (${currentHour} UTC) oder Wochentag (${currentDay}) historisch leicht im Minus. Gate-Score-Anforderung um ${penalty} erhöht.`);
         }
       }
     }
@@ -3828,11 +3852,6 @@ async function scanMarket() {
       if (signalsSent >= config.MAX_SIGNALS_PER_SCAN) { 
         scanStats.skippedMaxSignals++; 
         return; 
-      }
-
-      if (timeFilterBlocked) {
-        scanStats.timeBlocked++;
-        return;
       }
 
       const preCheck = riskEngine.assess({
@@ -3986,7 +4005,7 @@ async function scanMarket() {
 
         var direction = null;
         const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
-        let primaryFail = evaluateDirectionGates(primaryDir, gateParams, scanStats);
+        let primaryFail = evaluateDirectionGates(primaryDir, gateParams, scanStats, timeFilterConfig);
 
         if (!primaryFail) {
           direction = primaryDir;
@@ -3994,7 +4013,8 @@ async function scanMarket() {
           const secondaryFail = evaluateDirectionGates(
             primaryDir === 'LONG' ? 'SHORT' : 'LONG', 
             gateParams,
-            scanStats
+            scanStats,
+            timeFilterConfig
           );
           if (!secondaryFail) {
             direction = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
@@ -4468,7 +4488,7 @@ async function scanMarket() {
     }
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
-    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} preRiskBlocked=${scanStats.preRiskBlocked} preRiskReasons=${JSON.stringify(scanStats.preRiskReasons)} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
+    logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} timeThrottled=${scanStats.timeThrottled || 0} preRiskBlocked=${scanStats.preRiskBlocked} preRiskReasons=${JSON.stringify(scanStats.preRiskReasons)} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} lowConfluenceScore=${scanStats.lowConfluenceScore || 0} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
     // FIX (2026-08-29): postGatePassed>0 aber signals==0 über mehrere Tage
     // gemeldet - die Zähler für alles zwischen Gate-Pass und Signalversand
     // wurden zwar schon mitgezählt, tauchten aber nie in diesem Log auf.
