@@ -7,7 +7,7 @@
     "node": "22.x"
   },
   "scripts": {
-    "start": "node trading-bot-v25.js",
+    "start": "node trading-bot-v25-marketdata-fixed.mjs",
     "test": "node scripts/run-all-tests.js",
     "check": "node scripts/production-readiness.js"
   },
