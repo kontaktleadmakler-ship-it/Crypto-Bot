@@ -104,10 +104,17 @@ class MetaSupervisorAgent {
     const anomaly = results.anomaly?.score ?? 0;
     const strategy = results.strategy?.score ?? 0;
     const regime = clamp(results.regime?.confidence ?? results.regime?.score ?? 0.5);
-    const hardBlock = results.riskSupervisor?.hardBlock === true || results.liquidity?.decision === 'BLOCK' || results.strategy?.health === 'DISABLED';
+    const hardBlock = results.riskSupervisor?.hardBlock === true;
     const confidence = clamp(risk * 0.35 + liquidity * 0.15 + (1 - anomaly) * 0.15 + strategy * 0.25 + regime * 0.10);
-    const decision = hardBlock ? 'NO_TRADE' : confidence >= 0.70 ? 'PAPER_OK' : confidence >= 0.50 ? 'REDUCE_RISK' : 'NO_TRADE';
-    return { agent: 'meta-supervisor', decision, confidence, hardBlock };
+    // Supervisory confidence is advisory. Only explicit hard-safety conditions
+    // are allowed to veto the pipeline here. Strategy health/liquidity quality
+    // can reduce confidence, but the authoritative RiskEngine performs the
+    // final safety decision later with the actual proposed position.
+    const decision = hardBlock ? 'NO_TRADE' : confidence >= 0.70 ? 'PAPER_OK' : confidence >= 0.50 ? 'REDUCE_RISK' : 'MONITOR';
+    const advisoryBlocks = [];
+    if (results.liquidity?.decision === 'BLOCK') advisoryBlocks.push('LIQUIDITY_DEGRADED');
+    if (results.strategy?.health === 'DISABLED') advisoryBlocks.push('STRATEGY_HEALTH_DISABLED');
+    return { agent: 'meta-supervisor', decision, confidence, hardBlock, advisoryOnly: !hardBlock, advisoryBlocks };
   }
 }
 
