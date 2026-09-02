@@ -11,7 +11,7 @@ assert.equal(pkg.version, '25.0.16');
 assert.equal((runtime.match(/if \(isKucoinCircuitOpen\(\)\)/g) || []).length, 2);
 assert.match(runtime, /async function getMarketDataBundle\(symbol\) \{/);
 assert.doesNotMatch(runtime, /async function getMarketDataBundle\(symbol\) \{\s*if \(isKucoinCircuitOpen\(\)\) \{\s*if \(isKucoinCircuitOpen\(\)\)/);
-assert.match(runtime, /MARKET_DATA_CONCURRENCY: parseInt\(process\.env\.MARKET_DATA_CONCURRENCY, 10\) \|\| 8/);
+assert.match(runtime, /MARKET_DATA_CONCURRENCY: parseInt\(process\.env\.MARKET_DATA_CONCURRENCY, 10\) \|\| 3/);
 assert.match(runtime, /MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt\(process\.env\.MARKET_DATA_QUEUE_TIMEOUT_MS, 10\) \|\| 0/);
 assert.match(runtime, /ENABLE_PRELOADING: process\.env\.ENABLE_PRELOADING === 'true'/);
 assert.match(runtime, /err\.code = 'ASYNC_POOL_ITEM_TIMEOUT'/);
