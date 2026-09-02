@@ -5151,17 +5151,41 @@ const dashboardDecisionReplay = [];
 // scanner. No second synthetic market scanner is used for the live matrix.
 // ---------------------------------------------------------------------------
 const dashboardLiveCoinSnapshots = new Map();
+// Canonical production agent snapshots for the dashboard. The dashboard must
+// render the decision graph from the scanner's already-computed agent result,
+// never by launching a second ML/DQN/Risk evaluation.
+const dashboardLiveAgentSnapshots = new Map();
+const dashboardLiveDecisionSnapshots = new Map();
 let dashboardLastLiveScanCounter = 0;
 jarvisEventBus.on('event', (event) => {
-  if (!event || event.type !== 'SCAN:COIN' || !event.symbol) return;
-  const payload = event.payload || {};
-  dashboardLiveCoinSnapshots.set(String(event.symbol).toUpperCase(), {
-    ...payload,
-    symbol: String(event.symbol).toUpperCase(),
-    eventTs: Number(event.ts || Date.now()),
-    source: 'production-scanner'
-  });
-  dashboardLastLiveScanCounter = Math.max(dashboardLastLiveScanCounter, Number(payload.scanCounter || 0));
+  if (!event || !event.type) return;
+  const symbol = String(event.symbol || event.payload?.symbol || '').toUpperCase();
+  if (event.type === 'SCAN:COIN' && symbol) {
+    const payload = event.payload || {};
+    dashboardLiveCoinSnapshots.set(symbol, {
+      ...payload,
+      symbol,
+      eventTs: Number(event.ts || Date.now()),
+      source: 'production-scanner'
+    });
+    dashboardLastLiveScanCounter = Math.max(dashboardLastLiveScanCounter, Number(payload.scanCounter || 0));
+  }
+  if (event.type === 'AGENTS:EVALUATED' && symbol) {
+    dashboardLiveAgentSnapshots.set(symbol, {
+      ...(event.payload || {}),
+      symbol,
+      eventTs: Number(event.ts || Date.now()),
+      source: 'production-scanner'
+    });
+  }
+  if (event.type === 'DECISION:REPLAY' && symbol) {
+    dashboardLiveDecisionSnapshots.set(symbol, {
+      ...(event.payload || {}),
+      symbol,
+      eventTs: Number(event.ts || Date.now()),
+      source: 'production-scanner'
+    });
+  }
 });
 
 function dashboardRecordProductionScanCoin(snapshot, severity = 'INFO') {
@@ -5752,19 +5776,81 @@ async function getDashboardAutonomousSupervisor(symbol) {
   return result;
 }
 
+function dashboardCanonicalState(symbol = null) {
+  const key = symbol ? String(symbol).toUpperCase() : null;
+  const marketRows = dashboardLiveScannerRows();
+  const market = key ? (dashboardLiveCoinSnapshots.get(key) || null) : (marketRows[0] || null);
+  const agent = key ? (dashboardLiveAgentSnapshots.get(key) || null) : (market ? dashboardLiveAgentSnapshots.get(market.symbol) : null);
+  const decision = key ? (dashboardLiveDecisionSnapshots.get(key) || null) : (agent ? dashboardLiveDecisionSnapshots.get(agent.symbol) : null);
+  const ageMs = market ? Math.max(0, Date.now() - Number(market.eventTs || 0)) : null;
+  return {
+    ok: Boolean(market || agent || decision),
+    source: 'PRODUCTION_SCANNER_SNAPSHOT',
+    timestamp: Date.now(),
+    symbol: key || market?.symbol || null,
+    market,
+    agents: agent,
+    decision,
+    scan: { ...dashboardScanState, universe: dashboardScanUniverse, lastLiveScanCounter: dashboardLastLiveScanCounter },
+    connection: { connected: Boolean(market && ageMs !== null && ageMs <= 30000), ageMs },
+    nodes: Array.isArray(agent?.nodes) ? agent.nodes : [],
+    dqn: agent?.dqn || null,
+    confidence: Number(agent?.confidence || decision?.confidence || 0),
+    finalAction: agent?.finalAction || decision?.action || 'WAITING'
+  };
+}
+
+app.get('/api/dashboard/state', (req, res) => {
+  const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : null;
+  const state = dashboardCanonicalState(symbol);
+  // Unified read-only dashboard projection. All expensive market/ML/RL work is
+  // performed by the production scanner; the dashboard only consumes snapshots
+  // and recent events. This also makes the Brain usable immediately after a
+  // scan because it receives agent nodes, decision replay and connection data
+  // from the same response.
+  const events = jarvisEventBus.recent({ limit: 120, since: 0, symbol, types: null });
+  const agentEvents = events.filter(e => e.type === 'AGENTS:EVALUATED').slice(-30).reverse();
+  const decisionEvents = events.filter(e => /DECISION|SIGNAL:GENERATED|RISK:EVALUATED|SUPERVISOR:EVALUATED/.test(String(e.type))).slice(-60).reverse();
+  const latestAgentEvent = agentEvents[0] || null;
+  const latestDecisionEvent = decisionEvents[0] || null;
+  if (!state.agents && latestAgentEvent) {
+    state.agents = { ...(latestAgentEvent.payload || {}), symbol: latestAgentEvent.symbol || symbol, eventTs: latestAgentEvent.ts, source: 'PRODUCTION_SCANNER_EVENT_BUS' };
+    state.nodes = Array.isArray(state.agents.nodes) ? state.agents.nodes : [];
+    state.dqn = state.agents.dqn || null;
+    state.confidence = Number(state.agents.confidence || 0);
+    state.finalAction = state.agents.finalAction || state.finalAction;
+  }
+  state.events = events;
+  state.agentEvents = agentEvents;
+  state.decisionEvents = decisionEvents;
+  state.latestAgentEvent = latestAgentEvent;
+  state.latestDecisionEvent = latestDecisionEvent;
+  state.stats = {
+    nodes: Array.isArray(state.nodes) ? state.nodes.length : 0,
+    connections: Array.isArray(state.nodes) ? Math.max(0, state.nodes.length - 1) + Math.max(0, state.nodes.length - 2) : 0,
+    decisions: decisionEvents.length,
+    agentEvaluations: agentEvents.length,
+    liveCoins: dashboardLiveCoinSnapshots.size
+  };
+  res.setHeader('Cache-Control', 'no-store');
+  if (!state.ok && !state.agents && !latestAgentEvent) return res.status(503).json({ ...state, error: 'DASHBOARD_STATE_UNAVAILABLE' });
+  state.ok = true;
+  res.json(state);
+});
+
 app.get('/api/dashboard/agents', async (req, res) => {
   try {
-    const symbol = String(req.query.symbol || 'BTC-USDT').toUpperCase();
+    const symbol = String(req.query.symbol || dashboardScanUniverse[0] || 'BTC-USDT').toUpperCase();
     if (!/^[A-Z0-9]+-USDT$/.test(symbol)) return res.status(400).json({ error: 'INVALID_SYMBOL' });
-    const data = await getDashboardAgentNetwork(symbol);
+    const snap = dashboardCanonicalState(symbol);
+    if (!snap.agents) return res.status(503).json({ error: 'AGENT_SNAPSHOT_UNAVAILABLE', source: 'PRODUCTION_SCANNER_SNAPSHOT' });
     res.setHeader('Cache-Control', 'no-store');
-    res.json(data);
+    res.json({ ...snap.agents, canonical: true, source: 'PRODUCTION_SCANNER_SNAPSHOT', market: snap.market, decision: snap.decision });
   } catch (e) {
     logger.warn(`[Dashboard Agents] ${e.message}`);
     res.status(503).json({ error: e.message });
   }
 });
-
 app.get('/api/dashboard/supervisor', async (req, res) => {
   try {
     const symbol = String(req.query.symbol || dashboardScanUniverse[0] || 'BTC-USDT').toUpperCase();
@@ -5829,27 +5915,26 @@ app.get('/api/dashboard/scan', async (req, res) => {
 app.get('/api/dashboard/intelligence', async (req, res) => {
   try {
     const symbol = String(req.query.symbol || dashboardScanUniverse[0] || 'BTC-USDT').toUpperCase();
-    const [market, agents] = await Promise.all([getDashboardData(symbol), getDashboardAgentNetwork(symbol)]);
+    const snap = dashboardCanonicalState(symbol);
+    if (!snap.ok) return res.status(503).json({ error: 'DASHBOARD_STATE_UNAVAILABLE', source: 'PRODUCTION_SCANNER_SNAPSHOT' });
     const mlStats = mlModel.getStats();
     const dqnStats = dqnAgent.getStats();
     const drift = modelDriftMonitor.status();
-    const readiness = dashboardReadinessSnapshot();
     const performance = dashboardAgentPerformance();
-    const replay = dashboardDecisionReplay.slice(0, 80);
+    const replay = dashboardDecisionReplay.filter(x => String(x.symbol).toUpperCase() === symbol).slice(0, 80);
+    const a = snap.agents || {};
     const current = {
-      symbol, timestamp: Date.now(), marketPhase: dashboardRegimeSnapshot(),
-      regime: dashboardRegimeSnapshot(),
-      macro: { value: market.sentiment?.value ?? null, classification: market.sentiment?.classification ?? null, bias: market.sentiment?.bias ?? null, allowed: market.sentiment?.allowed ?? null },
-      confidence: agents.confidence, consensus: agents.consensus, vetoes: agents.vetoes, finalAction: agents.finalAction,
+      symbol, timestamp: snap.timestamp, marketPhase: snap.market?.marketPhase || currentMarketPhase,
+      regime: snap.market?.marketPhase || currentMarketPhase,
+      macro: { value: snap.market?.sentimentValue ?? null, classification: snap.market?.sentimentClass ?? null, bias: snap.market?.sentimentBias ?? null },
+      confidence: Number(a.confidence || snap.confidence || 0), consensus: Number(a.consensus || 0), vetoes: a.vetoes || [], finalAction: a.finalAction || snap.finalAction,
       activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, equity: config.CAPITAL_USD + dailyNetPnL,
-      risk: market.risk, agents: agents.nodes,
-      dqn: { ...dqnStats, action: agents.dqn?.action, qValues: agents.dqn?.qValues },
-      ml: { validationAccuracy: mlStats.validationAccuracy, stats: mlStats },
-      drift,
-      execution: readiness.execution
+      risk: snap.market?.risk || null, agents: a.nodes || [], dqn: { ...(a.dqn || {}), ...dqnStats },
+      ml: { validationAccuracy: mlStats.validationAccuracy, stats: mlStats }, drift,
+      execution: null, canonical: true, source: 'PRODUCTION_SCANNER_SNAPSHOT'
     };
     res.setHeader('Cache-Control','no-store');
-    res.json({ timestamp: Date.now(), current, replay, performance, readiness, scanner: { ...dashboardScanState, universe: dashboardScanUniverse, intervalMs: Number(config.SCAN_INTERVAL_MS || config.SCAN_INTERVAL || 0) || null }, regime: dashboardRegimeSnapshot() });
+    res.json({ timestamp: snap.timestamp, current, replay, performance, scanner: snap.scan, regime: current.regime, source: 'PRODUCTION_SCANNER_SNAPSHOT' });
   } catch (e) {
     logger.warn(`[Dashboard Intelligence] ${e.message}`);
     res.status(503).json({ error: e.message });
