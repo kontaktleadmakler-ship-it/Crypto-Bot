@@ -792,7 +792,10 @@ const config = {
   // validated in trading-bot-v25-marketdata-fixed.mjs. Operators can still
   // override via Render environment variables.
   SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 3,
-  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 2,
+  // Keep scan concurrency separate from the exchange HTTP pool.
+  MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 3,
+  FUTURES_API_CONCURRENCY: parseInt(process.env.FUTURES_API_CONCURRENCY, 10) || Math.max(8, (parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 3) * 2),
+  FUTURES_API_QUEUE_TIMEOUT_MS: parseInt(process.env.FUTURES_API_QUEUE_TIMEOUT_MS, 10) || 8000,
   MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 0,
   SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 75000,
   SCAN_WATCHDOG_MS: Math.max(180000, Math.min(300000, parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 240000)),
@@ -1308,51 +1311,52 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
 const futuresApiSemaphore = {
   active: 0,
   queue: [],
-  async acquire(timeoutMs = 30000) {
-    const limit = Math.max(1, Math.min(10, Number(config.MARKET_DATA_CONCURRENCY) || 3));
-    if (this.active < limit) {
-      this.active++;
-      return;
-    }
-    let timer;
-    let queueEntry;
-    const waitPromise = new Promise((resolve, reject) => {
+  sequence: 0,
+  async acquire(timeoutMs = config.FUTURES_API_QUEUE_TIMEOUT_MS) {
+    const limit = Math.max(2, Math.min(12, Number(config.FUTURES_API_CONCURRENCY) || 8));
+    if (this.active < limit) { this.active++; return; }
+    let timer = null;
+    let settled = false;
+    let grant;
+    const waiter = new Promise(resolve => { grant = resolve; });
+    const entry = { id: ++this.sequence, grant };
+    this.queue.push(entry);
+    const waitMs = Math.max(250, Number(timeoutMs) || 8000);
+    const timeout = new Promise(resolve => {
       timer = setTimeout(() => {
-        reject(new Error('Semaphore acquire timeout'));
-      }, timeoutMs);
-      queueEntry = () => {
-        clearTimeout(timer);
-        resolve();
-      };
-      this.queue.push(queueEntry);
+        if (settled) return;
+        settled = true;
+        const idx = this.queue.indexOf(entry);
+        if (idx !== -1) this.queue.splice(idx, 1);
+        resolve(false);
+      }, waitMs);
     });
-    try {
-      await waitPromise;
-      this.active++;
-    } catch (e) {
-      // The Promise resolver is scoped to the Promise callback and is not
-      // available here. Remove the actual queued waiter instead of referencing
-      // the out-of-scope `resolve` symbol (ReferenceError).
-      const idx = this.queue.indexOf(queueEntry);
-      if (idx !== -1) this.queue.splice(idx, 1);
-      throw e;
+    const granted = await Promise.race([waiter.then(() => true), timeout]);
+    if (timer) clearTimeout(timer);
+    if (!granted) {
+      const err = new Error(`Semaphore acquire timeout after ${waitMs}ms`);
+      err.code = 'SEMAPHORE_ACQUIRE_TIMEOUT';
+      throw err;
     }
+    settled = true;
+    this.active++;
   },
   release() {
-    this.active--;
-    if (this.queue.length > 0) this.queue.shift()();
+    this.active = Math.max(0, this.active - 1);
+    const next = this.queue.shift();
+    if (next) next.grant();
+  },
+  snapshot() {
+    return { active: this.active, queued: this.queue.length, limit: Math.max(2, Math.min(12, Number(config.FUTURES_API_CONCURRENCY) || 8)) };
   }
 };
 
 async function futuresApiGetWithRetry(url, options = {}, retries = 3, backoffMs = 1000) {
-  // Semaphore mit Timeout (max. 15s warten)
-  await futuresApiSemaphore.acquire(15000);
-  try {
-    return await axiosGetWithRetry(url, options, retries, backoffMs);
-  } finally {
-    futuresApiSemaphore.release();
-  }
+  await futuresApiSemaphore.acquire();
+  try { return await axiosGetWithRetry(url, options, retries, backoffMs); }
+  finally { futuresApiSemaphore.release(); }
 }
+
 
 async function processDbBulkQueue() {
   if (dbBulkQueue.length === 0 || !isDbConnected) return;
@@ -5630,7 +5634,8 @@ app.get('/', (req, res) => {
 // every 2.5s and receives live/closed-candle market data from KuCoin Futures.
 // ---------------------------------------------------------------------------
 const dashboardCache = new Map();
-const DASHBOARD_CACHE_MS = 1200;
+const DASHBOARD_CACHE_MS = 3000;
+const dashboardDataInflight = new Map();
 let dashboardEventCounter = 0;
 let dashboardScanUniverse = [];
 let dashboardScanState = { scanning: false, startedAt: null, finishedAt: null, counter: 0, checked: 0, signals: 0 };
@@ -6020,6 +6025,11 @@ async function getDashboardData(symbol) {
   const cached = dashboardCache.get(symbol);
   if (cached && Date.now() - cached.ts < DASHBOARD_CACHE_MS) return cached.data;
 
+  const inflightKey = String(symbol || '').toUpperCase();
+  const existingInflight = dashboardDataInflight.get(inflightKey);
+  if (existingInflight) return existingInflight;
+
+  const task = (async () => {
   const [marketDataResult, tickerResult, macro] = await Promise.allSettled([
     getMarketDataBundle(symbol),
     fetchKucoinTickerPrice(symbol),
@@ -6120,6 +6130,10 @@ async function getDashboardData(symbol) {
   };
   dashboardCache.set(symbol, { ts: Date.now(), data });
   return data;
+  })();
+  dashboardDataInflight.set(inflightKey, task);
+  try { return await task; }
+  finally { dashboardDataInflight.delete(inflightKey); }
 }
 
 app.get('/dashboard', (req, res) => {
