@@ -16,6 +16,7 @@ const require = createRequire(import.meta.url);
 const { JarvisEventBus } = require('./jarvis-event-bus.js');
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const { createPipeline, transition: pipelineTransition, reject: pipelineReject, withTimeout: pipelineWithTimeout } = require('./signal-pipeline-controller');
 
 /**
  * ============================================================================
@@ -3571,7 +3572,8 @@ function createEmptyScanStats() {
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
     timeBlocked: 0, timeThrottled: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0,
     marketDataTimeouts: 0, marketDataQueueTimeouts: 0, marketDataFailures: 0, circuitBreakerSkips: 0,
-    mlGateSkippedLowQuality: 0
+    mlGateSkippedLowQuality: 0,
+    pipelineRejected: 0, pipelineStages: {}, pipelineTimeouts: 0
   };
 }
 
@@ -3600,6 +3602,20 @@ const newsEvents = loadNewsEvents();
 
 function isNewsBlackout(now = Date.now()) {
   return newsEvents.some(t => now >= t - NEWS_BLACKOUT_BEFORE_MS && now <= t + NEWS_BLACKOUT_AFTER_MS);
+}
+
+function recordSignalPipelineStage(pipeline, symbol, stage, patch = {}, reason = null) {
+  if (reason) pipelineReject(pipeline, reason, patch);
+  else pipelineTransition(pipeline, stage, patch);
+  const payload = { pipelineStage: pipeline.stage, pipelineStatus: pipeline.status, pipelineReason: pipeline.reason, pipelineUpdatedAt: pipeline.updatedAt, pipelineHistory: pipeline.history.slice(-12), ...patch };
+  dashboardPatchScanRecord(null, symbol, payload);
+  try { jarvisEventBus.emitEvent('SIGNAL:PIPELINE', { symbol: String(symbol).toUpperCase(), scanId: pipeline.scanId, signalId: pipeline.signalId, stage: pipeline.stage, status: pipeline.status, reason: pipeline.reason, ...patch }, { source: 'signal-pipeline', severity: reason ? 'WARN' : 'INFO', persist: false, persistReplay: true }); } catch (_) {}
+}
+
+function countPipelineRejection(scanStats, pipeline, reason = null) {
+  scanStats.pipelineRejected = (scanStats.pipelineRejected || 0) + 1;
+  const key = String(reason || pipeline.reason || pipeline.stage || 'UNKNOWN');
+  scanStats.pipelineStages[key] = (scanStats.pipelineStages[key] || 0) + 1;
 }
 
 async function scanMarket() {
@@ -3837,23 +3853,23 @@ async function scanMarket() {
 
     await asyncPool(config.SCAN_CONCURRENCY, dynamicWatchlist, async (symbol) => {
       scanStats.total++;
+      const pipeline = createPipeline(symbol, scanCounter + 1);
+      recordSignalPipelineStage(pipeline, symbol, 'CANDIDATE');
       dashboardScanState.checked = scanStats.total;
 
-      if (activeTrades.has(symbol)) { 
-        scanStats.skippedActiveTrade++; 
-        return; 
+      if (activeTrades.has(symbol)) {
+        scanStats.skippedActiveTrade++; countPipelineRejection(scanStats, pipeline, 'ACTIVE_TRADE'); recordSignalPipelineStage(pipeline, symbol, 'REJECTED', {}, 'ACTIVE_TRADE'); return;
       }
 
       if (await isCoinDynamicallyBlacklisted(symbol).catch(() => false)) {
-        scanStats.skippedDynamicBlacklist++;
-        return;
+        scanStats.skippedDynamicBlacklist++; countPipelineRejection(scanStats, pipeline, 'DYNAMIC_BLACKLIST'); recordSignalPipelineStage(pipeline, symbol, 'REJECTED', {}, 'DYNAMIC_BLACKLIST'); return;
       }
 
-      if (signalsSent >= config.MAX_SIGNALS_PER_SCAN) { 
-        scanStats.skippedMaxSignals++; 
-        return; 
+      if (signalsSent >= config.MAX_SIGNALS_PER_SCAN) {
+        scanStats.skippedMaxSignals++; countPipelineRejection(scanStats, pipeline, 'MAX_SIGNALS_PER_SCAN'); recordSignalPipelineStage(pipeline, symbol, 'REJECTED', {}, 'MAX_SIGNALS_PER_SCAN'); return;
       }
 
+      recordSignalPipelineStage(pipeline, symbol, 'PRE_RISK');
       const preCheck = riskEngine.assess({
         equity: config.CAPITAL_USD + dailyNetPnL,
         peakEquity: peakCapital,
@@ -3870,6 +3886,8 @@ async function scanMarket() {
         if (Object.prototype.hasOwnProperty.call(scanStats, reason)) {
           scanStats[reason]++;
         }
+        countPipelineRejection(scanStats, pipeline, reason);
+        recordSignalPipelineStage(pipeline, symbol, 'REJECTED', { riskState: preCheck.state }, reason);
         return;
       }
 
@@ -3893,6 +3911,7 @@ async function scanMarket() {
         }
 
         const { raw15m, raw1h, raw4h, futuresData, orderBookMetrics: rawOrderBookMetrics } = marketData;
+        recordSignalPipelineStage(pipeline, symbol, 'MARKET_DATA');
         let orderBookMetrics = rawOrderBookMetrics;
      if (!orderBookMetrics || !orderBookMetrics.valid) {
     logger.warn(`[MARKET-DATA] OrderBook metrics unavailable for ${symbol}, using defaults.`);
@@ -3987,9 +4006,9 @@ async function scanMarket() {
             ['risk-supervisor','RISK SUPERVISOR',ev.riskSupervisor.score,ev.riskSupervisor.decision,ev.riskSupervisor.hardBlock?'BLOCK':'PASS'],
             ['portfolio-allocation','PORTFOLIO',Math.min(1,Number(ev.portfolioAllocation.scale||0)),'ALLOCATE','PASS'],
             ['anomaly-detection','ANOMALY',1-Number(ev.anomaly.score||0),ev.anomaly.severity,ev.anomaly.severity==='HIGH'?'VETO':'PASS'],
-            ['liquidity','LIQUIDITY',ev.liquidity.score,ev.liquidity.decision,ev.liquidity.decision==='BLOCK'?'VETO':'PASS'],
+            ['liquidity','LIQUIDITY',ev.liquidity.score,ev.liquidity.decision,ev.liquidity.decision==='BLOCK'?'WARN':'PASS'],
             ['exit-evaluation','EXIT EVALUATOR',ev.exit.score,ev.exit.decision,'MONITOR'],
-            ['strategy-evaluation','STRATEGY',ev.strategy.score,ev.strategy.health,ev.strategy.health==='DISABLED'?'VETO':'PASS'],
+            ['strategy-evaluation','STRATEGY',ev.strategy.score,ev.strategy.health,ev.strategy.health==='DISABLED'?'WARN':'PASS'],
             ['meta-supervisor','META SUPERVISOR',ev.meta.confidence,ev.meta.decision,ev.meta.hardBlock?'VETO':'PASS']
           ].map(([id,label,score,decision,status])=>({id,label,score,decision,status}));
           const consensus = nodes.filter(n=>['PASS','MONITOR'].includes(String(n.status))).length;
@@ -4025,6 +4044,7 @@ async function scanMarket() {
           scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
         }
 
+        recordSignalPipelineStage(pipeline, symbol, direction !== null ? 'DIRECTION_GATE_PASSED' : 'REJECTED', { gateDirection: direction, gateReason: direction ? null : (primaryFail || 'NO_DIRECTION') }, direction ? null : (primaryFail || 'NO_DIRECTION'));
         if (direction !== null) scanStats.gatePassed++;
         else scanStats.gateRejected++;
 
@@ -4074,6 +4094,7 @@ async function scanMarket() {
         }, direction ? 'INFO' : 'WARN');
 
         if (direction !== null) {
+          recordSignalPipelineStage(pipeline, symbol, 'POST_GATE');
           scanStats.postGatePassed++;
           if (direction === 'LONG' && orderFlowEval.pressure === 'BEARISH_DOMINANT' && orderFlowEval.score < 35) {
             scanStats.orderFlowBlocked++;
@@ -4131,6 +4152,7 @@ async function scanMarket() {
             volatilityRatio: btcATR > 0 ? atr / btcATR : 1
           });
 
+          recordSignalPipelineStage(pipeline, symbol, 'ML_EVALUATING');
           const mlPrediction = predictSignalSuccess(mlFeatures);
           dashboardPatchScanRecord(scanRecordEvent, symbol, {
             mlProbability: Number(mlPrediction.probability),
@@ -4153,11 +4175,12 @@ async function scanMarket() {
           if (mlQualityUnreliable) {
             scanStats.mlGateSkippedLowQuality = (scanStats.mlGateSkippedLowQuality || 0) + 1;
           } else if (mlPrediction.trained && mlPrediction.probability < config.ML_MIN_PREDICTION_PROBABILITY) {
-            scanStats.mlBlocked++;
+            scanStats.mlBlocked++; countPipelineRejection(scanStats, pipeline, 'ML_PROBABILITY_BELOW_THRESHOLD');
             dashboardPatchScanRecord(scanRecordEvent, symbol, {
               finalDecision: 'REJECT',
               decisionReason: `ML_PROBABILITY_BELOW_THRESHOLD (${(mlPrediction.probability * 100).toFixed(1)}%)`
             });
+            recordSignalPipelineStage(pipeline, symbol, 'REJECTED', { mlProbability: Number(mlPrediction.probability) }, 'ML_PROBABILITY_BELOW_THRESHOLD');
             return;
           }
 
@@ -4166,7 +4189,8 @@ async function scanMarket() {
           // ==========================================
           safetyController.set('pause', isPaused, isPaused ? 'runtime-paused' : 'runtime-active');
           safetyController.set('kill-switch', Boolean(riskEngine.killSwitch), riskEngine.killSwitch ? 'risk-engine-kill-switch' : 'risk-engine-clear');
-          const agentEvaluation = agentSuite.evaluate({
+          recordSignalPipelineStage(pipeline, symbol, 'AGENTS_EVALUATING');
+          const agentEvaluation = await pipelineWithTimeout(() => agentSuite.evaluate({
             symbol, direction,
             spreadPct: orderBookMetrics.spreadPct,
             depthUSD: Number(orderBookMetrics.depthUSD || futuresData?.volume24h || 0),
@@ -4184,7 +4208,8 @@ async function scanMarket() {
             killSwitch: safetyController.isActive('kill-switch') || isPaused, circuitBreaker: Date.now() < kucoinCircuitOpenUntil,
             regime: { confidence: currentMarketPhase === 'RANGING' || currentMarketPhase === 'TRENDING' ? 0.75 : 0.5 },
             oosScore: Number(mlModel.getStats().validationAccuracy || 0), driftScore: Number(modelDriftMonitor.status().score || 0)
-          });
+          }), 3000, 'AGENT_SUITE_TIMEOUT');
+          recordSignalPipelineStage(pipeline, symbol, 'AGENTS_EVALUATED', { agentDecision: agentEvaluation.meta?.decision, agentConfidence: Number(agentEvaluation.meta?.confidence || 0), agentHardBlock: Boolean(agentEvaluation.meta?.hardBlock), advisoryBlocks: agentEvaluation.meta?.advisoryBlocks || [] });
           const agentCount = Object.keys(agentEvaluation).filter(k => k !== 'meta').length;
           dashboardPatchScanRecord(scanRecordEvent, symbol, {
             agentCount,
@@ -4194,18 +4219,20 @@ async function scanMarket() {
             riskState: agentEvaluation.meta?.hardBlock ? 'BLOCKED' : (agentEvaluation.meta?.decision || 'AVAILABLE')
           });
           if (agentEvaluation.meta.hardBlock) {
-            scanStats.agentBlocked = (scanStats.agentBlocked || 0) + 1;
+            scanStats.agentBlocked = (scanStats.agentBlocked || 0) + 1; countPipelineRejection(scanStats, pipeline, 'AGENT_HARD_BLOCK');
             logger.warn(`[AGENT-SUPERVISOR] Signal für ${symbol} (${direction}) blockiert: ${agentEvaluation.meta.decision}`);
             dashboardPatchScanRecord(scanRecordEvent, symbol, {
               finalDecision: 'REJECT',
               decisionReason: `AGENT_SUPERVISOR_BLOCK (${agentEvaluation.meta.decision})`
             });
+            recordSignalPipelineStage(pipeline, symbol, 'REJECTED', { agentDecision: agentEvaluation.meta.decision }, 'AGENT_HARD_BLOCK');
             return;
           }
 
           // ==========================================
           // 🧠 DQN AGENT VETO-GATE (AKTIVIERT)
           // ==========================================
+          recordSignalPipelineStage(pipeline, symbol, 'DQN_EVALUATING');
           if (config.DQN_ENABLED && dqnAgent.isInitialized) {
             const dqnState = buildDQNStateVector({
               adx, rsi, hurst, relativeVolume, signalScore, direction,
@@ -4229,12 +4256,13 @@ async function scanMarket() {
 
             // Wenn Action = 0 (Veto/Ablehnen) und außerhalb der Exploration (Epsilon)
             if (dqnAgent.shouldVetoCandidate(dqnAction, direction) && Math.random() >= dqnAgent.epsilon) {
-              scanStats.dqnBlocked++;
+              scanStats.dqnBlocked++; countPipelineRejection(scanStats, pipeline, 'DQN_VETO');
               logger.info(`[DQN-VETO] Trade für ${symbol} (${direction}) vom DQN-Agenten blockiert (${dqnAgent.actions[dqnAction] || dqnAction}).`);
               dashboardPatchScanRecord(scanRecordEvent, symbol, {
                 finalDecision: 'REJECT',
                 decisionReason: `DQN_VETO (${dqnMeta.actionName})`
               });
+              recordSignalPipelineStage(pipeline, symbol, 'REJECTED', { dqnAction: dqnMeta.actionName }, 'DQN_VETO');
               return;
             }
           }
@@ -4311,6 +4339,7 @@ async function scanMarket() {
             return;
           }
 
+          recordSignalPipelineStage(pipeline, symbol, 'FINAL_RISK');
           const weeklyPnL = await getPeriodNetPnL(7);
           const riskCheck = riskEngine.assess({
             equity: config.CAPITAL_USD + dailyNetPnL, peakEquity: peakCapital, dailyPnL: dailyNetPnL, weeklyPnL,
@@ -4319,13 +4348,18 @@ async function scanMarket() {
             marketDataAgeMs: Math.max(0, Date.now() - Number(orderBookMetrics.fetchedAt || Date.now()))
           });
           if (!riskCheck.allowed) {
-            scanStats.riskEngineBlocked = (scanStats.riskEngineBlocked || 0) + 1;
-            logger.warn(`[RISK-ENGINE] Signal blockiert: ${riskCheck.reason}`); return;
+            scanStats.riskEngineBlocked = (scanStats.riskEngineBlocked || 0) + 1; countPipelineRejection(scanStats, pipeline, String(riskCheck.reason || 'RISK_BLOCK'));
+            logger.warn(`[RISK-ENGINE] Signal blockiert: ${riskCheck.reason}`);
+            recordSignalPipelineStage(pipeline, symbol, 'REJECTED', { riskState: riskCheck.state }, String(riskCheck.reason || 'RISK_BLOCK'));
+            return;
           }
+          recordSignalPipelineStage(pipeline, symbol, 'APPROVED', { riskState: riskCheck.state });
 
           // A valid signal is a strategy + risk decision. Paper execution is
           // downstream simulation and must not erase a generated signal.
           const signalId = `${symbol}:${direction}:${Date.now()}:${scanCounter}`;
+          pipeline.signalId = signalId;
+          recordSignalPipelineStage(pipeline, symbol, 'SIGNAL_GENERATED', { signalId, signalScore: Number(signalScore || 0) });
           const safeSymbol = escapeHtml(symbol);
           const signalText =
             `🚀 <b>NEUES SIGNAL: ${safeSymbol} (${direction})</b> [Score: ${signalScore}/100]\n` +
@@ -4354,6 +4388,7 @@ async function scanMarket() {
 
           let paperOrder = null;
           if (config.PAPER_EXECUTION_ENABLED) {
+            recordSignalPipelineStage(pipeline, symbol, 'EXECUTION_SUBMITTING', { signalId });
             const signalId = `${symbol}:${direction}:${Date.now()}:${scanCounter}`;
             try {
               const executionResult = await executePaperExecutionThroughCore({
@@ -4381,14 +4416,16 @@ async function scanMarket() {
               });
               paperOrder = executionResult?.remote || null;
               if (executionResult?.state === ExecutionState.UNKNOWN) {
-                isPaused = true;
                 global.reconciliationHealthy = false;
+                recordSignalPipelineStage(pipeline, symbol, 'REJECTED', { executionState: 'UNKNOWN' }, 'EXECUTION_UNKNOWN_RECONCILIATION_REQUIRED');
                 throw new Error('EXECUTION_UNKNOWN_RECONCILIATION_REQUIRED');
               }
               if (!paperOrder || !['FILLED', 'PARTIALLY_FILLED'].includes(paperOrder.status) || paperOrder.filledQty <= 0) {
-                scanStats.paperExecutionRejected = (scanStats.paperExecutionRejected || 0) + 1;
+                scanStats.paperExecutionRejected = (scanStats.paperExecutionRejected || 0) + 1; countPipelineRejection(scanStats, pipeline, 'PAPER_EXECUTION_REJECTED');
+                recordSignalPipelineStage(pipeline, symbol, 'REJECTED', { executionStatus: paperOrder?.status || 'NO_FILL' }, 'PAPER_EXECUTION_REJECTED');
                 return;
               }
+              recordSignalPipelineStage(pipeline, symbol, 'EXECUTED', { executionStatus: paperOrder.status, orderId: paperOrder.orderId || null });
               // Use the actual deterministic simulated fill for all downstream risk/TP math.
               entryPrice = paperOrder.avgFillPrice;
               if (paperOrder.status === 'PARTIALLY_FILLED') {
@@ -4401,6 +4438,7 @@ async function scanMarket() {
               }
             } catch (e) {
               scanStats.paperExecutionRejected = (scanStats.paperExecutionRejected || 0) + 1;
+              if (pipeline.stage !== 'REJECTED') { countPipelineRejection(scanStats, pipeline, e.code || 'PAPER_EXECUTION_ERROR'); recordSignalPipelineStage(pipeline, symbol, 'REJECTED', {}, e.code || 'PAPER_EXECUTION_ERROR'); }
               logger.warn(`[PAPER EXECUTION] ${symbol} blockiert: ${e.message}`);
               return;
             }
@@ -4408,6 +4446,7 @@ async function scanMarket() {
 
           const dynamicLeverage = calculateDynamicLeverage(atr, currentPrice, config.LEVERAGE);
 
+          recordSignalPipelineStage(pipeline, symbol, 'TRADE_PERSISTING');
           await upsertTrade(symbol, {
             symbol, direction, entry: entryPrice, stopLoss, tp1, tp2,
             signalId: paperOrder?.signalId || signalId,
@@ -4475,6 +4514,8 @@ async function scanMarket() {
         }
       } catch (e) {
         scanStats.runtimeErrors++;
+        if (e?.code === 'AGENT_SUITE_TIMEOUT' || e?.code === 'ASYNC_POOL_ITEM_TIMEOUT') scanStats.pipelineTimeouts = (scanStats.pipelineTimeouts || 0) + 1;
+        if (pipeline.stage !== 'REJECTED' && pipeline.stage !== 'EXECUTED') { countPipelineRejection(scanStats, pipeline, e.code || 'RUNTIME_ERROR'); recordSignalPipelineStage(pipeline, symbol, 'ERROR', {}, e.code || 'RUNTIME_ERROR'); }
         logger.error(`[SCAN ERROR] ${symbol}: ${e.message}`);
       }
     });
@@ -4493,6 +4534,7 @@ async function scanMarket() {
     // gemeldet - die Zähler für alles zwischen Gate-Pass und Signalversand
     // wurden zwar schon mitgezählt, tauchten aber nie in diesem Log auf.
     // Ergänzt, damit sichtbar ist, WELCHER Block die Kandidaten schluckt.
+    logger.info(`[SCAN-DIAGNOSTICS-PIPELINE] rejected=${scanStats.pipelineRejected || 0} timeouts=${scanStats.pipelineTimeouts || 0} stages=${JSON.stringify(scanStats.pipelineStages || {})}`);
     logger.info(`[SCAN-DIAGNOSTICS-POSTGATE] orderFlowBlocked=${scanStats.orderFlowBlocked} fundingBlocked=${scanStats.fundingBlocked} cooldownActive=${scanStats.cooldownActive} correlationBlocked=${scanStats.correlationBlocked} orderBookBlocked=${scanStats.orderBookBlocked} mlBlocked=${scanStats.mlBlocked} mlGateSkippedLowQuality=${scanStats.mlGateSkippedLowQuality || 0} agentBlocked=${scanStats.agentBlocked || 0} dqnBlocked=${scanStats.dqnBlocked} signalHistoryBlocked=${scanStats.signalHistoryBlocked} positionTooSmallForLot=${scanStats.positionTooSmallForLot} reconciliationBlocked=${scanStats.reconciliationBlocked || 0} riskEngineBlocked=${scanStats.riskEngineBlocked || 0}`);
 
     if (marketPhaseLogsCollection && isDbConnected) {
