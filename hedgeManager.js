@@ -1,56 +1,35 @@
 /**
- * Hedge Manager Modul für Risikosteuerung
+ * Hedge Manager Modul für Risikosteuerung.
+ * Tracker-safe: evaluateHedgeNeed is pure/read-only and never submits orders.
  */
 'use strict';
 
 class HedgeManager {
-    constructor(options = {}) {
-        this.logger = options.logger || console;
-        this.thresholdDropPct = Number.isFinite(options.thresholdDropPct) ? options.thresholdDropPct : -2.5;
-        this.referencePrice = null;
-    }
-
     calculateHedge(signal) {
-        if (!signal || !signal.price) {
-            return { action: 'NONE', ratio: 0.0 };
-        }
-        return {
-            action: signal.type === 'SELL_SIGNAL' ? 'INCREASE_HEDGE' : 'MAINTAIN',
-            ratio: 0.25
-        };
+        if (!signal || !signal.price) return { action: 'NONE', ratio: 0.0 };
+        return { action: signal.type === 'SELL_SIGNAL' ? 'INCREASE_HEDGE' : 'MAINTAIN', ratio: 0.25 };
     }
 
-    // Compatibility API used by the active-trade tracker.
-    // This method is intentionally pure/read-only: it does not place orders,
-    // acquire runtime locks, or call market-data APIs.
-    async evaluateHedgeNeed(activeTrades, btcMarkPrice) {
-        const price = Number(btcMarkPrice);
-        if (!Number.isFinite(price) || price <= 0) {
-            return { shouldHedge: false, dropPct: 0, reason: 'INVALID_BTC_PRICE' };
+    evaluateHedgeNeed(activeTrades, btcMarkPrice, thresholdPct = -2.5) {
+        const btc = Number(btcMarkPrice);
+        if (!Number.isFinite(btc) || btc <= 0 || !activeTrades || typeof activeTrades.values !== 'function') {
+            return { shouldHedge:false, dropPct:0, reason:'INSUFFICIENT_DATA' };
         }
-
-        if (!Number.isFinite(this.referencePrice) || this.referencePrice <= 0) {
-            this.referencePrice = price;
-            return { shouldHedge: false, dropPct: 0, reason: 'REFERENCE_INITIALIZED' };
+        let longExposure = 0;
+        for (const trade of activeTrades.values()) {
+            if (String(trade.direction || '').toUpperCase() === 'LONG') longExposure += Math.abs(Number(trade.notionalUSD || 0));
         }
+        // Without a prior BTC reference this method must remain neutral rather
+        // than inventing a price move. The runtime may supply btcReferencePrice.
+        const ref = Number(this.btcReferencePrice || btc);
+        const dropPct = ref > 0 ? (btc / ref - 1) * 100 : 0;
+        const shouldHedge = longExposure > 0 && dropPct <= thresholdPct;
+        return { shouldHedge, dropPct, longExposureUSD: longExposure, reason: shouldHedge ? 'BTC_DROP_THRESHOLD' : 'NO_HEDGE' };
+    }
 
-        const dropPct = ((price - this.referencePrice) / this.referencePrice) * 100;
-        // Track the latest/high-water reference so normal upward movement
-        // does not trigger a false hedge after a later decline.
-        if (price > this.referencePrice) this.referencePrice = price;
-
-        const hasLongExposure = activeTrades instanceof Map
-            ? [...activeTrades.values()].some(t => String(t?.direction || '').toUpperCase() === 'LONG')
-            : Array.isArray(activeTrades)
-                ? activeTrades.some(t => String(t?.direction || '').toUpperCase() === 'LONG')
-                : false;
-
-        return {
-            shouldHedge: hasLongExposure && dropPct <= this.thresholdDropPct,
-            dropPct,
-            thresholdDropPct: this.thresholdDropPct,
-            hasLongExposure
-        };
+    setReferencePrice(price) {
+        const p = Number(price);
+        if (Number.isFinite(p) && p > 0) this.btcReferencePrice = p;
     }
 }
 
