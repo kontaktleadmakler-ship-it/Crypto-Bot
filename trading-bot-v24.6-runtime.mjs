@@ -791,11 +791,11 @@ const config = {
   // watchlist (not just one symbol). Aligned with the values already
   // validated in trading-bot-v25-marketdata-fixed.mjs. Operators can still
   // override via Render environment variables.
-  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 3,
+  SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 2,
   // Keep scan concurrency separate from the exchange HTTP pool.
   MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 3,
   FUTURES_API_CONCURRENCY: parseInt(process.env.FUTURES_API_CONCURRENCY, 10) || Math.max(8, (parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 3) * 2),
-  FUTURES_API_QUEUE_TIMEOUT_MS: parseInt(process.env.FUTURES_API_QUEUE_TIMEOUT_MS, 10) || 8000,
+  FUTURES_API_QUEUE_TIMEOUT_MS: parseInt(process.env.FUTURES_API_QUEUE_TIMEOUT_MS, 10) || 5000,
   MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 0,
   SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 75000,
   SCAN_WATCHDOG_MS: Math.max(180000, Math.min(300000, parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 240000)),
@@ -1256,6 +1256,14 @@ function predictSignalSuccess(features) {
   return mlModel.predict(features);
 }
 
+async function predictSignalSuccessAsync(features) {
+  if (!config.ML_ENABLED || !isModelTrained) {
+    return { probability: 0.5, class: 'UNKNOWN', confidence: 0, trained: false };
+  }
+  if (typeof mlModel.predictAsync === 'function') return await mlModel.predictAsync(features);
+  return predictSignalSuccess(features);
+}
+
 async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 1000) {
   if (Date.now() < kucoinCircuitOpenUntil) {
     throw new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
@@ -1309,46 +1317,34 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
 }
 
 const futuresApiSemaphore = {
-  active: 0,
-  queue: [],
-  sequence: 0,
-  async acquire(timeoutMs = config.FUTURES_API_QUEUE_TIMEOUT_MS) {
-    const limit = Math.max(2, Math.min(12, Number(config.FUTURES_API_CONCURRENCY) || 8));
-    if (this.active < limit) { this.active++; return; }
-    let timer = null;
-    let settled = false;
-    let grant;
-    const waiter = new Promise(resolve => { grant = resolve; });
-    const entry = { id: ++this.sequence, grant };
-    this.queue.push(entry);
-    const waitMs = Math.max(250, Number(timeoutMs) || 8000);
-    const timeout = new Promise(resolve => {
-      timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
+  active: 0, queue: [], sequence: 0, timeoutCount: 0,
+  acquire(timeoutMs = config.FUTURES_API_QUEUE_TIMEOUT_MS, priority = 'normal') {
+    const limit = Math.max(2, Math.min(12, Number(config.FUTURES_API_CONCURRENCY) || 6));
+    if (this.active < limit) { this.active++; return Promise.resolve(); }
+    const waitMs = Math.max(250, Number(timeoutMs) || 5000);
+    return new Promise((resolve, reject) => {
+      const entry = { id: ++this.sequence, priority: priority === 'high' ? 0 : priority === 'low' ? 2 : 1, resolve, reject, timer: null };
+      entry.timer = setTimeout(() => {
         const idx = this.queue.indexOf(entry);
         if (idx !== -1) this.queue.splice(idx, 1);
-        resolve(false);
+        this.timeoutCount++;
+        const err = new Error(`Semaphore acquire timeout after ${waitMs}ms`);
+        err.code = 'SEMAPHORE_ACQUIRE_TIMEOUT';
+        reject(err);
       }, waitMs);
+      this.queue.push(entry);
+      this.queue.sort((a,b) => a.priority - b.priority || a.id - b.id);
     });
-    const granted = await Promise.race([waiter.then(() => true), timeout]);
-    if (timer) clearTimeout(timer);
-    if (!granted) {
-      const err = new Error(`Semaphore acquire timeout after ${waitMs}ms`);
-      err.code = 'SEMAPHORE_ACQUIRE_TIMEOUT';
-      throw err;
-    }
-    settled = true;
-    this.active++;
   },
   release() {
     this.active = Math.max(0, this.active - 1);
     const next = this.queue.shift();
-    if (next) next.grant();
+    if (!next) return;
+    clearTimeout(next.timer);
+    this.active++;
+    next.resolve();
   },
-  snapshot() {
-    return { active: this.active, queued: this.queue.length, limit: Math.max(2, Math.min(12, Number(config.FUTURES_API_CONCURRENCY) || 8)) };
-  }
+  snapshot() { return { active: this.active, queued: this.queue.length, timeoutCount: this.timeoutCount, limit: Math.max(2, Math.min(12, Number(config.FUTURES_API_CONCURRENCY) || 6)) }; }
 };
 
 async function futuresApiGetWithRetry(url, options = {}, retries = 3, backoffMs = 1000) {
@@ -2687,6 +2683,13 @@ async function fetchKucoinKlinesCached(symbol, timeframe, limit) {
   return candles;
 }
 
+function getStaleKlinesSnapshot(symbol, timeframe, maxAgeMs = 5 * 60 * 1000) {
+  const cached = klinesCache.get(`${symbol}_${timeframe}`);
+  if (!cached || cached.timeframe !== timeframe || !Array.isArray(cached.candles) || cached.candles.length < 20) return null;
+  const ageMs = Date.now() - Number(cached.timestamp || 0);
+  return ageMs <= maxAgeMs ? { candles: cached.candles, ageMs } : null;
+}
+
 // ==========================================
 // CENTRAL MARKET-DATA GATEWAY
 // ==========================================
@@ -2768,11 +2771,18 @@ async function getMarketDataBundle(symbol) {
         );
       };
 
-      const raw15m = await fetchKlines('15m', 100);
+      let raw15m = await fetchKlines('15m', 100);
+      let marketDataSource = 'live';
       if (!raw15m || raw15m.length < 20) {
-        const err = new Error(`${symbol}/15m market data unavailable`);
-        err.code = 'KLINES_UNAVAILABLE';
-        throw err;
+        const stale = getStaleKlinesSnapshot(symbol, '15m');
+        if (!stale) {
+          const err = new Error(`${symbol}/15m market data unavailable`);
+          err.code = 'KLINES_UNAVAILABLE';
+          throw err;
+        }
+        raw15m = stale.candles;
+        marketDataSource = 'stale-cache';
+        logger.warn(`[MARKET-DATA] ${symbol}: Live-15m unavailable; using ${Math.round(stale.ageMs / 1000)}s stale snapshot.`);
       }
 
       let raw1h = config.ENABLE_MULTI_TF_DERIVATION
@@ -2807,6 +2817,7 @@ async function getMarketDataBundle(symbol) {
       return {
         symbol,
         raw15m,
+        marketDataSource,
         raw1h,
         raw4h,
         futuresData: futuresResult.status === 'fulfilled' ? futuresResult.value : null,
@@ -4157,7 +4168,8 @@ async function scanMarket() {
           });
 
           recordSignalPipelineStage(pipeline, symbol, 'ML_EVALUATING');
-          const mlPrediction = predictSignalSuccess(mlFeatures);
+          await new Promise(resolve => setImmediate(resolve));
+          const mlPrediction = await predictSignalSuccessAsync(mlFeatures);
           dashboardPatchScanRecord(scanRecordEvent, symbol, {
             mlProbability: Number(mlPrediction.probability),
             mlTrained: Boolean(mlPrediction.trained)
@@ -5953,44 +5965,9 @@ function dashboardSma(values, period) {
 }
 
 async function getDashboardScanMatrix() {
-  const now = Date.now();
-  if (dashboardScanCache.data && now - dashboardScanCache.ts < 1800) return dashboardScanCache.data;
-  let universe = dashboardScanUniverse.length ? [...dashboardScanUniverse] : await getTopKucoinPairs(config.TOP_COIN_LIMIT);
-  universe = universe.filter(isFuturesContractTradable);
-  if (!universe.length) universe = ['BTC-USDT','ETH-USDT','SOL-USDT','XRP-USDT'];
-  const symbols = universe.slice(0, Math.max(6, Math.min(20, Number(config.TOP_COIN_LIMIT || 12))));
-  const rows = [];
-  await asyncPool(4, symbols, async (sym) => {
-    try {
-      const [ticker, candles] = await Promise.all([
-        fetchKucoinTickerPrice(sym),
-        fetchKucoinKlinesCached(sym, '15m', 60)
-      ]);
-      if (!Number.isFinite(Number(ticker)) || !candles?.length) return;
-      const closes = candles.map(c => Number(c.close));
-      const price = Number(ticker);
-      const previous = closes[Math.max(0, closes.length - 4)] || closes[0] || price;
-      const change = previous ? ((price - previous) / previous) * 100 : 0;
-      const rsi = calculateRSI(closes, 14);
-      const macd = calculateMACD(closes);
-      const ma20 = calculateEMA(closes, 20);
-      const ma50 = calculateEMA(closes, 50);
-      const volatility = dashboardVolatility(closes);
-      const tech = rsi >= 25 && rsi <= 75;
-      const trend = ma20 > ma50 ? 'BULL' : ma20 < ma50 ? 'BEAR' : 'FLAT';
-      const volume24h = candles.slice(-96).reduce((sum, c) => sum + Number(c.volume || 0) * Number(c.close || 0), 0);
-      rows.push({ symbol: sym, price, change, rsi, macd: Number(macd.histogram || 0), ma20, ma50, volatility, trend, tech, volume24h, timestamp: now });
-    } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
-  });
-  rows.sort((a,b) => symbols.indexOf(a.symbol) - symbols.indexOf(b.symbol));
-  const data = {
-    timestamp: now,
-    scan: { ...dashboardScanState, universe: symbols, isScanning: isScanning },
-    rows
-  };
-  dashboardScanCache.ts = now;
-  dashboardScanCache.data = data;
-  return data;
+  // Read-only dashboard projection. Never fetch KuCoin data here.
+  const rows = await dashboardLiveScannerRows();
+  return rows;
 }
 
 function dashboardSharpe(closes) {
