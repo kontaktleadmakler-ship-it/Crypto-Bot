@@ -653,8 +653,14 @@ const config = {
   SLIPPAGE_PERCENT: parseFloat(process.env.SLIPPAGE_PERCENT) || 0.05,
   FEE_PERCENT: parseFloat(process.env.FEE_PERCENT) || 0.1,
 
-  // Phase B1-B4: paper execution only. Live execution remains impossible.
-  PAPER_EXECUTION_ENABLED: process.env.PAPER_EXECUTION_ENABLED !== 'false',
+  // Phase B1-B4: paper execution only.
+  // EXECUTION_MODE=paper is the explicit operator mode. In paper mode the
+  // simulator MUST be enabled unless the operator explicitly disables it.
+  // Live execution remains impossible in this runtime.
+  EXECUTION_MODE: (process.env.EXECUTION_MODE || 'paper').toLowerCase(),
+  PAPER_EXECUTION_ENABLED: (process.env.EXECUTION_MODE || 'paper').toLowerCase() === 'paper'
+    ? process.env.PAPER_EXECUTION_ENABLED !== 'false'
+    : false,
   PAPER_EXECUTION_LATENCY_MS: parseFloat(process.env.PAPER_EXECUTION_LATENCY_MS) || 150,
   PAPER_SPREAD_PERCENT: parseFloat(process.env.PAPER_SPREAD_PERCENT) || 0,
   PAPER_SLIPPAGE_PERCENT: parseFloat(process.env.PAPER_SLIPPAGE_PERCENT) || (parseFloat(process.env.SLIPPAGE_PERCENT) || 0.05),
@@ -2185,7 +2191,7 @@ const exchangeAdapter = new KuCoinFuturesAdapter({
   config
 });
 
-logger.info(`🔌 Exchange Adapter: ${exchangeAdapter.name} | Execution: DISABLED | MarketData: ENABLED`);
+logger.info(`🔌 Exchange Adapter: ${exchangeAdapter.name} | LiveExecution: DISABLED | MarketData: ENABLED`);
 
 const executionSimulator = new ExecutionSimulator({ config, logger });
 const executionParity = new ExecutionParity({ config, simulator: executionSimulator });
@@ -2207,7 +2213,7 @@ let reconciliationEngine = new ReconciliationEngine({
   logger
 });
 
-logger.info('🧪 Phase-B Execution aktiv | PaperOnly + Idempotency + Reconciliation + Fee/Spread/Slippage/Latency');
+logger.info(`🧪 PAPER EXECUTION ${config.PAPER_EXECUTION_ENABLED ? 'ENABLED' : 'DISABLED'} | mode=${config.EXECUTION_MODE} | startingCapital=$${Number(config.CAPITAL_USD).toFixed(2)} | LiveExecution=DISABLED`);
 
 // ==========================================
 // 11. KUCOIN MARKET DATA
@@ -3312,7 +3318,7 @@ function createEmptyScanStats() {
     total: 0, signalsSent: 0, totalSignalScore: 0, avgSignalScore: 0,
     universeLoaded: 0, watchlistReturned: 0, tradableCandidates: 0, filteredNonTradable: 0,
     marketDataEvaluated: 0, gatePassed: 0, gateRejected: 0, postGatePassed: 0,
-    runtimeErrors: 0, paperExecutionRejected: 0,
+    runtimeErrors: 0, paperExecutionRejected: 0, paperOrdersFilled: 0,
     skippedActiveTrade: 0, skippedMaxSignals: 0, skippedDbDisconnected: 0,
     skippedMaxConcurrentTrades: 0, skippedDailyLossLimit: 0, skippedMaxSameDirection: 0,
     skippedExposureLimit: 0, skippedMaxDrawdown: 0, missingKlines: 0,
@@ -3923,6 +3929,20 @@ async function scanMarket() {
                 return;
               }
               // Use the actual deterministic simulated fill for all downstream risk/TP math.
+              scanStats.paperOrdersFilled = (scanStats.paperOrdersFilled || 0) + 1;
+              jarvisEventBus.emitEvent('PAPER:ORDER_FILLED', {
+                symbol,
+                direction,
+                orderId: paperOrder.orderId,
+                signalId: paperOrder.signalId,
+                status: paperOrder.status,
+                quantity: Number(paperOrder.filledQty || 0),
+                entryPrice: Number(paperOrder.avgFillPrice || 0),
+                notionalUSD: Number(paperOrder.notionalUSD || 0),
+                feeUSD: Number(paperOrder.feeUSD || 0),
+                timestamp: Date.now()
+              }, { source: 'paper-execution', persist: true, persistReplay: true, persistMinIntervalMs: 0 });
+              logger.info(`[PAPER ORDER FILLED] ${symbol} ${direction} qty=${Number(paperOrder.filledQty || 0)} price=${Number(paperOrder.avgFillPrice || 0).toFixed(8)} notional=$${Number(paperOrder.notionalUSD || 0).toFixed(2)}`);
               entryPrice = paperOrder.avgFillPrice;
               if (paperOrder.status === 'PARTIALLY_FILLED') {
                 const filledRatio = paperOrder.filledQty / Math.max(1e-12, sizing.positionSizeUnits);
@@ -5776,6 +5796,10 @@ async function getDashboardAutonomousSupervisor(symbol) {
   return result;
 }
 
+function marketRowsForDashboard() {
+  return dashboardLiveScannerRows();
+}
+
 function dashboardCanonicalState(symbol = null) {
   const key = symbol ? String(symbol).toUpperCase() : null;
   const marketRows = dashboardLiveScannerRows();
@@ -5789,6 +5813,7 @@ function dashboardCanonicalState(symbol = null) {
     timestamp: Date.now(),
     symbol: key || market?.symbol || null,
     market,
+    marketRows,
     agents: agent,
     decision,
     scan: { ...dashboardScanState, universe: dashboardScanUniverse, lastLiveScanCounter: dashboardLastLiveScanCounter },
@@ -5970,6 +5995,26 @@ async function getDashboardExecutionPortfolio(symbol) {
   const longNotional = positions.filter(p => p.direction === 'LONG').reduce((a,p) => a + Math.abs(Number(p.notionalUSD || 0)), 0);
   const shortNotional = positions.filter(p => p.direction === 'SHORT').reduce((a,p) => a + Math.abs(Number(p.notionalUSD || 0)), 0);
   const unrealizedPnL = positions.reduce((a,p) => a + Number(p.unrealizedPnL || 0), 0);
+  // Paper-trade history is the source of truth for realized P&L / win rate.
+  let closedTrades = [];
+  if (closedTradesCollection && isDbConnected) {
+    try {
+      closedTrades = await closedTradesCollection.find({
+        isPartial: { $ne: true },
+        closeTime: { $exists: true }
+      }).sort({ closeTime: -1 }).limit(500).toArray();
+    } catch (e) {
+      logger.warn(`[Dashboard Execution] closed trade history unavailable: ${e.message}`);
+    }
+  }
+  const realizedPnL = closedTrades.reduce((sum,t) => sum + Number(t.pnlUSD || 0), 0);
+  const wins = closedTrades.filter(t => Number(t.pnlUSD || 0) > 0).length;
+  const losses = closedTrades.filter(t => Number(t.pnlUSD || 0) <= 0).length;
+  const totalFees = closedTrades.reduce((sum,t) =>
+    sum + Number(t.entryFeeUSD || 0) + Number(t.executionEntryFeeUSD || 0) +
+    Number(t.exitFeeUSD || 0) + Number(t.executionExitFeeUSD || 0), 0);
+  const winRate = closedTrades.length ? wins / closedTrades.length * 100 : 0;
+  const totalPnL = realizedPnL + unrealizedPnL;
   const concentration = positions.map(p => ({ symbol: p.symbol, pct: gross > 0 ? Math.abs(p.notionalUSD) / gross * 100 : 0 }));
   const maxConcentration = concentration.length ? Math.max(...concentration.map(x => x.pct)) : 0;
   const risk = riskEngine.assess({ equity, peakEquity: peakCapital, dailyPnL: dailyNetPnL, openPositions: positions });
@@ -6002,8 +6047,34 @@ async function getDashboardExecutionPortfolio(symbol) {
     lifecycle: stages,
     latestDecision: latest,
     positions,
+    closedTrades: closedTrades.slice(0, 100).map(t => ({
+      symbol: t.symbol,
+      direction: t.direction,
+      entry: Number(t.entry || t.entryPrice || 0),
+      exit: Number(t.exitPrice || t.executionExitPrice || 0),
+      pnlUSD: Number(t.pnlUSD || 0),
+      pnlPct: Number(t.pnlPct || 0),
+      closeReason: t.closeReason || 'unknown',
+      openedAt: t.openTime || t.entryTime || t.startTime || null,
+      closedAt: t.closeTime || null,
+      signalId: t.signalId || null
+    })),
+    performance: {
+      realizedPnL,
+      unrealizedPnL,
+      totalPnL,
+      winRate,
+      wins,
+      losses,
+      closedTrades: closedTrades.length,
+      totalFees
+    },
     portfolio: {
-      equity, dailyPnL: Number(dailyNetPnL || 0), unrealizedPnL, grossExposureUSD: gross,
+      mode: 'PAPER',
+      startingCapitalUSD: Number(config.CAPITAL_USD || 0),
+      equity: equity + unrealizedPnL, dailyPnL: Number(dailyNetPnL || 0),
+      realizedPnL, unrealizedPnL, totalPnL, winRate, wins, losses,
+      grossExposureUSD: gross,
       exposurePct: equity > 0 ? gross / equity * 100 : 0,
       longNotionalUSD: longNotional, shortNotionalUSD: shortNotional,
       netDirectionalUSD: longNotional - shortNotional,
