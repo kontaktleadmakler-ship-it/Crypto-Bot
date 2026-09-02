@@ -288,28 +288,74 @@ function renderScanHistory(){
  }).join('')||'<span style="color:var(--muted)">NO PERSISTED SCAN HISTORY YET</span>';
 }
 
-async function load(){try{const marketResult=await Promise.allSettled([api('/api/dashboard/live-scanner')]);const market=marketResult[0].status==='fulfilled'?marketResult[0].value:null;state.market=market?.rows||state.market||[];state.scan=market?.scan||state.scan||{};state.liveSource=market?.source||state.liveSource||'WAITING';fetch('/api/dashboard/connection',{cache:'no-store',headers:{'X-API-Key':dashboardApiKey()}}).then(r=>r.json()).then(c=>{state.connection=c; $('eventCount').textContent=c.connected?'LIVE':'WAITING'; $('footerStatus').textContent=c.connected?'JARVIS 6.15 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.15 // WAITING FOR PRODUCTION SCANNER';}).catch(()=>{});renderMarket();renderHeat();const syms=state.market.map(r=>r.symbol).filter(Boolean);const sel=$('coinSelect');const current=state.symbol;sel.innerHTML=syms.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');if(syms.includes(current))sel.value=current;else if(syms[0]){state.symbol=syms[0];sel.value=syms[0]}
-const [intel,agents,portfolio,regime,router,timeline,scanHistory,execution,connection,marketOverview]=await Promise.allSettled([api(`/api/dashboard/state?symbol=${encodeURIComponent(state.symbol)}`),api(`/api/dashboard/agents?symbol=${encodeURIComponent(state.symbol)}`),api('/api/dashboard/portfolio-learning'),api('/api/dashboard/regime-intelligence'),api(`/api/dashboard/adaptive-router?symbol=${encodeURIComponent(state.symbol)}`),api(`/api/dashboard/coin-timeline?symbol=${encodeURIComponent(state.symbol)}&limit=160`),api(`/api/dashboard/scan-history?symbol=${encodeURIComponent(state.symbol)}&limit=120`),api(`/api/dashboard/execution?symbol=${encodeURIComponent(state.symbol)}`),api('/api/dashboard/connection'),api(`/api/dashboard/state?symbol=${encodeURIComponent(state.symbol)}`)]);
-if(intel.status==='fulfilled'){const cs=intel.value;state.intel={current:{market:cs.market||{},marketPhase:cs.market?.marketPhase||cs.regime||'—',risk:cs.market?.risk||null,technical:{rsi:cs.market?.rsi},sentiment:{fundingRate:cs.market?.fundingRate},dqn:cs.dqn,decision:cs.decision||{},confidence:cs.confidence,finalAction:cs.finalAction},source:cs.source,scanner:cs.scan};}else{state.intel=null;}state.agents=agents.status==='fulfilled'?agents.value:(intel.status==='fulfilled'&&intel.value.agents?intel.value.agents:null);state.portfolio=portfolio.status==='fulfilled'?portfolio.value:null;state.regime=regime.status==='fulfilled'?regime.value:null;state.router=router.status==='fulfilled'?router.value:null;state.execution=execution.status==='fulfilled'?execution.value:null;state.connection=connection.status==='fulfilled'?connection.value:null;state.marketOverview=marketOverview.status==='fulfilled'?marketOverview.value:null;if(timeline.status==='fulfilled'){state.timeline=timeline.value.timeline||[];state.timelineSummary=timeline.value.summary||{}}
-$('heroSymbol').textContent=state.symbol;$('chartSymbol').textContent=state.symbol;$('regime').textContent=state.regime?.currentRegime||state.regime?.phase||state.regime?.live?.phase||state.intel?.regime?.phase||state.intel?.current?.marketPhase?.phase||state.intel?.current?.marketPhase||'—';$('regimeLarge').textContent=$('regime').textContent;$('regimeDesc').textContent=state.regime?.description||state.intel?.regime?.description||'Adaptive regime intelligence';$('riskHead').textContent=state.portfolio?.portfolio?.risk?.level||state.intel?.current?.risk?.level||'—';$('riskHead').className=(String($('riskHead').textContent).includes('HIGH')?'bad':String($('riskHead').textContent).includes('LOW')?'good':'warn');const pnl=state.portfolio?.portfolio?.dailyPnL; $('pnlHead').textContent=pnl==null?'—':pct(pnl);$('pnlHead').className=colorClass(pnl);renderAgents();renderLiveControl();renderBrain();renderNeuralDetail();renderScanHistory();renderForensics();renderOutcomeChart();renderRouter();$('lastUpdate').textContent=new Date().toLocaleTimeString();$('footerStatus').textContent=state.liveSource==='PRODUCTION_SCANNER'&&state.market.length?'JARVIS 6.15 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.15 // WAITING FOR PRODUCTION SCANNER';
-if(dashboardAuthFailed){$('authBanner').classList.add('show');$('footerStatus').textContent='JARVIS // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';}
-else{$('authBanner').classList.remove('show');}
-}catch(e){
+async function load(){
+ try{
+  // One canonical request for the dashboard's live state. Secondary endpoints
+  // remain available for historical panels, but the Brain and live matrix never
+  // depend on them being healthy.
+  const canonical=await api(`/api/dashboard/state?symbol=${encodeURIComponent(state.symbol||'BTC-USDT')}`);
+  if(canonical && canonical.ok){
+    state.market=canonical.market?[canonical.market,...(state.market||[]).filter(x=>String(x.symbol).toUpperCase()!==String(canonical.market.symbol).toUpperCase())]:(state.market||[]);
+    state.market=state.market.filter(Boolean);
+    state.scan=canonical.scan||state.scan||{};
+    state.connection=canonical.connection||state.connection||{};
+    state.liveSource=canonical.source||'PRODUCTION_SCANNER';
+    state.agents=canonical.agents||state.agents||{};
+    state.intel={current:{
+      market:canonical.market||{},
+      marketPhase:canonical.market?.marketPhase||canonical.scan?.phase||'—',
+      risk:canonical.market?.risk||null,
+      dqn:canonical.dqn||canonical.agents?.dqn||null,
+      decision:canonical.decision||{},
+      confidence:canonical.confidence,
+      finalAction:canonical.finalAction
+    },source:canonical.source,scanner:canonical.scan};
+    state.events=canonical.events||[];
+    state.scanHistory=(canonical.decisionEvents||[]).map(e=>({ts:e.ts,eventId:e.eventId,type:e.type,symbol:e.symbol,payload:e.payload||{}}));
+    state.scanHistory=(state.scanHistory||[]).concat((canonical.agentEvents||[]).map(e=>({ts:e.ts,eventId:e.eventId,type:e.type,symbol:e.symbol,payload:e.payload||{}}))).slice(-240);
+    if(canonical.stats){$('nodes').textContent=canonical.stats.nodes||'—';$('connections').textContent=canonical.stats.connections||'—';$('decisions').textContent=canonical.stats.decisions||'—';}
+    if(canonical.market?.symbol) state.symbol=canonical.market.symbol;
+  }
+  renderMarket();renderHeat();
+  const syms=state.market.map(r=>r.symbol).filter(Boolean);const sel=$('coinSelect');
+  if(sel){const current=state.symbol;sel.innerHTML=syms.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');if(syms.includes(current))sel.value=current;else if(syms[0]){state.symbol=syms[0];sel.value=syms[0]}}
+  // Optional projections: failures here must never blank the canonical live state.
+  const results=await Promise.allSettled([
+    api(`/api/dashboard/agents?symbol=${encodeURIComponent(state.symbol)}`),
+    api('/api/dashboard/regime-intelligence'),
+    api(`/api/dashboard/adaptive-router?symbol=${encodeURIComponent(state.symbol)}`),
+    api(`/api/dashboard/coin-timeline?symbol=${encodeURIComponent(state.symbol)}&limit=160`),
+    api(`/api/dashboard/scan-history?symbol=${encodeURIComponent(state.symbol)}&limit=120`),
+    api(`/api/dashboard/execution?symbol=${encodeURIComponent(state.symbol)}`),
+    api('/api/dashboard/portfolio-learning'),
+    api('/api/dashboard/connection')
+  ]);
+  const [agents,regime,router,timeline,scanHistory,execution,portfolio,connection]=results;
+  if(agents.status==='fulfilled' && agents.value) state.agents=agents.value;
+  if(regime.status==='fulfilled') state.regime=regime.value;
+  if(router.status==='fulfilled') state.router=router.value;
+  if(timeline.status==='fulfilled') {state.timeline=timeline.value.timeline||[];state.timelineSummary=timeline.value.summary||{};}
+  if(scanHistory.status==='fulfilled') state.scanHistory=(scanHistory.value.events||scanHistory.value.items||state.scanHistory||[]).slice(-240);
+  if(execution.status==='fulfilled') state.execution=execution.value;
+  if(portfolio.status==='fulfilled') state.portfolio=portfolio.value;
+  if(connection.status==='fulfilled') state.connection=connection.value;
+
+  $('heroSymbol').textContent=state.symbol;$('chartSymbol').textContent=state.symbol;
+  $('regime').textContent=state.regime?.currentRegime||state.regime?.phase||state.regime?.live?.phase||state.intel?.current?.marketPhase||'—';
+  $('regimeLarge').textContent=$('regime').textContent;$('regimeDesc').textContent=state.regime?.description||'Adaptive regime intelligence';
+  $('riskHead').textContent=state.portfolio?.portfolio?.risk?.level||state.intel?.current?.risk?.level||'—';
+  $('riskHead').className=(String($('riskHead').textContent).includes('HIGH')?'bad':String($('riskHead').textContent).includes('LOW')?'good':'warn');
+  const pnl=state.portfolio?.portfolio?.dailyPnL;$('pnlHead').textContent=pnl==null?'—':pct(pnl);$('pnlHead').className=colorClass(pnl);
+  renderAgents();renderLiveControl();renderBrain();renderNeuralDetail();renderScanHistory();renderForensics();renderOutcomeChart();renderRouter();
+  $('lastUpdate').textContent=new Date().toLocaleTimeString();
+  $('footerStatus').textContent=state.connection?.connected?'JARVIS 6.15 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.15 // WAITING FOR PRODUCTION SCANNER';
+  $('eventCount').textContent=state.connection?.connected?'LIVE':'WAITING';
+  if(dashboardAuthFailed){$('authBanner').classList.add('show');$('footerStatus').textContent='JARVIS // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';}else $('authBanner').classList.remove('show');
+ }catch(e){
   if(e&&e.authError){$('authBanner').classList.add('show');$('footerStatus').textContent='JARVIS // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';}
   else{$('footerStatus').textContent='JARVIS // DATA LINK DEGRADED · '+e.message}
-}}
-if(!dashboardApiKey())showKeyModal(false);
-$('coinSelect').addEventListener('change',e=>{state.symbol=e.target.value;load()});setInterval(()=>{$('clock').textContent=new Date().toLocaleTimeString('de-DE');},1000);$('clock').textContent=new Date().toLocaleTimeString('de-DE');
-
-// ---------------------------------------------------------------------------
-// PRODUCTION SCANNER LINK 6.14
-// The server emits named SSE events (event: jarvis). `onmessage` only receives
-// unnamed SSE messages, so the previous dashboard never reacted to the real
-// scanner event stream. Subscribe explicitly to the named event and merge the
-// SAME production SCAN:COIN payload into the UI. No synthetic market feed.
-// ---------------------------------------------------------------------------
-let liveEventSource=null;
-let liveReloadTimer=null;
+ }
+}
 function scheduleLiveRefresh(){
   clearTimeout(liveReloadTimer);
   liveReloadTimer=setTimeout(()=>load().catch(()=>{}),800);
