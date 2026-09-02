@@ -30,4 +30,8 @@ assert.ok(result.meta.decision);
 const blocked = suite.evaluate({ exposurePct: 95, maxExposurePct: 80, maxDrawdownPct: 25, maxDailyLossPct: 10 });
 assert.equal(blocked.riskSupervisor.hardBlock, true);
 assert.equal(blocked.meta.decision, 'NO_TRADE');
+
+const advisory = suite.evaluate({ spreadPct: 10, maxSpreadPct: 1, depthUSD: 0, orderSizeUSD: 10000, strategy: {}, oosScore: 0, driftScore: 1, maxExposurePct: 80, exposurePct: 0, maxDrawdownPct: 25, drawdownPct: 0, maxDailyLossPct: 10, dailyLossPct: 0 });
+assert.equal(advisory.meta.hardBlock, false, 'STRATEGY_HEALTH_IS_ADVISORY');
+assert.ok(Array.isArray(advisory.meta.advisoryBlocks));
 console.log('Agent Suite tests: OK');
