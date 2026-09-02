@@ -94,6 +94,21 @@
     <section class="panel"><div class="title">ADAPTIVE STRATEGY ROUTER <small>REGIME WEIGHTING</small></div><div id="router" class="router"></div></section>
     <section class="panel"><div class="title">REGIME INTELLIGENCE <small id="regimeDuration">LIVE</small></div><div class="route"><span>CURRENT REGIME</span><b id="regimeLarge">—</b><div id="regimeDesc" style="font-size:8px;color:var(--muted);margin-top:5px">—</div></div></section>
   </aside>
+
+    <section class="panel" style="grid-column:1/-1">
+      <div class="title">PAPER TRADING PORTFOLIO <small id="paperExecStatus">PAPER ONLY</small></div>
+      <div id="paperMetrics" style="display:grid;grid-template-columns:repeat(8,minmax(90px,1fr));gap:6px;margin:7px 0"></div>
+      <div style="display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:8px">
+        <div>
+          <div class="sub">OPEN POSITIONS</div>
+          <div id="paperOpen" style="font-size:8px;overflow:auto;max-height:210px"></div>
+        </div>
+        <div>
+          <div class="sub">CLOSED PAPER TRADES</div>
+          <div id="paperClosed" style="font-size:8px;overflow:auto;max-height:210px"></div>
+        </div>
+      </div>
+    </section>
 </main>
 <footer class="footer"><span id="footerStatus">JARVIS // LIVE MARKET DATA → NEURAL DECISION → OUTCOME FORENSICS</span><nav><button class="active">COMMAND</button><button onclick="focusPanel('marketRows')">MARKET</button><button onclick="focusPanel('brain')">NEURAL</button><button onclick="focusPanel('timeline')">FORENSICS</button><button onclick="focusPanel('outcomeChart')">OUTCOMES</button></nav><span id="lastUpdate">—</span></footer>
 </div>
@@ -288,6 +303,37 @@ function renderScanHistory(){
  }).join('')||'<span style="color:var(--muted)">NO PERSISTED SCAN HISTORY YET</span>';
 }
 
+
+function money(v){const x=Number(v);return Number.isFinite(x)?'$'+x.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}):'—';}
+function signedMoney(v){const x=Number(v);if(!Number.isFinite(x))return '—';return (x>=0?'+':'-')+'$'+Math.abs(x).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
+function renderPaperTrading(){
+  const e=state.execution||{}, p=e.portfolio||{}, perf=e.performance||{};
+  const open=Array.isArray(e.positions)?e.positions:[];
+  const closed=Array.isArray(e.closedTrades)?e.closedTrades:[];
+  const metrics=[
+    ['BALANCE',money(Number(p.startingCapitalUSD||0)+Number(perf.realizedPnL||0))],
+    ['EQUITY',money(Number(p.equity||0))],
+    ['REALIZED P&L',signedMoney(perf.realizedPnL)],
+    ['UNREALIZED P&L',signedMoney(perf.unrealizedPnL)],
+    ['TOTAL P&L',signedMoney(perf.totalPnL)],
+    ['WIN RATE',Number(perf.winRate||0).toFixed(1)+'%'],
+    ['TRADES',String(perf.closedTrades||closed.length||0)],
+    ['OPEN',String(open.length)]
+  ];
+  const mm=$('paperMetrics');
+  if(mm) mm.innerHTML=metrics.map(([k,v])=>`<div class="control-box"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('');
+  const ps=$('paperExecStatus');
+  if(ps) ps.textContent=e.execution?.liveOrders?'LIVE BLOCKED — ERROR':'PAPER ONLY · LIVE ORDERS OFF';
+  const op=$('paperOpen');
+  if(op) op.innerHTML=open.length?`<table style="width:100%;border-collapse:collapse"><thead><tr><th>COIN</th><th>SIDE</th><th>ENTRY</th><th>MARK</th><th>U-P&L</th><th>SL</th><th>TP1</th><th>TP2</th></tr></thead><tbody>${
+    open.map(x=>`<tr><td>${esc(x.symbol)}</td><td>${esc(x.direction)}</td><td>${esc(money(x.entry))}</td><td>${esc(money(x.mark))}</td><td class="${Number(x.unrealizedPnL||0)>=0?'good':'bad'}">${esc(signedMoney(x.unrealizedPnL))}</td><td>${esc(money(x.stopLoss))}</td><td>${esc(money(x.tp1))}</td><td>${esc(money(x.tp2))}</td></tr>`).join('')
+  }</tbody></table>`:'<span style="color:var(--muted)">NO OPEN PAPER POSITIONS</span>';
+  const cp=$('paperClosed');
+  if(cp) cp.innerHTML=closed.length?`<table style="width:100%;border-collapse:collapse"><thead><tr><th>COIN</th><th>SIDE</th><th>ENTRY</th><th>EXIT</th><th>P&L</th><th>REASON</th><th>CLOSED</th></tr></thead><tbody>${
+    closed.slice(0,50).map(x=>`<tr><td>${esc(x.symbol)}</td><td>${esc(x.direction)}</td><td>${esc(money(x.entry))}</td><td>${esc(money(x.exit))}</td><td class="${Number(x.pnlUSD||0)>=0?'good':'bad'}">${esc(signedMoney(x.pnlUSD))}</td><td>${esc(x.closeReason||'—')}</td><td>${x.closedAt?esc(new Date(x.closedAt).toLocaleString()):'—'}</td></tr>`).join('')
+  }</tbody></table>`:'<span style="color:var(--muted)">NO CLOSED PAPER TRADES YET</span>';
+}
+
 async function load(){
  try{
   // One canonical request for the dashboard's live state. Secondary endpoints
@@ -316,7 +362,7 @@ async function load(){
     if(canonical.stats){$('nodes').textContent=canonical.stats.nodes||'—';$('connections').textContent=canonical.stats.connections||'—';$('decisions').textContent=canonical.stats.decisions||'—';}
     if(canonical.market?.symbol) state.symbol=canonical.market.symbol;
   }
-  renderMarket();renderHeat();
+  renderMarket();renderHeat();renderPaperTrading();
   const syms=state.market.map(r=>r.symbol).filter(Boolean);const sel=$('coinSelect');
   if(sel){const current=state.symbol;sel.innerHTML=syms.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');if(syms.includes(current))sel.value=current;else if(syms[0]){state.symbol=syms[0];sel.value=syms[0]}}
   // Optional projections: failures here must never blank the canonical live state.
@@ -336,7 +382,7 @@ async function load(){
   if(router.status==='fulfilled') state.router=router.value;
   if(timeline.status==='fulfilled') {state.timeline=timeline.value.timeline||[];state.timelineSummary=timeline.value.summary||{};}
   if(scanHistory.status==='fulfilled') state.scanHistory=(scanHistory.value.events||scanHistory.value.items||state.scanHistory||[]).slice(-240);
-  if(execution.status==='fulfilled') state.execution=execution.value;
+  if(execution.status==='fulfilled') { state.execution=execution.value; renderPaperTrading(); }
   if(portfolio.status==='fulfilled') state.portfolio=portfolio.value;
   if(connection.status==='fulfilled') state.connection=connection.value;
 
@@ -346,7 +392,7 @@ async function load(){
   $('riskHead').textContent=state.portfolio?.portfolio?.risk?.level||state.intel?.current?.risk?.level||'—';
   $('riskHead').className=(String($('riskHead').textContent).includes('HIGH')?'bad':String($('riskHead').textContent).includes('LOW')?'good':'warn');
   const pnl=state.portfolio?.portfolio?.dailyPnL;$('pnlHead').textContent=pnl==null?'—':pct(pnl);$('pnlHead').className=colorClass(pnl);
-  renderAgents();renderLiveControl();renderBrain();renderNeuralDetail();renderScanHistory();renderForensics();renderOutcomeChart();renderRouter();
+  renderAgents();renderLiveControl();renderBrain();renderNeuralDetail();renderScanHistory();renderForensics();renderOutcomeChart();renderRouter();renderPaperTrading();
   $('lastUpdate').textContent=new Date().toLocaleTimeString();
   $('footerStatus').textContent=state.connection?.connected?'JARVIS 6.15 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.15 // WAITING FOR PRODUCTION SCANNER';
   $('eventCount').textContent=state.connection?.connected?'LIVE':'WAITING';
