@@ -165,42 +165,30 @@ let brain3dStarted=false;
 let brain3dData={symbol:'—',action:'STANDBY',confidence:0,regime:'—',timeline:[],inputs:{}};
 function renderBrain(){
   const cur=state.intel?.current||{};
-  const d=cur.decision||{};
-  const tech=cur.technical||{}, sent=cur.sentiment||{}, risk=cur.risk||{};
-  const action=String(d.action||state.agents?.finalAction||state.agents?.supervisor?.recommendation||'REJECT').toUpperCase();
+  const marketRow=state.market.find(x=>String(x.symbol).toUpperCase()===String(state.symbol).toUpperCase())||state.market[0]||{};
+  const a=state.agents||{};
+  const d=a.decision||cur.decision||{};
+  const action=String(a.finalAction||d.action||state.market.find(x=>x.symbol===state.symbol)?.gateDirection||'WAITING').toUpperCase();
+  const nodes=Array.isArray(a.nodes)?a.nodes:[];
+  const confidence=Number(a.confidence??d.confidence??0);
   const t=Array.isArray(state.timeline)?state.timeline:[];
-  const latest=t[t.length-1]||{};
-  const inputs={
-    PRICE:cur.market?.price,
-    RSI:tech.rsi,
-    ADX:cur.adx||cur.technical?.adx,
-    OI:cur.market?.contract?.openInterestChangePct??cur.market?.oiDeltaPct,
-    FUNDING:sent.fundingRate,
-    VOLUME:cur.market?.volume24h
-  };
-  brain3dData={
-    symbol:state.symbol||'—',action,confidence:Number(d.confidence||0),
-    regime:state.regime?.currentRegime||state.regime?.phase||cur.marketPhase||'—',
-    timeline:t.slice(-12),inputs
-  };
+  const localEvents=state.scanHistory.filter(x=>String(x.symbol||'').toUpperCase()===String(state.symbol).toUpperCase());
+  const timeline=(t.length?t:localEvents.map(x=>({action:x.payload?.gateDirection||x.payload?.action||'SCAN',confidence:x.payload?.confidence||0,scanTs:x.ts,outcomeQuality:'PENDING'})));
+  brain3dData={symbol:state.symbol||marketRow.symbol||'—',action,confidence,regime:state.regime?.currentRegime||cur.marketPhase||marketRow.marketPhase||'—',timeline:timeline.slice(-12),inputs:{PRICE:marketRow.price,RSI:marketRow.rsi,ADX:marketRow.adx,OI:marketRow.openInterest,FUNDING:marketRow.fundingRate,VOLUME:marketRow.volume24h}};
   const brain=$('brain');
-  if(!brain3dStarted){
-    brain.innerHTML='<canvas id="brain3dCanvas"></canvas><div class="brain-scan"></div><div class="brain-vignette"></div><div class="brain-chip">NEURAL CORE // LIVE</div><div class="brain-hud"><div class="tl">ORIGIN <strong id="brainOrigin">LIVE SCAN</strong></div><div class="tr">REGIME <strong id="brainRegime">—</strong><br>CONFIDENCE <strong id="brainConfidence">—</strong></div><div class="bl">GRAPH <strong id="brainGraph">3D / DECISION LINKED</strong></div><div class="br">OUTCOME <strong id="brainOutcome">PENDING</strong></div></div><div class="brain-decision-list" id="brainDecisionList"></div>';
-    brain3dStarted=true;
-    startBrain3D();
+  if(!brain3dStarted){brain.innerHTML='<canvas id="brain3dCanvas"></canvas><div class="brain-scan"></div><div class="brain-vignette"></div><div class="brain-chip">NEURAL CORE // LIVE</div><div class="brain-hud"><div class="tl">ORIGIN <strong id="brainOrigin">LIVE SCAN</strong></div><div class="tr">REGIME <strong id="brainRegime">—</strong><br>CONFIDENCE <strong id="brainConfidence">—</strong></div><div class="bl">GRAPH <strong id="brainGraph">3D / DECISION LINKED</strong></div><div class="br">OUTCOME <strong id="brainOutcome">PENDING</strong></div></div><div class="brain-decision-list" id="brainDecisionList"></div>';
+    brain3dStarted=true; startBrain3D();
   }
   $('brainRegime').textContent=brain3dData.regime;
-  $('brainConfidence').textContent=n(brain3dData.confidence,1)+'%';
-  const oq=latest.outcomeQuality||'PENDING';
+  $('brainConfidence').textContent=confidence>1?n(confidence,1)+'%':n(confidence*100,1)+'%';
+  const latest=brain3dData.timeline.at(-1)||{}; const oq=latest.outcomeQuality||'PENDING';
   const bo=$('brainOutcome');bo.textContent=oq;bo.className=oq==='POSITIVE'?'greentxt':oq==='NEGATIVE'?'redtxt':'goldtxt';
   const list=$('brainDecisionList');
-  if(list){
-    list.innerHTML=brain3dData.timeline.slice(-4).reverse().map(x=>{
-      const q=x.outcomeQuality||'PENDING';
-      const r=x.outcomes?.plus10Scan?.directedReactionPct;
-      return `<div class="brain-decision-item ${q==='POSITIVE'?'good':q==='NEGATIVE'?'bad':''}"><b>${esc(x.action||'REJECT')}</b> · ${n(x.confidence,0)}% · ${new Date(x.scanTs||Date.now()).toLocaleTimeString()}<br>OUTCOME +10: ${r==null?'PENDING':pct(r)}</div>`;
-    }).join('');
-  }
+  if(list) list.innerHTML=nodes.slice(0,8).map(x=>{const sc=Number(x.score||x.confidence||0);const pctv=sc<=1?sc*100:sc;const st=x.status||x.decision||'WAITING';const bad=/VETO|BLOCK/i.test(st);return `<div class="brain-decision-item ${bad?'bad':'good'}"><b>${esc(x.label||x.name||x.id||'AGENT')}</b> · ${n(pctv,0)}% · ${esc(st)}<br>${esc(x.decision||'LIVE')} · ${new Date(a.eventTs||Date.now()).toLocaleTimeString()}</div>`}).join('')||'<div class="brain-decision-item">WAITING FOR PRODUCTION AGENT EVENT</div>';
+  $('nodes').textContent=nodes.length||'—';
+  $('connections').textContent=nodes.length?Math.max(0,nodes.length-1)+Math.max(0,nodes.length-2):'—';
+  $('decisions').textContent=state.scanHistory.filter(x=>/SIGNAL:GENERATED|AGENTS:EVALUATED|SCAN:COIN/.test(x.type||'')).length||timeline.length||'—';
+  $('accuracy').textContent=state.intel?.current?.ml?.validationAccuracy!=null?n(Number(state.intel.current.ml.validationAccuracy)*100,1)+'%':'—';
 }
 function startBrain3D(){
   const canvas=$('brain3dCanvas');if(!canvas)return;
@@ -301,8 +289,8 @@ function renderScanHistory(){
 }
 
 async function load(){try{const marketResult=await Promise.allSettled([api('/api/dashboard/live-scanner')]);const market=marketResult[0].status==='fulfilled'?marketResult[0].value:null;state.market=market?.rows||state.market||[];state.scan=market?.scan||state.scan||{};state.liveSource=market?.source||state.liveSource||'WAITING';fetch('/api/dashboard/connection',{cache:'no-store',headers:{'X-API-Key':dashboardApiKey()}}).then(r=>r.json()).then(c=>{state.connection=c; $('eventCount').textContent=c.connected?'LIVE':'WAITING'; $('footerStatus').textContent=c.connected?'JARVIS 6.15 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.15 // WAITING FOR PRODUCTION SCANNER';}).catch(()=>{});renderMarket();renderHeat();const syms=state.market.map(r=>r.symbol).filter(Boolean);const sel=$('coinSelect');const current=state.symbol;sel.innerHTML=syms.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');if(syms.includes(current))sel.value=current;else if(syms[0]){state.symbol=syms[0];sel.value=syms[0]}
-const [intel,agents,portfolio,regime,router,timeline,scanHistory,execution,connection,marketOverview]=await Promise.allSettled([api(`/api/dashboard/intelligence?symbol=${encodeURIComponent(state.symbol)}`),api(`/api/dashboard/agents?symbol=${encodeURIComponent(state.symbol)}`),api('/api/dashboard/portfolio-learning'),api('/api/dashboard/regime-intelligence'),api(`/api/dashboard/adaptive-router?symbol=${encodeURIComponent(state.symbol)}`),api(`/api/dashboard/coin-timeline?symbol=${encodeURIComponent(state.symbol)}&limit=160`),api(`/api/dashboard/scan-history?symbol=${encodeURIComponent(state.symbol)}&limit=120`),api(`/api/dashboard/execution?symbol=${encodeURIComponent(state.symbol)}`),api('/api/dashboard/connection'),api('/api/dashboard/state')]);
-state.intel=intel.status==='fulfilled'?intel.value:null;state.agents=agents.status==='fulfilled'?agents.value:null;state.portfolio=portfolio.status==='fulfilled'?portfolio.value:null;state.regime=regime.status==='fulfilled'?regime.value:null;state.router=router.status==='fulfilled'?router.value:null;state.execution=execution.status==='fulfilled'?execution.value:null;state.connection=connection.status==='fulfilled'?connection.value:null;state.marketOverview=marketOverview.status==='fulfilled'?marketOverview.value:null;if(timeline.status==='fulfilled'){state.timeline=timeline.value.timeline||[];state.timelineSummary=timeline.value.summary||{}}
+const [intel,agents,portfolio,regime,router,timeline,scanHistory,execution,connection,marketOverview]=await Promise.allSettled([api(`/api/dashboard/state?symbol=${encodeURIComponent(state.symbol)}`),api(`/api/dashboard/agents?symbol=${encodeURIComponent(state.symbol)}`),api('/api/dashboard/portfolio-learning'),api('/api/dashboard/regime-intelligence'),api(`/api/dashboard/adaptive-router?symbol=${encodeURIComponent(state.symbol)}`),api(`/api/dashboard/coin-timeline?symbol=${encodeURIComponent(state.symbol)}&limit=160`),api(`/api/dashboard/scan-history?symbol=${encodeURIComponent(state.symbol)}&limit=120`),api(`/api/dashboard/execution?symbol=${encodeURIComponent(state.symbol)}`),api('/api/dashboard/connection'),api(`/api/dashboard/state?symbol=${encodeURIComponent(state.symbol)}`)]);
+if(intel.status==='fulfilled'){const cs=intel.value;state.intel={current:{market:cs.market||{},marketPhase:cs.market?.marketPhase||cs.regime||'—',risk:cs.market?.risk||null,technical:{rsi:cs.market?.rsi},sentiment:{fundingRate:cs.market?.fundingRate},dqn:cs.dqn,decision:cs.decision||{},confidence:cs.confidence,finalAction:cs.finalAction},source:cs.source,scanner:cs.scan};}else{state.intel=null;}state.agents=agents.status==='fulfilled'?agents.value:(intel.status==='fulfilled'&&intel.value.agents?intel.value.agents:null);state.portfolio=portfolio.status==='fulfilled'?portfolio.value:null;state.regime=regime.status==='fulfilled'?regime.value:null;state.router=router.status==='fulfilled'?router.value:null;state.execution=execution.status==='fulfilled'?execution.value:null;state.connection=connection.status==='fulfilled'?connection.value:null;state.marketOverview=marketOverview.status==='fulfilled'?marketOverview.value:null;if(timeline.status==='fulfilled'){state.timeline=timeline.value.timeline||[];state.timelineSummary=timeline.value.summary||{}}
 $('heroSymbol').textContent=state.symbol;$('chartSymbol').textContent=state.symbol;$('regime').textContent=state.regime?.currentRegime||state.regime?.phase||state.regime?.live?.phase||state.intel?.regime?.phase||state.intel?.current?.marketPhase?.phase||state.intel?.current?.marketPhase||'—';$('regimeLarge').textContent=$('regime').textContent;$('regimeDesc').textContent=state.regime?.description||state.intel?.regime?.description||'Adaptive regime intelligence';$('riskHead').textContent=state.portfolio?.portfolio?.risk?.level||state.intel?.current?.risk?.level||'—';$('riskHead').className=(String($('riskHead').textContent).includes('HIGH')?'bad':String($('riskHead').textContent).includes('LOW')?'good':'warn');const pnl=state.portfolio?.portfolio?.dailyPnL; $('pnlHead').textContent=pnl==null?'—':pct(pnl);$('pnlHead').className=colorClass(pnl);renderAgents();renderLiveControl();renderBrain();renderNeuralDetail();renderScanHistory();renderForensics();renderOutcomeChart();renderRouter();$('lastUpdate').textContent=new Date().toLocaleTimeString();$('footerStatus').textContent=state.liveSource==='PRODUCTION_SCANNER'&&state.market.length?'JARVIS 6.15 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.15 // WAITING FOR PRODUCTION SCANNER';
 if(dashboardAuthFailed){$('authBanner').classList.add('show');$('footerStatus').textContent='JARVIS // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';}
 else{$('authBanner').classList.remove('show');}
@@ -349,7 +337,7 @@ function applyProductionEvent(evt){
     return;
   }
     if(evt.type==='AGENTS:EVALUATED'){
-     state.agents={...(evt.payload||{}),live:true,updatedAt:Number(evt.ts||Date.now())};
+     state.agents={...(evt.payload||{}),live:true,updatedAt:Number(evt.ts||Date.now()),eventTs:Number(evt.ts||Date.now())};
      $('eventCount').textContent='LIVE';
      renderAgents();renderNeuralDetail();renderBrain();
      return;
