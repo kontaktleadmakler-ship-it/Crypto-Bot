@@ -6391,6 +6391,121 @@ app.get('/api/dashboard/portfolio-learning', async (req, res) => {
   catch (error) { res.status(503).json({ error:'PORTFOLIO_LEARNING_UNAVAILABLE', message:error.message }); }
 });
 
+
+// ============================================================================
+// JARVIS 6.17 — DECISION INTELLIGENCE & AUDIT PROJECTION
+// Read-only dashboard diagnostics. No execution side effects.
+// ============================================================================
+function dashboardDecisionTrace(symbol = null) {
+  const key = symbol ? String(symbol).toUpperCase() : null;
+  const events = jarvisEventBus.recent({ limit: 500, since: 0, symbol: key, types: null }) || [];
+  const relevant = events.filter(e => {
+    const t = String(e.type || '');
+    return /SCAN:COIN|AGENTS:EVALUATED|RISK:EVALUATED|SUPERVISOR:EVALUATED|SIGNAL:GENERATED|DECISION:REPLAY/.test(t);
+  });
+  const latest = relevant.at(-1) || null;
+  const byType = type => [...relevant].reverse().find(e => e.type === type) || null;
+  const marketEvent = byType('SCAN:COIN');
+  const agentEvent = byType('AGENTS:EVALUATED');
+  const riskEvent = byType('RISK:EVALUATED');
+  const supervisorEvent = byType('SUPERVISOR:EVALUATED');
+  const decisionEvent = byType('DECISION:REPLAY') || byType('SIGNAL:GENERATED');
+  const market = marketEvent?.payload || dashboardLiveCoinSnapshots.get(key) || null;
+  const agents = agentEvent?.payload || dashboardLiveAgentSnapshots.get(key) || null;
+  const risk = riskEvent?.payload || market?.risk || null;
+  const supervisor = supervisorEvent?.payload || agents?.supervisor || null;
+  const decision = decisionEvent?.payload || dashboardLiveDecisionSnapshots.get(key) || null;
+  const ml = agents?.ml || market?.ml || null;
+  const dqn = agents?.dqn || null;
+  const vetoes = [...new Set([
+    ...(Array.isArray(agents?.vetoes) ? agents.vetoes : []),
+    ...(Array.isArray(decision?.vetoes) ? decision.vetoes : []),
+    ...(Array.isArray(supervisor?.vetoes) ? supervisor.vetoes : [])
+  ].map(String))];
+  const reasons = [];
+  if (vetoes.length) reasons.push(...vetoes);
+  if (risk?.allowed === false && risk?.reason) reasons.push(`RISK: ${risk.reason}`);
+  if (supervisor?.hardBlock) reasons.push('SUPERVISOR: HARD BLOCK');
+  if (market?.gateStatus && String(market.gateStatus).toUpperCase() !== 'PASS') reasons.push(`GATE: ${market.gateStatus}`);
+  if (!reasons.length && (agents?.finalAction || decision?.action) === 'REJECT') reasons.push('No explicit reject reason recorded');
+  return {
+    timestamp: Date.now(), symbol: key || market?.symbol || agents?.symbol || decision?.symbol || null,
+    source: 'PRODUCTION_EVENT_BUS',
+    stages: {
+      market: market ? { ts: marketEvent?.ts || market.eventTs || null, price: market.price ?? null, rsi: market.rsi ?? null, adx: market.adx ?? null, flow: market.bidAskRatio ?? market.flow ?? null, volume24h: market.volume24h ?? null, openInterest: market.openInterest ?? null, fundingRate: market.fundingRate ?? null, regime: market.marketPhase ?? null, gateStatus: market.gateStatus ?? null } : null,
+      ml: ml ? { probability: ml.probability ?? ml.mlProbability ?? null, confidence: ml.confidence ?? null, validationAccuracy: ml.validationAccuracy ?? null, modelVersion: ml.modelVersion ?? null, samples: ml.samples ?? ml.trainingSamples ?? null } : null,
+      dqn: dqn ? { action: dqn.action ?? null, qValues: Array.isArray(dqn.qValues) ? dqn.qValues : [], epsilon: dqn.epsilon ?? null, modelVersion: dqn.modelVersion ?? null, trainingSteps: dqn.trainingSteps ?? null, exploration: dqn.exploration ?? null } : null,
+      agents: Array.isArray(agents?.nodes) ? agents.nodes : (Array.isArray(agents?.agents) ? agents.agents : []),
+      supervisor: supervisor ? { recommendation: supervisor.recommendation ?? supervisor.action ?? null, confidence: supervisor.confidence ?? null, consensusPct: supervisor.consensusPct ?? null, hardBlock: Boolean(supervisor.hardBlock), conflicts: supervisor.conflicts || [], decisionPath: supervisor.decisionPath || null } : null,
+      risk: risk ? { allowed: risk.allowed ?? null, level: risk.level ?? null, reason: risk.reason ?? null, drawdownPct: risk.drawdownPct ?? null, exposurePct: risk.exposurePct ?? null } : null,
+      final: { action: agents?.finalAction || decision?.action || 'WAITING', confidence: Number(agents?.confidence ?? decision?.confidence ?? 0), reasons }
+    },
+    eventIds: relevant.slice(-20).map(e => ({ eventId: e.eventId, type: e.type, ts: e.ts }))
+  };
+}
+
+async function dashboardPerformanceSnapshot() {
+  let closed = [];
+  if (closedTradesCollection && isDbConnected) {
+    try { closed = await closedTradesCollection.find({isPartial:{$ne:true},closeTime:{$exists:true}}).sort({closeTime:1}).limit(2000).toArray(); } catch (_) { logger.warn?.(`[Dashboard Performance] ${_.message || _}`); }
+  }
+  const pnls = closed.map(t => Number(t.pnlUSD || 0)).filter(Number.isFinite);
+  const wins = pnls.filter(x => x > 0), losses = pnls.filter(x => x < 0);
+  const grossProfit = wins.reduce((a,b)=>a+b,0), grossLoss = Math.abs(losses.reduce((a,b)=>a+b,0));
+  let eq = Number(config.CAPITAL_USD || 0), peak = eq, maxDd = 0;
+  for (const p of pnls) { eq += p; peak = Math.max(peak,eq); if(peak>0) maxDd=Math.max(maxDd,(peak-eq)/peak*100); }
+  const avgWin = wins.length ? grossProfit/wins.length : null;
+  const avgLoss = losses.length ? grossLoss/losses.length : null;
+  const pf = grossLoss > 0 ? grossProfit/grossLoss : (grossProfit > 0 ? Infinity : null);
+  const rows = [
+    ['TRADES', pnls.length], ['WIN RATE', pnls.length ? wins.length/pnls.length*100 : null],
+    ['PROFIT FACTOR', pf], ['AVG WIN', avgWin], ['AVG LOSS', avgLoss],
+    ['EXPECTANCY', pnls.length ? pnls.reduce((a,b)=>a+b,0)/pnls.length : null],
+    ['MAX DRAWDOWN', maxDd], ['NET P&L', pnls.reduce((a,b)=>a+b,0)],
+    ['GROSS PROFIT', grossProfit], ['GROSS LOSS', -grossLoss]
+  ];
+  const byRegime = {};
+  for (const t of closed) {
+    const regime = String(t.marketPhase || t.regime || t.phase || t.entryMarketPhase || 'UNKNOWN').toUpperCase();
+    const p = Number(t.pnlUSD || 0); const r = byRegime[regime] ||= {regime,trades:0,wins:0,pnl:0}; r.trades++; r.wins += p>0?1:0; r.pnl += p;
+  }
+  const byAgent = dashboardAgentPerformance();
+  return { timestamp:Date.now(), metrics:Object.fromEntries(rows.map(([k,v])=>[k,v])), byRegime:Object.values(byRegime).map(r=>({...r,winRate:r.trades?r.wins/r.trades*100:0})).sort((a,b)=>b.trades-a.trades), byAgent, sample:closed.length, source:'PAPER_CLOSED_TRADES' };
+}
+
+function dashboardScannerHealth() {
+  const now = Date.now();
+  const rows = dashboardScanUniverse.map(symbol => {
+    const snap = dashboardLiveCoinSnapshots.get(String(symbol).toUpperCase());
+    const ageMs = snap ? Math.max(0, now - Number(snap.eventTs || 0)) : null;
+    const status = ageMs == null ? 'NO DATA' : ageMs <= 15000 ? 'LIVE' : ageMs <= 90000 ? 'STALE' : 'OFFLINE';
+    return {symbol, status, ageMs, latencyMs:Number(snap?.latencyMs ?? snap?.scanLatencyMs ?? 0) || null, gate:snap?.gateStatus ?? null, lastScanTs:snap?.eventTs ?? null, error:snap?.error ?? null};
+  });
+  return {timestamp:now, scanCounter:Number(scanCounter||0), lastFullScanTs:dashboardScanState.finishedAt||null, phase:dashboardScanState.phase || currentMarketPhase || 'UNKNOWN', scanning:Boolean(dashboardScanState.scanning), evaluated:Number(dashboardScanState.checked||0), signals:Number(dashboardScanState.signals||0), timeouts:Number(dashboardScanState.timeouts||0), errors:Number(dashboardScanState.errors||0), lastLiveScanCounter:Number(dashboardLastLiveScanCounter||0), rows};
+}
+
+app.get('/api/dashboard/decision-intelligence', async (req, res) => {
+  try {
+    const symbol = String(req.query.symbol || dashboardScanUniverse[0] || 'BTC-USDT').toUpperCase();
+    const events = jarvisEventBus.recent({limit:300, since:0, symbol:null, types:null}) || [];
+    const audit = dashboardDecisionTrace(symbol);
+    const perf = await dashboardPerformanceSnapshot();
+    const scanner = dashboardScannerHealth();
+    const matrix = dashboardScanUniverse.map(sym => {
+      const a = dashboardLiveAgentSnapshots.get(String(sym).toUpperCase()) || {};
+      const d = dashboardLiveDecisionSnapshots.get(String(sym).toUpperCase()) || {};
+      const m = dashboardLiveCoinSnapshots.get(String(sym).toUpperCase()) || {};
+      const r = m.risk || {};
+      return {symbol:sym, action:a.finalAction||d.action||m.gateDirection||'WAITING', confidence:Number(a.confidence||d.confidence||0), gate:m.gateStatus||'—', risk:r.allowed==null?'—':(r.allowed?'PASS':'BLOCK'), regime:m.marketPhase||'—', qValues:Array.isArray(a.dqn?.qValues)?a.dqn.qValues:[]};
+    });
+    const feedback = events.filter(e=>e.type==='RL:FEEDBACK').slice(-60).map(e=>({ts:e.ts,...(e.payload||{})}));
+    const mlHistory = events.filter(e=>/ML|MODEL|TRAIN/.test(String(e.type))).slice(-60).map(e=>({ts:e.ts,type:e.type,...(e.payload||{})}));
+    const filtered = events.slice().reverse().filter(e=>e.symbol || e.payload?.symbol).slice(0,120);
+    res.setHeader('Cache-Control','no-store');
+    res.json({timestamp:Date.now(),symbol,audit,performance:perf,scanner,matrix,learningHistory:{rlFeedback:feedback,ml:mlHistory},events:filtered,source:'PRODUCTION_EVENT_BUS'});
+  } catch (e) { logger.warn(`[Dashboard Decision Intelligence] ${e.message}`); res.status(503).json({error:'DECISION_INTELLIGENCE_UNAVAILABLE',message:e.message}); }
+});
+
 app.get('/api/dashboard/events', (req, res) => {
   const limit = Math.min(200, Math.max(1, Number(req.query.limit || 80)));
   const since = Number(req.query.since || 0);

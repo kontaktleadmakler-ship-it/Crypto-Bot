@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>JARVIS 6.16 // Neural Intelligence Command Center</title>
+<title>JARVIS 6.17 // Neural Intelligence Command Center</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Orbitron:wght@500;600;700;800&display=swap" rel="stylesheet">
@@ -54,7 +54,7 @@
 .paper-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px}.paper-card{border:1px solid #123e53;border-radius:5px;padding:6px;background:#07111b}.paper-card span{display:block;color:var(--muted);font-size:7px}.paper-card b{font-size:11px}.paper-table{width:100%;border-collapse:collapse;font-size:7px}.paper-table th,.paper-table td{padding:4px;border-bottom:1px solid #102536;text-align:left}.paper-table th{color:var(--muted);font-size:6px}.paper-scroll{max-height:145px;overflow:auto}.attr-row{padding:5px 2px;border-bottom:1px solid #102536;font-size:7px}.attr-row .reason{color:var(--muted);margin-top:2px}.attr-good{color:var(--green)}.attr-bad{color:var(--red)}
 .brain-decision-list{position:absolute;right:10px;top:32px;z-index:5;width:150px;display:grid;gap:4px;pointer-events:none}.brain-decision-item{padding:4px 6px;border:1px solid rgba(0,240,255,.16);background:rgba(4,11,18,.68);font-size:6px;color:#7899a8;backdrop-filter:blur(3px)}.brain-decision-item b{color:#d9f9ff}.brain-decision-item.good{border-color:rgba(0,255,136,.3)}.brain-decision-item.bad{border-color:rgba(255,51,102,.3)}
 
-/* JARVIS 6.16 // NEURAL CORE VISUAL OVERDRIVE */
+/* JARVIS 6.17 // NEURAL CORE VISUAL OVERDRIVE */
 .brain{perspective:1100px;cursor:pointer}
 .brain:before{content:"";position:absolute;inset:8%;border:1px solid rgba(0,240,255,.08);border-radius:50%;transform:rotateX(68deg);box-shadow:0 0 35px rgba(0,240,255,.06);pointer-events:none}
 .brain:after{content:"";position:absolute;inset:18% 30%;border-left:1px solid rgba(111,85,255,.12);border-right:1px solid rgba(0,240,255,.08);border-radius:50%;transform:rotateY(72deg);pointer-events:none}
@@ -80,6 +80,8 @@
 #authError{color:var(--red);font-size:9px;margin:-4px 0 10px;min-height:11px}
 #authBanner{display:none;position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:998;background:#2a0b13;border:1px solid var(--red);color:#ffd7de;font:10px 'JetBrains Mono';padding:6px 14px;border-radius:6px;cursor:pointer}
 #authBanner.show{display:block}
+
+.audit-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px}.audit-cell{background:#07111a;border:1px solid #102b3b;padding:4px;border-radius:4px;min-width:0}.audit-cell span{display:block;color:var(--muted);font-size:7px}.audit-cell b{display:block;margin-top:2px;font-size:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.audit-reasons{font-size:8px}.audit-reason{padding:4px 5px;margin:2px 0;border-left:2px solid var(--red);background:#120b11;color:#ffdbe1}.audit-reason.ok{border-left-color:var(--green);background:#07140f}.audit-table{font-size:7px;overflow:auto;max-height:180px}.audit-table table{width:100%;border-collapse:collapse}.audit-table th,.audit-table td{padding:3px;border-bottom:1px solid #102536;text-align:left;white-space:nowrap}.audit-table th{color:var(--muted);font-weight:500}.audit-table .good{color:var(--green)}.audit-table .bad{color:var(--red)}.audit-table .warn{color:var(--yellow)}
 </style>
 </head>
 <body>
@@ -95,7 +97,7 @@
 <div id="authBanner" onclick="showKeyModal(true)">⚠ API-KEY UNGÜLTIG ODER FEHLT — KLICKEN ZUM NEU EINGEBEN</div>
 <div class="app">
 <header class="header">
-  <div><div class="brand">◉ JARVIS <span style="color:var(--cyan)">6.15</span></div><small>NEURAL COMMAND CENTER</small></div>
+  <div><div class="brand">◉ JARVIS <span style="color:var(--cyan)">6.17</span></div><small>NEURAL COMMAND CENTER</small></div>
   <div class="center-title"><div class="coin-title">► <span id="heroSymbol">BTC-USDT</span> ◄</div><div id="heroSub" style="font-size:8px;color:var(--muted);margin-top:3px">LIVE KUCOIN FUTURES // DECISION → OUTCOME GRAPH</div></div>
   <div class="header-metrics">
     <div class="metric"><span>LIVE SYSTEM</span><b class="online"><i class="dot"></i> ONLINE</b></div>
@@ -136,13 +138,24 @@
     <section id="equityPanel" class="panel"><div class="title">REALIZED EQUITY CURVE <small>DATABASE HISTORY</small></div><div class="eq-wrap"><canvas id="equityChart"></canvas></div></section>
     <section id="routerPanel" class="panel"><div class="title">ADAPTIVE STRATEGY ROUTER <small>REGIME WEIGHTING</small></div><div id="router" class="router"></div></section>
     <section id="regimePanel" class="panel"><div class="title">REGIME INTELLIGENCE <small id="regimeDuration">LIVE</small></div><div class="route"><span>CURRENT REGIME</span><b id="regimeLarge">—</b><div id="regimeDesc" style="font-size:8px;color:var(--muted);margin-top:5px">—</div></div></section>
+    <section id="intelligencePanel" class="panel"><div class="title">DECISION INTELLIGENCE & AUDIT <small id="auditStatus">LIVE / READ-ONLY</small></div>
+      <div class="title" style="margin-top:3px">DECISION TRACE <small id="traceSymbol">SELECTED COIN</small></div><div id="decisionTrace" class="audit-grid"></div>
+      <div class="title" style="margin-top:6px">REJECT / HOLD DIAGNOSIS</div><div id="decisionReasons" class="audit-reasons"></div>
+      <div class="title" style="margin-top:6px">SCANNER HEALTH</div><div id="scannerHealth" class="audit-table"></div>
+      <div class="title" style="margin-top:6px">MULTI-COIN DECISION MATRIX</div><div id="decisionMatrix" class="audit-table"></div>
+      <div class="title" style="margin-top:6px">PERFORMANCE · PROFIT FACTOR · EXPECTANCY · DRAWDOWN</div><div id="performanceStats" class="audit-grid"></div>
+      <div class="title" style="margin-top:6px">REGIME / AGENT PERFORMANCE</div><div id="performanceBreakdown" class="audit-table"></div>
+      <div class="title" style="margin-top:6px">EVENT FILTER</div><div style="display:flex;gap:4px;margin-bottom:4px"><select id="eventTypeFilter" style="flex:1;background:#08131e;color:#d8f9ff;border:1px solid #123e53;border-radius:4px;padding:4px;font:8px 'JetBrains Mono'"><option value="">ALL TYPES</option></select><input id="eventTextFilter" placeholder="symbol / text" style="flex:1;background:#08131e;color:#d8f9ff;border:1px solid #123e53;border-radius:4px;padding:4px;font:8px 'JetBrains Mono'"></div><div id="auditEventStream" class="event-stream"></div>
+      <div class="title" style="margin-top:6px">LEARNING HISTORY</div><div id="learningHistory" class="audit-table"></div>
+      <div class="title" style="margin-top:6px">HISTORICAL DECISION REPLAY</div><div id="historicalReplay" class="audit-table"></div>
+    </section>
   </aside>
 </main>
-<footer class="footer"><span id="footerStatus">JARVIS 6.16 // LIVE MARKET DATA → NEURAL DECISION → OUTCOME FORENSICS</span><nav><button class="active" onclick="focusPanel('brainPanel')">COMMAND</button><button onclick="focusPanel('marketRows')">MARKET</button><button onclick="focusPanel('brainPanel')">NEURAL</button><button onclick="focusPanel('forensicsPanel')">FORENSICS</button><button onclick="focusPanel('outcomePanel')">OUTCOMES</button><button onclick="focusPanel('portfolioPanel')">TRADES / P&L</button><button onclick="focusPanel('healthPanel')">HEALTH</button></nav><span id="lastUpdate">—</span></footer>
+<footer class="footer"><span id="footerStatus">JARVIS 6.17 // LIVE MARKET DATA → NEURAL DECISION → OUTCOME FORENSICS</span><nav><button class="active" onclick="focusPanel('brainPanel')">COMMAND</button><button onclick="focusPanel('marketRows')">MARKET</button><button onclick="focusPanel('brainPanel')">NEURAL</button><button onclick="focusPanel('forensicsPanel')">FORENSICS</button><button onclick="focusPanel('outcomePanel')">OUTCOMES</button><button onclick="focusPanel('portfolioPanel')">TRADES / P&L</button><button onclick="focusPanel('healthPanel')">HEALTH</button></nav><span id="lastUpdate">—</span></footer>
 </div>
 <div id="neuralModal" class="neural-modal" aria-hidden="true"><div class="neural-card"><button id="neuralClose" class="neural-close">CLOSE</button><div class="title">NEURAL TRACE <small>PRODUCTION DECISION PIPELINE</small></div><div id="neuralTrace"></div></div></div>
 <script>
-const state={symbol:'',market:[],scan:null,intel:null,agents:null,portfolio:null,execution:null,connection:null,marketOverview:null,timeline:[],router:null,regime:null,events:0,liveSource:null,scanHistory:[],attribution:[]};
+const state={symbol:'',market:[],scan:null,intel:null,agents:null,portfolio:null,execution:null,connection:null,marketOverview:null,timeline:[],router:null,regime:null,events:0,liveSource:null,scanHistory:[],attribution:[],decisionIntel:null};
 let outcomeChart=null;let equityChart=null;
 let liveReloadTimer=null;
 let liveEventSource=null;
@@ -357,6 +370,22 @@ function renderPaperExecution(){
 
 
 function liveState(ageMs){if(ageMs==null)return ['OFFLINE','badge-off'];if(ageMs<=15000)return ['LIVE','badge-live'];if(ageMs<=90000)return ['STALE','badge-stale'];return ['OFFLINE','badge-off'];}
+function auditVal(v){return v==null||v===''?'—':(typeof v==='number'?n(v,3):String(v));}
+function renderDecisionIntelligence(){
+ const x=state.decisionIntel||{}; const a=x.audit||{}; const st=a.stages||{};
+ const final=st.final||{}; $('traceSymbol').textContent=state.symbol||'—'; $('auditStatus').textContent=x.source||'WAITING';
+ const cells=[['FINAL',final.action],['CONFIDENCE',final.confidence==null?'—':n(Number(final.confidence)>1?final.confidence:final.confidence*100,1)+'%'],['PRICE',st.market?.price],['RSI',st.market?.rsi],['ADX',st.market?.adx],['FLOW',st.market?.flow],['REGIME',st.market?.regime],['ML PROB.',st.ml?.probability==null?'—':n(Number(st.ml.probability)>1?st.ml.probability:Number(st.ml.probability)*100,1)+'%'],['ML ACC.',st.ml?.validationAccuracy==null?'—':n(Number(st.ml.validationAccuracy)*100,1)+'%'],['DQN',st.dqn?.action],['Q-VALUES',(st.dqn?.qValues||[]).map(v=>n(v,3)).join(' / ')||'—'],['SUPERVISOR',st.supervisor?.recommendation],['RISK',st.risk?.allowed==null?'—':(st.risk.allowed?'PASS':'BLOCK')]];
+ $('decisionTrace').innerHTML=cells.map(([k,v])=>`<div class="audit-cell"><span>${k}</span><b>${esc(auditVal(v))}</b></div>`).join('');
+ const reasons=Array.isArray(final.reasons)?final.reasons:[]; $('decisionReasons').innerHTML=reasons.length?reasons.map(r=>`<div class="audit-reason">${esc(r)}</div>`).join(''):'<div class="audit-reason ok">NO EXPLICIT VETO / REJECT REASON RECORDED</div>';
+ const sc=x.scanner||{}; $('scannerHealth').innerHTML=`<table><thead><tr><th>COIN</th><th>STATUS</th><th>AGE</th><th>LATENCY</th><th>GATE</th><th>ERROR</th></tr></thead><tbody>${(sc.rows||[]).map(r=>`<tr><td>${esc(r.symbol)}</td><td class="${r.status==='LIVE'?'good':r.status==='STALE'?'warn':'bad'}">${esc(r.status)}</td><td>${r.ageMs==null?'—':n(r.ageMs/1000,1)+'s'}</td><td>${r.latencyMs==null?'—':n(r.latencyMs,0)+'ms'}</td><td>${esc(r.gate||'—')}</td><td>${esc(r.error||'—')}</td></tr>`).join('')}</tbody></table><div style="margin-top:4px;color:var(--muted)">SCAN ${sc.scanning?'RUNNING':'IDLE'} · EVALUATED ${sc.evaluated??'—'} · SIGNALS ${sc.signals??'—'} · TIMEOUTS ${sc.timeouts??'—'} · ERRORS ${sc.errors??'—'}</div>`;
+ const matrix=x.matrix||[]; $('decisionMatrix').innerHTML=`<table><thead><tr><th>COIN</th><th>ACTION</th><th>CONF.</th><th>GATE</th><th>RISK</th><th>REGIME</th><th>Q</th></tr></thead><tbody>${matrix.map(r=>`<tr><td>${esc(r.symbol)}</td><td>${esc(r.action)}</td><td>${n(Number(r.confidence)>1?r.confidence*100:r.confidence,1)}%</td><td>${esc(r.gate)}</td><td>${esc(r.risk)}</td><td>${esc(r.regime)}</td><td>${(r.qValues||[]).map(v=>n(v,2)).join('/')||'—'}</td></tr>`).join('')}</tbody></table>`;
+ const m=x.performance?.metrics||{}; const fmt=(k,v)=>['WIN RATE','MAX DRAWDOWN'].includes(k)?(v==null?'—':n(v,2)+'%'):k==='PROFIT FACTOR'?(v===Infinity?'∞':v==null?'—':n(v,2)):(v==null?'—':'$'+n(v,2)); $('performanceStats').innerHTML=Object.entries(m).map(([k,v])=>`<div class="audit-cell"><span>${k}</span><b>${fmt(k,v)}</b></div>`).join('');
+ const reg=(x.performance?.byRegime||[]).map(r=>`<tr><td>${esc(r.regime)}</td><td>${r.trades}</td><td>${n(r.winRate,1)}%</td><td class="${r.pnl>=0?'good':'bad'}">$${n(r.pnl,2)}</td></tr>`).join(''); const ag=(x.performance?.byAgent||[]).slice(0,30).map(r=>`<tr><td>${esc(r.symbol)} / ${esc(r.direction)}</td><td>${r.signals}</td><td>${n(r.winRate,1)}%</td><td class="${r.totalPnL>=0?'good':'bad'}">$${n(r.totalPnL,2)}</td></tr>`).join(''); $('performanceBreakdown').innerHTML=`<b>REGIME</b><table><tr><th>REGIME</th><th>N</th><th>WIN%</th><th>P&L</th></tr>${reg||'<tr><td colspan="4">NO REGIME-LABELED CLOSED TRADES</td></tr>'}</table><b style="display:block;margin-top:5px">AGENT / DIRECTION</b><table><tr><th>AGENT / SIDE</th><th>N</th><th>WIN%</th><th>P&L</th></tr>${ag||'<tr><td colspan="4">NO AGENT PERFORMANCE HISTORY</td></tr>'}</table>`;
+ const ev=x.events||[]; const types=[...new Set(ev.map(e=>e.type).filter(Boolean))]; const sel=$('eventTypeFilter'); const old=sel.value; sel.innerHTML='<option value="">ALL TYPES</option>'+types.map(t=>`<option value="${esc(t)}">${esc(t)}</option>`).join(''); sel.value=types.includes(old)?old:''; const filter=()=>{const typ=sel.value,text=($('eventTextFilter').value||'').toUpperCase();const rows=ev.filter(e=>(!typ||e.type===typ)&&(!text||JSON.stringify(e).toUpperCase().includes(text))).slice(0,80);$('auditEventStream').innerHTML=rows.map(e=>`<div class="stream-row"><b>${new Date(e.ts||Date.now()).toLocaleTimeString()}</b><b>${esc(e.type)}</b><span>${esc(e.symbol||e.payload?.symbol||'SYSTEM')} · ${esc(e.payload?.finalAction||e.payload?.action||e.payload?.reason||e.payload?.status||'EVENT')}</span></div>`).join('')||'<span style="color:var(--muted)">NO MATCHING EVENTS</span>';}; if(!sel.dataset.bound){sel.addEventListener('change',filter);$('eventTextFilter').addEventListener('input',filter);sel.dataset.bound='1';} filter();
+ const rl=x.learningHistory?.rlFeedback||[], mlh=x.learningHistory?.ml||[]; $('learningHistory').innerHTML=`<table><tr><th>TIME</th><th>TYPE</th><th>DETAIL</th></tr>${[...rl.slice(-20),...mlh.slice(-20)].sort((a,b)=>b.ts-a.ts).slice(0,30).map(e=>`<tr><td>${e.ts?new Date(e.ts).toLocaleTimeString():'—'}</td><td>${esc(e.type||'RL:FEEDBACK')}</td><td>${esc(e.modelVersion||e.reason||('steps '+(e.trainingSteps??'—')))}</td></tr>`).join('')||'<tr><td colspan="3">NO LEARNING EVENTS RECORDED</td></tr>'}</table>`;
+ const replay=Array.isArray(state.scanHistory)?state.scanHistory.slice(-50).reverse():[]; $('historicalReplay').innerHTML=`<table><tr><th>TIME</th><th>COIN</th><th>TYPE</th><th>ACTION / STATUS</th></tr>${replay.map(e=>`<tr><td>${e.ts?new Date(e.ts).toLocaleTimeString():'—'}</td><td>${esc(e.symbol||'—')}</td><td>${esc(e.type||'—')}</td><td>${esc(e.payload?.finalAction||e.payload?.action||e.payload?.gateStatus||e.payload?.status||'—')}</td></tr>`).join('')||'<tr><td colspan="4">NO REPLAY EVENTS</td></tr>'}</table>`;
+}
+
 function renderIntelStrip(){
  const a=state.agents||{}, d=a.dqn||state.intel?.current?.dqn||{}, ml=state.intel?.current?.ml||{}, e=state.execution||{}, port=e.portfolio||state.portfolio?.portfolio||{}, c=state.connection||{}, q=Array.isArray(d.qValues)?d.qValues:[];
  const qbest=q.length?Math.max(...q):null; const qmin=q.length?Math.min(...q):null;
@@ -460,9 +489,10 @@ async function load(){
     api('/api/dashboard/portfolio-learning'),
     api('/api/dashboard/connection'),
     api(`/api/dashboard/attribution?symbol=${encodeURIComponent(state.symbol)}&horizon=20`),
-    api('/api/dashboard/outcome-forensics?limit=300')
+    api('/api/dashboard/outcome-forensics?limit=300'),
+    api(`/api/dashboard/decision-intelligence?symbol=${encodeURIComponent(state.symbol)}`)
   ]);
-  const [agents,intelligence,regime,router,timeline,scanHistory,execution,portfolio,connection,attribution,allOutcomes]=results;
+  const [agents,intelligence,regime,router,timeline,scanHistory,execution,portfolio,connection,attribution,allOutcomes,decisionIntel]=results;
   if(agents.status==='fulfilled' && agents.value) state.agents=agents.value;
   if(intelligence.status==='fulfilled' && intelligence.value) state.intel=intelligence.value;
   if(regime.status==='fulfilled') state.regime=regime.value;
@@ -474,6 +504,7 @@ async function load(){
   if(connection.status==='fulfilled') state.connection=connection.value;
   if(attribution.status==='fulfilled') state.attribution=attribution.value?.agents||[];
   if(allOutcomes.status==='fulfilled') state.allOutcomes=allOutcomes.value||null;
+  if(decisionIntel.status==='fulfilled') state.decisionIntel=decisionIntel.value||null;
 
   $('heroSymbol').textContent=state.symbol;$('chartSymbol').textContent=state.symbol;
   $('regime').textContent=state.regime?.currentRegime||state.regime?.phase||state.regime?.live?.phase||state.intel?.current?.marketPhase||'—';
@@ -482,18 +513,18 @@ async function load(){
   $('riskHead').className=(String($('riskHead').textContent).includes('HIGH')?'bad':String($('riskHead').textContent).includes('LOW')?'good':'warn');
   const pnl=state.execution?.performance?.totalPnL ?? state.portfolio?.portfolio?.totalPnL ?? state.portfolio?.portfolio?.dailyPnL;$('pnlHead').textContent=pnl==null?'—':'$'+n(pnl,2);$('pnlHead').className=colorClass(pnl);
   const serverTs=Number(canonical?.timestamp||state.intel?.timestamp||Date.now()); $('clock').textContent=new Date(serverTs).toLocaleTimeString(); $('learning').textContent=state.intel?.current?.ml?.validationAccuracy!=null?'LIVE':'WAITING';
-  renderAgents();renderLiveControl();renderBrain();renderIntelStrip();renderHealth();renderLearning();renderRiskGovernor();renderEventStream();renderNeuralDetail();renderScanHistory();renderForensics();renderOutcomeChart();renderRouter();renderPaperExecution();renderEquityCurve();if($('neuralModal').classList.contains('show'))renderNeuralTrace();
+  renderAgents();renderLiveControl();renderBrain();renderDecisionIntelligence();renderIntelStrip();renderHealth();renderLearning();renderRiskGovernor();renderEventStream();renderNeuralDetail();renderScanHistory();renderForensics();renderOutcomeChart();renderRouter();renderPaperExecution();renderEquityCurve();if($('neuralModal').classList.contains('show'))renderNeuralTrace();
   $('lastUpdate').textContent=new Date().toLocaleTimeString();
-  $('footerStatus').textContent=state.connection?.connected?'JARVIS 6.16 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.16 // WAITING FOR PRODUCTION SCANNER';
+  $('footerStatus').textContent=state.connection?.connected?'JARVIS 6.17 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.17 // WAITING FOR PRODUCTION SCANNER';
   $('eventCount').textContent=state.connection?.connected?'LIVE':'WAITING';
-  if(dashboardAuthFailed){$('authBanner').classList.add('show');$('footerStatus').textContent='JARVIS 6.16 // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';}else $('authBanner').classList.remove('show');
+  if(dashboardAuthFailed){$('authBanner').classList.add('show');$('footerStatus').textContent='JARVIS 6.17 // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';}else $('authBanner').classList.remove('show');
  }catch(e){
   if(e&&e.authError){
     $('authBanner').classList.add('show');
-    $('footerStatus').textContent='JARVIS 6.16 // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';
+    $('footerStatus').textContent='JARVIS 6.17 // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';
     if(!dashboardApiKey()) showKeyModal(false);
   }
-  else{$('footerStatus').textContent='JARVIS 6.16 // DATA LINK DEGRADED · '+e.message}
+  else{$('footerStatus').textContent='JARVIS 6.17 // DATA LINK DEGRADED · '+e.message}
  }
 }
 function scheduleLiveRefresh(){
@@ -511,7 +542,7 @@ function applyProductionEvent(evt){
     if(idx>=0) state.market[idx]=row; else state.market.push(row);
     state.market.sort((a,b)=>String(a.symbol).localeCompare(String(b.symbol)));
     state.liveSource='PRODUCTION_SCANNER';
-    $('footerStatus').textContent='JARVIS 6.16 // LIVE DATA LINK · PRODUCTION SCANNER';
+    $('footerStatus').textContent='JARVIS 6.17 // LIVE DATA LINK · PRODUCTION SCANNER';
     $('eventCount').textContent='LIVE';
     renderMarket();renderHeat();
     if(!state.symbol && row.symbol){state.symbol=row.symbol;}
@@ -546,7 +577,7 @@ function applyProductionEvent(evt){
    }
    if(['RISK:EVALUATED','SUPERVISOR:EVALUATED','DECISION:REPLAY','EXECUTION:STATE','COUNTERFACTUAL:EVALUATED','ROUTER:EVALUATED'].includes(evt.type)){
      $('eventCount').textContent='LIVE';
-     scheduleLiveRefresh();
+     renderDecisionIntelligence();scheduleLiveRefresh();
    }
 }
 function connectProductionStream(){
@@ -555,14 +586,14 @@ function connectProductionStream(){
     liveEventSource=new EventSource(withApiKey('/api/dashboard/events/stream'));
     liveEventSource.addEventListener('ready',()=>{
       $('eventCount').textContent='CONNECTED';
-      $('footerStatus').textContent='JARVIS 6.16 // CONNECTED · PRODUCTION EVENT BUS';
+      $('footerStatus').textContent='JARVIS 6.17 // CONNECTED · PRODUCTION EVENT BUS';
     });
     liveEventSource.addEventListener('jarvis',ev=>{
       try{applyProductionEvent(JSON.parse(ev.data));}catch(_){$('eventCount').textContent='BAD EVENT';}
     });
     liveEventSource.onerror=()=>{
       $('eventCount').textContent='RECONNECT';
-      $('footerStatus').textContent='JARVIS 6.16 // RECONNECTING · PRODUCTION EVENT BUS';
+      $('footerStatus').textContent='JARVIS 6.17 // RECONNECTING · PRODUCTION EVENT BUS';
     };
   }catch(_){$('eventCount').textContent='POLLING';}
 }
