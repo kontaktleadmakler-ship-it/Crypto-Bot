@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+const html=fs.readFileSync(path.resolve('dashboard.html'),'utf8');
+assert.match(html,/grid-template-rows:minmax\(360px,1fr\) 185px 190px minmax\(300px,auto\) 145px 135px;overflow:auto/);
+assert.match(html,/api\(`\/api\/dashboard\/intelligence\?symbol=/);
+assert.match(html,/\$\('clock'\)\.textContent=new Date\(serverTs\)\.toLocaleTimeString\(\)/);
+assert.match(html,/\$\('learning'\)\.textContent=/);
+assert.match(html,/\$\('accuracy'\)\.textContent=/);
+console.log('dashboard-functional-regression.test.js: PASS');
