@@ -7,7 +7,7 @@ const kucoin = fs.readFileSync(path.join(root, 'kucoin.js'), 'utf8');
 const srcKucoin = fs.readFileSync(path.join(root, 'src/api/kucoin.js'), 'utf8');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 
-assert.equal(pkg.version, '25.0.16');
+assert.equal(pkg.version, '25.0.17');
 assert.equal((runtime.match(/if \(isKucoinCircuitOpen\(\)\)/g) || []).length, 2);
 assert.match(runtime, /async function getMarketDataBundle\(symbol\) \{/);
 assert.doesNotMatch(runtime, /async function getMarketDataBundle\(symbol\) \{\s*if \(isKucoinCircuitOpen\(\)\) \{\s*if \(isKucoinCircuitOpen\(\)\)/);
@@ -21,7 +21,8 @@ assert.match(runtime, /MARKET_DATA_CONCURRENCY: parseInt\(process\.env\.MARKET_D
 // timeout below - just through a different config surface. Assert on the
 // real, live implementation instead of the dead v24.6 declaration.
 assert.match(runtime, /MARKET_DATA_BUNDLE_TIMEOUT_MS = Math\.min\(/);
-assert.match(runtime, /marketDataSemaphore\.acquire\(10000\)/);
+assert.match(runtime, /marketDataSemaphore\.acquire\(config\.MARKET_DATA_QUEUE_TIMEOUT_MS\)/);
+assert.match(runtime, /MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt\(process\.env\.MARKET_DATA_QUEUE_TIMEOUT_MS, 10\) \|\| 10000/);
 assert.match(runtime, /err\.code = 'MARKET_DATA_QUEUE_TIMEOUT'/);
 assert.match(runtime, /ENABLE_PRELOADING: process\.env\.ENABLE_PRELOADING === 'true'/);
 assert.match(runtime, /err\.code = 'ASYNC_POOL_ITEM_TIMEOUT'/);
