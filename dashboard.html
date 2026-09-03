@@ -369,7 +369,7 @@ function renderPaperExecution(){
 }
 
 
-function liveState(ageMs){if(ageMs==null)return ['OFFLINE','badge-off'];if(ageMs<=15000)return ['LIVE','badge-live'];if(ageMs<=90000)return ['STALE','badge-stale'];return ['OFFLINE','badge-off'];}
+function liveState(ageMs){if(ageMs==null)return ['OFFLINE','badge-off'];if(ageMs<=30000)return ['LIVE','badge-live'];if(ageMs<=900000)return ['STALE','badge-stale'];return ['OFFLINE','badge-off'];}
 function auditVal(v){return v==null||v===''?'—':(typeof v==='number'?n(v,3):String(v));}
 function renderDecisionIntelligence(){
  const x=state.decisionIntel||{}; const a=x.audit||{}; const st=a.stages||{};
@@ -393,7 +393,7 @@ function renderIntelStrip(){
  $('intelStrip').innerHTML=items.map(([k,v])=>`<div class="intel-card"><span>${k}</span><b>${esc(v)}</b></div>`).join('');
 }
 function renderHealth(){
- const c=state.connection||{}, h=state.systemHealth||{}, r=state.readiness||{}, checks=r.checks||{}, [feed,feedCls]=liveState(c.ageMs);
+ const c=state.connection||{}, h=state.systemHealth||{}, r=state.readiness||{}, checks=r.checks||{}, [feed,feedCls]=h.marketFeedStatus ? [h.marketFeedStatus, h.marketFeedStatus==='LIVE'?'badge-live':h.marketFeedStatus==='STALE'?'badge-stale':'badge-off'] : liveState(c.ageMs);
  const items=[['MARKET FEED',feed,feedCls],['DATABASE',h.dbConnected?'CONNECTED':'DEGRADED',h.dbConnected?'good':'bad'],['EVENT BUS',c.connected?'CONNECTED':'WAITING',c.connected?'good':'warn'],['SCANNER',state.scan?.evaluated??state.scan?.scanned??'—',''],['KUCOIN ERRORS',h.kucoinErrorCount??0,Number(h.kucoinErrorCount||0)>0?'warn':'good'],['API BLOCKED',h.kucoinBlockedRequests??0,Number(h.kucoinBlockedRequests||0)>0?'warn':'good'],['CIRCUIT BREAKER',h.circuitBreakerOpen?('OPEN '+Math.ceil((Number(h.circuitBreakerRemainingMs||0))/1000)+'s'):'CLEAR',h.circuitBreakerOpen?'bad':'good'],['PAUSED',h.paused?'YES':'NO',h.paused?'bad':'good'],['READINESS',r.ready?'READY':'NOT READY',r.ready?'good':'warn'],['RECONCILIATION',checks.reconciliationHealthy?'PASS':'FAIL',checks.reconciliationHealthy?'good':'bad'],['OOS',checks.oosValidated?'PASS':'CHECK',checks.oosValidated?'good':'warn']];
  $('healthGrid').innerHTML=items.map(([k,v,cl])=>`<div class="health-item"><span>${k}</span><b class="${cl}">${esc(v)}</b></div>`).join('');$('healthStatus').innerHTML=`<span class="${feedCls}">${feed}</span>`;
 }

@@ -6176,6 +6176,13 @@ function dashboardCanonicalState(symbol = null) {
   const agent = key ? (dashboardLiveAgentSnapshots.get(key) || null) : (market ? dashboardLiveAgentSnapshots.get(market.symbol) : null);
   const decision = key ? (dashboardLiveDecisionSnapshots.get(key) || null) : (agent ? dashboardLiveDecisionSnapshots.get(agent.symbol) : null);
   const ageMs = market ? Math.max(0, Date.now() - Number(market.eventTs || 0)) : null;
+  // Dashboard health follows the production scanner cadence. The scanner runs
+  // every few minutes, so treating a >15s snapshot as OFFLINE creates a false
+  // outage between healthy scans. OFFLINE means no feed for 15 minutes (or no
+  // snapshot at all); a recent but not actively updating snapshot is STALE.
+  const marketFeedStatus = market && ageMs !== null
+    ? (ageMs <= 30000 ? 'LIVE' : ageMs <= 900000 ? 'STALE' : 'OFFLINE')
+    : 'OFFLINE';
   return {
     ok: Boolean(market || agent || decision),
     source: 'PRODUCTION_SCANNER_SNAPSHOT',
@@ -6186,7 +6193,7 @@ function dashboardCanonicalState(symbol = null) {
     agents: agent,
     decision,
     scan: { ...dashboardScanState, universe: dashboardScanUniverse, lastLiveScanCounter: dashboardLastLiveScanCounter },
-    connection: { connected: Boolean(market && ageMs !== null && ageMs <= 30000), ageMs },
+    connection: { connected: Boolean(market && ageMs !== null && ageMs <= 900000 && !isKucoinCircuitOpen()), ageMs },
     nodes: Array.isArray(agent?.nodes) ? agent.nodes : [],
     dqn: agent?.dqn || null,
     ml: (()=>{ try { return { ...mlModel.getStats(), validationAccuracy: Number(mlModel.getStats().validationAccuracy || 0) }; } catch (_) { return null; } })(),
@@ -6194,6 +6201,8 @@ function dashboardCanonicalState(symbol = null) {
     finalAction: agent?.finalAction || decision?.action || 'WAITING',
     readiness: dashboardReadinessSnapshot(),
     systemHealth: {
+      marketFeedStatus,
+      marketFeedAgeMs: ageMs,
       dbConnected: Boolean(isDbConnected),
       paused: Boolean(isPaused),
       shuttingDown: Boolean(isShuttingDown),
