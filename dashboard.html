@@ -31,6 +31,19 @@
 .brain-chip{position:absolute;z-index:5;left:50%;top:50%;transform:translate(-50%,-50%);padding:5px 9px;border:1px solid rgba(0,240,255,.35);background:rgba(3,12,20,.68);backdrop-filter:blur(3px);font:700 8px Orbitron;color:var(--cyan);letter-spacing:2px;text-shadow:0 0 9px rgba(0,240,255,.8);box-shadow:0 0 22px rgba(0,240,255,.12)}
 .paper-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px}.paper-card{border:1px solid #123e53;border-radius:5px;padding:6px;background:#07111b}.paper-card span{display:block;color:var(--muted);font-size:7px}.paper-card b{font-size:11px}.paper-table{width:100%;border-collapse:collapse;font-size:7px}.paper-table th,.paper-table td{padding:4px;border-bottom:1px solid #102536;text-align:left}.paper-table th{color:var(--muted);font-size:6px}.paper-scroll{max-height:145px;overflow:auto}.attr-row{padding:5px 2px;border-bottom:1px solid #102536;font-size:7px}.attr-row .reason{color:var(--muted);margin-top:2px}.attr-good{color:var(--green)}.attr-bad{color:var(--red)}
 .brain-decision-list{position:absolute;right:10px;top:32px;z-index:5;width:150px;display:grid;gap:4px;pointer-events:none}.brain-decision-item{padding:4px 6px;border:1px solid rgba(0,240,255,.16);background:rgba(4,11,18,.68);font-size:6px;color:#7899a8;backdrop-filter:blur(3px)}.brain-decision-item b{color:#d9f9ff}.brain-decision-item.good{border-color:rgba(0,255,136,.3)}.brain-decision-item.bad{border-color:rgba(255,51,102,.3)}
+
+/* JARVIS 6.16 // NEURAL CORE VISUAL OVERDRIVE */
+.brain{perspective:1100px;cursor:pointer}
+.brain:before{content:"";position:absolute;inset:8%;border:1px solid rgba(0,240,255,.08);border-radius:50%;transform:rotateX(68deg);box-shadow:0 0 35px rgba(0,240,255,.06);pointer-events:none}
+.brain:after{content:"";position:absolute;inset:18% 30%;border-left:1px solid rgba(111,85,255,.12);border-right:1px solid rgba(0,240,255,.08);border-radius:50%;transform:rotateY(72deg);pointer-events:none}
+.brain-hud{z-index:6}
+.brain-chip{z-index:7;animation:neuralPulse 1.8s ease-in-out infinite}
+@keyframes neuralPulse{50%{box-shadow:0 0 35px rgba(0,240,255,.35),inset 0 0 14px rgba(0,240,255,.08);transform:translate(-50%,-50%) scale(1.03)}}
+.brain-layer-label{position:absolute;z-index:6;pointer-events:none;padding:3px 5px;border:1px solid rgba(0,240,255,.12);background:rgba(3,12,20,.5);font:6px 'JetBrains Mono';color:#5e899b;letter-spacing:1px}
+.brain-layer-label.input{left:12px;top:43%;}.brain-layer-label.hidden{left:50%;top:18%;transform:translateX(-50%)}.brain-layer-label.output{right:12px;top:43%;color:#7db6a5}
+.neural-synapse-legend{position:absolute;left:10px;bottom:28px;z-index:6;display:flex;gap:8px;font:6px 'JetBrains Mono';color:#62899a}.neural-synapse-legend i{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:3px;box-shadow:0 0 6px currentColor}
+.neural-kpi{position:absolute;right:10px;bottom:28px;z-index:6;font:6px 'JetBrains Mono';color:#648b9c;text-align:right}.neural-kpi b{color:#d8f9ff}
+
 /* DASHBOARD-AUTH-FIX: inline key gate (replaces window.prompt, which many
    in-app/embedded browsers silently block, and an explicit auth-error
    banner so a bad/missing key doesn't just look like "no data yet"). */
@@ -85,7 +98,7 @@
       </div>
       <div class="brain" id="brain" title="Klicken für Neural Trace"></div><button id="neuralTraceBtn" class="trace-btn" type="button">OPEN NEURAL TRACE / DECISION PIPELINE</button>
     </section>
-    <section id="outcomePanel" class="panel outcome-panel"><div class="chartwrap"><div class="title">DECISION OUTCOME DEVELOPMENT <small id="chartSymbol">BTC-USDT</small></div><canvas id="outcomeChart"></canvas></div><div><div class="title">OUTCOME FORENSICS <small>OBSERVED</small></div><div class="outcome-stats" id="outcomeStats"></div></div></section>
+    <section id="outcomePanel" class="panel outcome-panel"><div class="chartwrap"><div class="title">DECISION OUTCOME DEVELOPMENT <small id="chartSymbol">SELECTED COIN</small></div><canvas id="outcomeChart"></canvas></div><div><div class="title">OUTCOME FORENSICS <small id="outcomeCoverage">ALL COINS</small></div><div class="outcome-stats" id="outcomeStats"></div></div></section>
   </section>
 
   <aside class="right">
@@ -101,7 +114,7 @@
 </div>
 <div id="neuralModal" class="neural-modal" aria-hidden="true"><div class="neural-card"><button id="neuralClose" class="neural-close">CLOSE</button><div class="title">NEURAL TRACE <small>PRODUCTION DECISION PIPELINE</small></div><div id="neuralTrace"></div></div></div>
 <script>
-const state={symbol:'BTC-USDT',market:[],scan:null,intel:null,agents:null,portfolio:null,execution:null,connection:null,marketOverview:null,timeline:[],router:null,regime:null,events:0,liveSource:null,scanHistory:[],attribution:[]};
+const state={symbol:'',market:[],scan:null,intel:null,agents:null,portfolio:null,execution:null,connection:null,marketOverview:null,timeline:[],router:null,regime:null,events:0,liveSource:null,scanHistory:[],attribution:[]};
 let outcomeChart=null;
 let liveReloadTimer=null;
 let liveEventSource=null;
@@ -182,23 +195,25 @@ function renderBrain(){
   const marketRow=state.market.find(x=>String(x.symbol).toUpperCase()===String(state.symbol).toUpperCase())||state.market[0]||{};
   const a=state.agents||{};
   const d=a.decision||cur.decision||{};
-  const action=String(a.finalAction||d.action||state.market.find(x=>x.symbol===state.symbol)?.gateDirection||'WAITING').toUpperCase();
+  const action=String(a.finalAction||d.action||marketRow.gateDirection||'WAITING').toUpperCase();
   const nodes=Array.isArray(a.nodes)?a.nodes:[];
   const confidence=Number(a.confidence??d.confidence??0);
   const t=Array.isArray(state.timeline)?state.timeline:[];
   const localEvents=state.scanHistory.filter(x=>String(x.symbol||'').toUpperCase()===String(state.symbol).toUpperCase());
   const timeline=(t.length?t:localEvents.map(x=>({action:x.payload?.gateDirection||x.payload?.action||'SCAN',confidence:x.payload?.confidence||0,scanTs:x.ts,outcomeQuality:'PENDING'})));
-  brain3dData={symbol:state.symbol||marketRow.symbol||'—',action,confidence,regime:state.regime?.currentRegime||cur.marketPhase||marketRow.marketPhase||'—',timeline:timeline.slice(-12),inputs:{PRICE:marketRow.price,RSI:marketRow.rsi,ADX:marketRow.adx,OI:marketRow.openInterest,FUNDING:marketRow.fundingRate,VOLUME:marketRow.volume24h}};
+  brain3dData={symbol:state.symbol||marketRow.symbol||'—',action,confidence,regime:state.regime?.currentRegime||cur.marketPhase||marketRow.marketPhase||'—',timeline:timeline.slice(-16),inputs:{PRICE:marketRow.price,RSI:marketRow.rsi,ADX:marketRow.adx,OI:marketRow.openInterest,FUNDING:marketRow.fundingRate,VOLUME:marketRow.volume24h}};
   const brain=$('brain');
-  if(!brain3dStarted){brain.innerHTML='<canvas id="brain3dCanvas"></canvas><div class="brain-scan"></div><div class="brain-vignette"></div><div class="brain-chip">NEURAL CORE // LIVE</div><div class="brain-hud"><div class="tl">ORIGIN <strong id="brainOrigin">LIVE SCAN</strong></div><div class="tr">REGIME <strong id="brainRegime">—</strong><br>CONFIDENCE <strong id="brainConfidence">—</strong></div><div class="bl">GRAPH <strong id="brainGraph">3D / DECISION LINKED</strong></div><div class="br">OUTCOME <strong id="brainOutcome">PENDING</strong></div></div><div class="brain-decision-list" id="brainDecisionList"></div>';
+  if(!brain3dStarted){
+    brain.innerHTML='<canvas id="brain3dCanvas"></canvas><div class="brain-scan"></div><div class="brain-vignette"></div><div class="brain-chip">NEURAL CORE // LIVE</div><div class="brain-layer-label input">INPUT LAYER · MARKET</div><div class="brain-layer-label hidden">HIDDEN LAYERS · AGENTS / ML / DQN</div><div class="brain-layer-label output">OUTPUT LAYER · DECISION</div><div class="neural-synapse-legend"><span><i style="color:#00f0ff"></i>ACTIVE SYNAPSE</span><span><i style="color:#00ff88"></i>POSITIVE</span><span><i style="color:#ff3366"></i>VETO / LOSS</span></div><div class="neural-kpi">SIGNAL <b id="brainSignal">WAITING</b><br>LATENCY <b id="brainLatency">—</b></div><div class="brain-hud"><div class="tl">ORIGIN <strong id="brainOrigin">LIVE SCAN</strong></div><div class="tr">REGIME <strong id="brainRegime">—</strong><br>CONFIDENCE <strong id="brainConfidence">—</strong></div><div class="bl">GRAPH <strong id="brainGraph">3D / SYNAPTIC</strong></div><div class="br">OUTCOME <strong id="brainOutcome">PENDING</strong></div></div><div class="brain-decision-list" id="brainDecisionList"></div>';
     brain3dStarted=true; startBrain3D();
   }
   $('brainRegime').textContent=brain3dData.regime;
   $('brainConfidence').textContent=confidence>1?n(confidence,1)+'%':n(confidence*100,1)+'%';
+  $('brainSignal').textContent=action;
   const latest=brain3dData.timeline.at(-1)||{}; const oq=latest.outcomeQuality||'PENDING';
   const bo=$('brainOutcome');bo.textContent=oq;bo.className=oq==='POSITIVE'?'greentxt':oq==='NEGATIVE'?'redtxt':'goldtxt';
   const list=$('brainDecisionList');
-  if(list) list.innerHTML=nodes.slice(0,8).map(x=>{const sc=Number(x.score||x.confidence||0);const pctv=sc<=1?sc*100:sc;const st=x.status||x.decision||'WAITING';const bad=/VETO|BLOCK/i.test(st);return `<div class="brain-decision-item ${bad?'bad':'good'}"><b>${esc(x.label||x.name||x.id||'AGENT')}</b> · ${n(pctv,0)}% · ${esc(st)}<br>${esc(x.decision||'LIVE')} · ${new Date(a.eventTs||Date.now()).toLocaleTimeString()}</div>`}).join('')||'<div class="brain-decision-item">WAITING FOR PRODUCTION AGENT EVENT</div>';
+  if(list) list.innerHTML=nodes.slice(0,8).map((x,i)=>{const sc=Number(x.score||x.confidence||0);const pctv=sc<=1?sc*100:sc;const st=x.status||x.decision||'WAITING';const bad=/VETO|BLOCK/i.test(st);return `<div class="brain-decision-item ${bad?'bad':'good'}"><b>${esc(x.label||x.name||x.id||'AGENT')}</b> · ${n(pctv,0)}% · ${esc(st)}<br>NEURON ${i+1} · ${new Date(a.eventTs||Date.now()).toLocaleTimeString()}</div>`}).join('')||'<div class="brain-decision-item">WAITING FOR PRODUCTION AGENT EVENT</div>';
   $('nodes').textContent=nodes.length||'—';
   $('connections').textContent=nodes.length?Math.max(0,nodes.length-1)+Math.max(0,nodes.length-2):'—';
   $('decisions').textContent=state.scanHistory.filter(x=>/SIGNAL:GENERATED|AGENTS:EVALUATED|SCAN:COIN/.test(x.type||'')).length||timeline.length||'—';
@@ -207,68 +222,66 @@ function renderBrain(){
 function startBrain3D(){
   const canvas=$('brain3dCanvas');if(!canvas)return;
   const ctx=canvas.getContext('2d');
-  let W=0,H=0,dpr=1,t0=performance.now(),particles=[],links=[],brainPts=[];
+  let W=0,H=0,dpr=1,t0=performance.now(),brainPts=[],links=[],orbitX=-.12,orbitY=.08,drag=false,lx=0,ly=0,zoom=1;
+  const palette={cyan:'#00f0ff',violet:'#8d6bff',green:'#00ff88',red:'#ff3366',gold:'#ffd166',ink:'rgba(3,12,20,.94)'};
   const resize=()=>{const r=canvas.getBoundingClientRect();dpr=Math.min(2,window.devicePixelRatio||1);W=Math.max(320,r.width);H=Math.max(220,r.height);canvas.width=Math.round(W*dpr);canvas.height=Math.round(H*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);buildBrain();};
   function buildBrain(){
-    brainPts=[];links=[];particles=[];
-    const n=150;
-    for(let i=0;i<n;i++){
-      const u=i/(n-1), theta=u*Math.PI*2*5.3, phi=Math.acos(1-2*((i%37)+.5)/37);
-      const hemi=i%2===0?-1:1;
-      const x=hemi*(82+26*Math.abs(Math.sin(theta*1.7)))*Math.sin(phi)*Math.cos(theta);
-      const y=118*Math.cos(phi)*(.82+.16*Math.sin(theta*2.1)**2);
-      const z=hemi*32*Math.sin(phi)*Math.sin(theta);
-      brainPts.push({x,y,z,seed:Math.random(),hemi});
+    brainPts=[];links=[];
+    const N=260;
+    for(let i=0;i<N;i++){
+      const side=i%2?-1:1, a=(i*2.39996)%Math.PI*2, v=((i*0.618033)%1)*2-1;
+      const rr=Math.sqrt(Math.max(0,1-v*v)), x=(82+54*Math.sin(a*2.1)**2)*rr*Math.cos(a), y=v*112*(.86+.12*Math.cos(a*2)), z=(54+35*Math.sin(a*1.7)**2)*rr*Math.sin(a);
+      const fold=8*Math.sin(a*7.0+v*5.0); brainPts.push({x:side*(x+fold),y,z:side*z*.92,side,seed:Math.random(),phase:Math.random()*6.28,activity:.25+Math.random()*.75});
     }
-    for(let i=0;i<brainPts.length;i++){
-      let nearest=[];
-      for(let j=0;j<brainPts.length;j++)if(i!==j){const a=brainPts[i],b=brainPts[j];const dx=a.x-b.x,dy=a.y-b.y,dz=a.z-b.z;nearest.push([dx*dx+dy*dy+dz*dz,j]);}
-      nearest.sort((a,b)=>a[0]-b[0]);for(let k=0;k<2;k++){const j=nearest[k][1];if(i<j)links.push([i,j]);}
+    for(let i=0;i<N;i++){
+      const near=[];for(let j=0;j<N;j++)if(i!==j){const a=brainPts[i],b=brainPts[j],dx=a.x-b.x,dy=a.y-b.y,dz=a.z-b.z;near.push([dx*dx+dy*dy+dz*dz,j]);}
+      near.sort((a,b)=>a[0]-b[0]);for(let k=0;k<3;k++){const j=near[k][1];if(i<j)links.push([i,j]);}
     }
   }
-  function project(p,rot){
-    let x=p.x*Math.cos(rot)-p.z*Math.sin(rot);let z=p.x*Math.sin(rot)+p.z*Math.cos(rot);
-    const yaw=.28;const x2=x*Math.cos(yaw)-z*Math.sin(yaw);z=x*Math.sin(yaw)+z*Math.cos(yaw);
-    const depth=1/(1+(z+70)/430);return {x:W/2+x2*1.55,y:H/2+p.y*0.88,scale:.72+depth*.52,z,depth};
+  function rot3(p,t){
+    let x=p.x,z=p.z,y=p.y;
+    const cy=Math.cos(t.yaw),sy=Math.sin(t.yaw),cx=Math.cos(t.pitch),sx=Math.sin(t.pitch);
+    let x1=x*cy-z*sy,z1=x*sy+z*cy;let y1=y*cx-z1*sx,z2=y*sx+z1*cx;
+    return{x:x1,y:y1,z:z2};
   }
-  function brainShape(rot){
-    const pts=[];for(let i=0;i<80;i++){const a=(i/79)*Math.PI*2;const l=project({x:-155*Math.cos(a)*(.86+.08*Math.sin(a*3)**2),y:145*Math.sin(a),z:22*Math.sin(a*2)},rot);const rr=project({x:155*Math.cos(a)*(.86+.08*Math.sin(a*3)**2),y:145*Math.sin(a),z:22*Math.sin(a*2)},rot);pts.push([l,rr]);}
-    ctx.save();ctx.beginPath();pts.forEach((p,i)=>{if(i===0)ctx.moveTo(p[0].x,p[0].y);else ctx.lineTo(p[0].x,p[0].y)});pts.forEach((p,i)=>{const q=pts[pts.length-1-i][1];ctx.lineTo(q.x,q.y)});ctx.closePath();ctx.fillStyle='rgba(2,17,29,.62)';ctx.shadowBlur=32;ctx.shadowColor='rgba(0,240,255,.22)';ctx.fill();ctx.shadowBlur=0;ctx.strokeStyle='rgba(0,240,255,.28)';ctx.lineWidth=1.2;ctx.stroke();ctx.restore();
-    ctx.save();ctx.setLineDash([2,5]);ctx.strokeStyle='rgba(111,85,255,.28)';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(W/2,H/2-128);ctx.bezierCurveTo(W/2-20,H/2-45,W/2+20,H/2+45,W/2,H/2+128);ctx.stroke();ctx.restore();
+  function project(p,t){const q=rot3(p,t), focal=430*zoom, depth=Math.max(180,focal+q.z), sc=focal/depth;return{x:W/2+q.x*sc,y:H/2+q.y*sc,scale:sc,z:q.z};}
+  function layerNodes(now){
+    const cx=W/2,cy=H/2, cols=4, rows=7, layers=[];
+    for(let l=0;l<cols;l++){const arr=[];for(let r=0;r<rows;r++){
+      const xx=(l-1.5)*82, yy=(r-3)*30, zz=Math.sin((r+l)*1.7)*52 + (l-1.5)*18;
+      arr.push(project({x:xx,y:yy,z:zz},{yaw:orbitY+Math.sin(now*.00025)*.22,pitch:orbitX+Math.cos(now*.0002)*.08}));
+    }layers.push(arr);}
+    return layers;
   }
-  function chain(){
-    const cx=W/2,cy=H/2;
-    const latest=brain3dData.timeline[brain3dData.timeline.length-1]||{};
-    const reaction=latest.outcomes?.plus10Scan?.directedReactionPct;
-    const decision={x:cx,y:cy};
-    const src=[-220,-145,-72,72,145,220].map((x,i)=>({x:cx+x,y:cy+(i-2.5)*30}));
-    const outs=[-120,-40,40,120].map(y=>({x:cx+245,y:cy+y}));
-    const col=brain3dData.action.includes('BUY')||brain3dData.action.includes('LONG')?'#00ff88':brain3dData.action.includes('SELL')||brain3dData.action.includes('SHORT')?'#ffd700':'#ff3366';
-    ctx.save();ctx.lineWidth=1;
-    src.forEach((p,i)=>{ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.bezierCurveTo(p.x+55,p.y,(cx-80),cy+(i-2.5)*16,cx,cy);ctx.strokeStyle='rgba(0,240,255,.22)';ctx.stroke();});
-    outs.forEach((p,i)=>{ctx.beginPath();ctx.moveTo(cx,cy);ctx.bezierCurveTo(cx+65,cy,(p.x-70),p.y,p.x,p.y);const v=[latest.outcomes?.plus1Scan?.directedReactionPct,latest.outcomes?.plus3Scan?.directedReactionPct,latest.outcomes?.plus5Scan?.directedReactionPct,latest.outcomes?.plus10Scan?.directedReactionPct][i];ctx.strokeStyle=v==null?'rgba(255,215,0,.25)':Number(v)>=0?'rgba(0,255,136,.6)':'rgba(255,51,102,.65)';ctx.setLineDash([4,5]);ctx.stroke();ctx.setLineDash([]);});
-    // decision core
-    ctx.beginPath();ctx.arc(cx,cy,34,0,Math.PI*2);ctx.fillStyle='rgba(3,31,29,.92)';ctx.fill();ctx.shadowBlur=22;ctx.shadowColor=col;ctx.strokeStyle=col;ctx.lineWidth=2;ctx.stroke();ctx.shadowBlur=0;
-    ctx.fillStyle='#d8f9ff';ctx.textAlign='center';ctx.font='700 9px Orbitron';ctx.fillText(brain3dData.action,cx,cy-3);ctx.font='700 7px JetBrains Mono';ctx.fillStyle=col;ctx.fillText(n(brain3dData.confidence,0)+'%',cx,cy+11);
-    src.forEach((p,i)=>{ctx.beginPath();ctx.arc(p.x,p.y,5+(i%2),0,Math.PI*2);ctx.fillStyle='rgba(0,240,255,.14)';ctx.fill();ctx.strokeStyle='rgba(0,240,255,.65)';ctx.stroke();});
-    outs.forEach((p,i)=>{const v=[latest.outcomes?.plus1Scan?.directedReactionPct,latest.outcomes?.plus3Scan?.directedReactionPct,latest.outcomes?.plus5Scan?.directedReactionPct,latest.outcomes?.plus10Scan?.directedReactionPct][i];ctx.beginPath();ctx.arc(p.x,p.y,7,0,Math.PI*2);ctx.fillStyle=v==null?'rgba(255,215,0,.12)':Number(v)>=0?'rgba(0,255,136,.16)':'rgba(255,51,102,.16)';ctx.fill();ctx.strokeStyle=v==null?'#ffd700':Number(v)>=0?'#00ff88':'#ff3366';ctx.shadowBlur=12;ctx.shadowColor=ctx.strokeStyle;ctx.stroke();ctx.shadowBlur=0;ctx.fillStyle='#9bb9c7';ctx.font='7px JetBrains Mono';ctx.textAlign='left';ctx.fillText(['+1','+3','+5','+10'][i],p.x+11,p.y+3);});
-    ctx.restore();
+  function drawNetwork(now,active){
+    const layers=layerNodes(now);ctx.save();
+    for(let l=0;l<layers.length-1;l++)for(let i=0;i<layers[l].length;i++)for(let j=0;j<layers[l+1].length;j++){
+      if((i*5+j+l)%3!==0)continue;const a=layers[l][i],b=layers[l+1][j];ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.strokeStyle=l===2?`rgba(0,255,136,${.12+a.scale*.06})`:`rgba(0,190,235,${.07+a.scale*.06})`;ctx.lineWidth=.55;ctx.stroke();
+      const phase=(now/900+(i+j+l)*.071)%1;if(phase<.42){const tt=phase/.42,x=a.x+(b.x-a.x)*tt,y=a.y+(b.y-a.y)*tt;ctx.beginPath();ctx.arc(x,y,1.8+a.scale,0,Math.PI*2);ctx.fillStyle=active;ctx.shadowBlur=12;ctx.shadowColor=active;ctx.fill();ctx.shadowBlur=0;}
+    }
+    layers.flat().forEach((p,i)=>{const pulse=1+Math.sin(now*.004+i)*.35;ctx.beginPath();ctx.arc(p.x,p.y,(2.4+p.scale*2)*pulse,0,Math.PI*2);ctx.fillStyle=palette.ink;ctx.fill();ctx.strokeStyle=i>20?palette.violet:palette.cyan;ctx.lineWidth=.8;ctx.shadowBlur=7;ctx.shadowColor=ctx.strokeStyle;ctx.stroke();ctx.shadowBlur=0;});
+    const out=layers.at(-1);['BUY','HOLD','SELL','RISK'].forEach((label,i)=>{const p=out[i];if(!p)return;ctx.font='7px JetBrains Mono';ctx.fillStyle=label==='BUY'?palette.green:label==='SELL'?palette.red:palette.cyan;ctx.fillText(label,p.x+10,p.y+3);});ctx.restore();
   }
   function frame(now){
-    ctx.clearRect(0,0,W,H);const rot=(now-t0)*0.00022;const g=ctx.createRadialGradient(W/2,H/2,10,W/2,H/2,Math.max(W,H)*.58);g.addColorStop(0,'rgba(0,240,255,.055)');g.addColorStop(1,'rgba(0,0,0,.02)');ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
-    brainShape(rot);
-    const projected=brainPts.map((p,i)=>({p, q:project(p,rot),i}));
-    projected.sort((a,b)=>a.q.z-b.q.z);
-    ctx.save();
-    links.forEach(([a,b])=>{const pa=project(brainPts[a],rot),pb=project(brainPts[b],rot);ctx.beginPath();ctx.moveTo(pa.x,pa.y);ctx.lineTo(pb.x,pb.y);ctx.strokeStyle=`rgba(0,180,230,${.08+Math.max(0,pa.depth)*.12})`;ctx.lineWidth=.65;ctx.stroke();});
-    projected.forEach(o=>{const s=o.q.scale;ctx.beginPath();ctx.arc(o.q.x,o.q.y,1.2*s+o.p.seed*1.2,0,Math.PI*2);const hemi=o.p.hemi>0?'0,240,255':'111,85,255';ctx.fillStyle=`rgba(${hemi},${.35+o.q.depth*.5})`;ctx.shadowBlur=4;ctx.shadowColor=`rgba(${hemi},.65)`;ctx.fill();});ctx.restore();
-    chain();
+    ctx.clearRect(0,0,W,H);const bg=ctx.createRadialGradient(W/2,H/2,10,W/2,H/2,Math.max(W,H)*.7);bg.addColorStop(0,'rgba(0,240,255,.09)');bg.addColorStop(.55,'rgba(38,35,100,.045)');bg.addColorStop(1,'rgba(0,0,0,0)');ctx.fillStyle=bg;ctx.fillRect(0,0,W,H);
+    const autoYaw=(now-t0)*.00022;const t={yaw:orbitY+autoYaw,pitch:orbitX};const action=String(brain3dData.action||'').toUpperCase();const active=/SHORT|SELL/.test(action)?palette.red:/LONG|BUY/.test(action)?palette.green:palette.cyan;
+    const projected=brainPts.map((p,i)=>({p,q:project(p,t),i})).sort((a,b)=>a.q.z-b.q.z);
+    ctx.save();links.forEach(([a,b],idx)=>{const pa=project(brainPts[a],t),pb=project(brainPts[b],t);ctx.beginPath();ctx.moveTo(pa.x,pa.y);ctx.lineTo(pb.x,pb.y);const activity=.04+(.11*brainPts[a].activity);ctx.strokeStyle=idx%11===0?active.replace(')',','):`rgba(0,190,235,${activity})`;ctx.strokeStyle=idx%17===0?active:`rgba(0,190,235,${activity})`;ctx.lineWidth=.35+.55*Math.max(pa.scale,pb.scale);ctx.stroke();if(idx%23===0){const tt=(now/1600+idx*.037)%1,x=pa.x+(pb.x-pa.x)*tt,y=pa.y+(pb.y-pa.y)*tt;ctx.beginPath();ctx.arc(x,y,1.25,0,Math.PI*2);ctx.fillStyle=active;ctx.shadowBlur=10;ctx.shadowColor=active;ctx.fill();ctx.shadowBlur=0;}});
+    projected.forEach(o=>{const r=(.75+o.p.seed*1.7)*o.q.scale*(1+.28*Math.sin(now*.003+o.p.phase));ctx.beginPath();ctx.arc(o.q.x,o.q.y,r,0,Math.PI*2);const c=o.p.side>0?'0,240,255':'141,107,255';ctx.fillStyle=`rgba(${c},${.22+o.q.scale*.55})`;ctx.shadowBlur=5;o.q.z>0?ctx.shadowColor='rgba(0,240,255,.45)':ctx.shadowColor='rgba(141,107,255,.35)';ctx.fill();});ctx.restore();
+    // Deep 3D hemispheric rings / synaptic shell
+    ctx.save();for(let ring=0;ring<5;ring++){ctx.beginPath();for(let k=0;k<=90;k++){const a=k/90*Math.PI*2;const p=project({x:(150+ring*11)*Math.cos(a),y:(78+ring*7)*Math.sin(a),z:18*Math.sin(a*2+ring)},t);k?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y);}ctx.strokeStyle=`rgba(0,240,255,${.05+ring*.012})`;ctx.lineWidth=1;ctx.stroke();}ctx.restore();
+    drawNetwork(now,active);
+    const latest=brain3dData.timeline.at(-1)||{};const vals=[latest.outcomes?.plus1Scan?.directedReactionPct,latest.outcomes?.plus3Scan?.directedReactionPct,latest.outcomes?.plus5Scan?.directedReactionPct,latest.outcomes?.plus10Scan?.directedReactionPct];ctx.save();ctx.font='7px JetBrains Mono';ctx.fillStyle='#6f91a4';ctx.fillText('OBSERVED FUTURE PATH',14,18);vals.forEach((v,i)=>{const x=18+i*62,y=32;ctx.beginPath();ctx.arc(x,y,4,0,Math.PI*2);ctx.strokeStyle=v==null?palette.gold:Number(v)>=0?palette.green:palette.red;ctx.stroke();ctx.fillStyle=ctx.strokeStyle;ctx.fillText(['+1','+3','+5','+10'][i],x+9,y+3);});ctx.fillStyle='#5f8393';ctx.fillText('DRAG TO ORBIT · WHEEL TO ZOOM',14,H-12);ctx.restore();
     requestAnimationFrame(frame);
   }
+  canvas.addEventListener('pointerdown',e=>{drag=true;lx=e.clientX;ly=e.clientY;canvas.setPointerCapture?.(e.pointerId);});
+  canvas.addEventListener('pointermove',e=>{if(!drag)return;orbitY+=(e.clientX-lx)*.006;orbitX+=(e.clientY-ly)*.004;orbitX=Math.max(-1.1,Math.min(1.1,orbitX));lx=e.clientX;ly=e.clientY;});
+  canvas.addEventListener('pointerup',()=>drag=false);canvas.addEventListener('pointercancel',()=>drag=false);
+  canvas.addEventListener('wheel',e=>{e.preventDefault();zoom*=e.deltaY<0?1.08:.93;zoom=Math.max(.72,Math.min(1.65,zoom));},{passive:false});
   window.addEventListener('resize',resize);resize();requestAnimationFrame(frame);
 }
 
-function renderForensics(){const t=state.timeline||[];const s=state.intel?.current||{};const summary=state.timelineSummary||{};$('forensicSummary').innerHTML=[['SCANS',summary.scans||t.length],['DECISIONS',summary.decisions||t.filter(x=>x.decision).length],['PASS',summary.passes||t.filter(x=>String(x.snapshot?.gateStatus||'').toUpperCase()==='PASS').length],['REJECT',summary.rejects??Math.max(0,t.length-(summary.passes||0))],['AVG REACTION',pct(summary.avgDirectedReactionPct)],['POSITIVE',summary.positiveReactionRate==null?'—':`${n(summary.positiveReactionRate,1)}%`],['MFE',(()=>{const v=t.map(x=>Number(x.mfePct)).filter(Number.isFinite);return v.length?pct(Math.max(...v)):'—'})()],['MAE',(()=>{const v=t.map(x=>Number(x.maePct)).filter(Number.isFinite);return v.length?pct(Math.min(...v)):'—'})()]].map(x=>`<div class="fstat"><span>${x[0]}</span><b class="${String(x[1]).startsWith('-')?'bad':String(x[1]).includes('+')?'good':''}">${esc(x[1])}</b></div>`).join('');$('timeline').innerHTML=t.slice(-80).reverse().map(x=>{const q=x.outcomeQuality||'PENDING';const a=x.action||'REJECT';const r=x.outcomes?.plus10Scan?.directedReactionPct;return `<div class="event ${q==='POSITIVE'?'good':q==='NEGATIVE'?'bad':''}"><i class="rail"></i><span class="time">${new Date(x.scanTs).toLocaleTimeString()}</span><div><div class="etype">${esc(a)} · ${n(x.confidence,0)}%</div><div class="desc">SCAN · ${formatPrice(x.snapshot?.price)} · RSI ${n(x.snapshot?.rsi,1)} · OI ${n(x.snapshot?.openInterest,0)} · outcome +10 ${r==null?'PENDING':pct(r)} · MFE ${pct(x.mfePct)} · MAE ${pct(x.maePct)}</div></div></div>`}).join('')||'<div style="color:var(--muted);font-size:8px">NO HISTORICAL SCAN SNAPSHOTS YET</div>';}
+function renderForensics(){const t=state.timeline||[];const coverage=state.allOutcomes?.rows||[];if($('outcomeCoverage'))$('outcomeCoverage').textContent=coverage.length?`ALL COINS · ${coverage.length} ACTIVE`:'ALL COINS · WAITING';const s=state.intel?.current||{};const summary=state.timelineSummary||{};$('forensicSummary').innerHTML=[['SCANS',summary.scans||t.length],['DECISIONS',summary.decisions||t.filter(x=>x.decision).length],['PASS',summary.passes||t.filter(x=>String(x.snapshot?.gateStatus||'').toUpperCase()==='PASS').length],['REJECT',summary.rejects??Math.max(0,t.length-(summary.passes||0))],['AVG REACTION',pct(summary.avgDirectedReactionPct)],['POSITIVE',summary.positiveReactionRate==null?'—':`${n(summary.positiveReactionRate,1)}%`],['MFE',(()=>{const v=t.map(x=>Number(x.mfePct)).filter(Number.isFinite);return v.length?pct(Math.max(...v)):'—'})()],['MAE',(()=>{const v=t.map(x=>Number(x.maePct)).filter(Number.isFinite);return v.length?pct(Math.min(...v)):'—'})()]].map(x=>`<div class="fstat"><span>${x[0]}</span><b class="${String(x[1]).startsWith('-')?'bad':String(x[1]).includes('+')?'good':''}">${esc(x[1])}</b></div>`).join('');$('timeline').innerHTML=t.slice(-80).reverse().map(x=>{const q=x.outcomeQuality||'PENDING';const a=x.action||'REJECT';const r=x.outcomes?.plus10Scan?.directedReactionPct;return `<div class="event ${q==='POSITIVE'?'good':q==='NEGATIVE'?'bad':''}"><i class="rail"></i><span class="time">${new Date(x.scanTs).toLocaleTimeString()}</span><div><div class="etype">${esc(a)} · ${n(x.confidence,0)}%</div><div class="desc">SCAN · ${formatPrice(x.snapshot?.price)} · RSI ${n(x.snapshot?.rsi,1)} · OI ${n(x.snapshot?.openInterest,0)} · outcome +10 ${r==null?'PENDING':pct(r)} · MFE ${pct(x.mfePct)} · MAE ${pct(x.maePct)}</div></div></div>`}).join('')||'<div style="color:var(--muted);font-size:8px">NO HISTORICAL SCAN SNAPSHOTS YET</div>';}
 function renderRouter(){const r=state.router||{};const weights=Array.isArray(r.weights)?r.weights:[];const entries=weights.slice(0,8).map(w=>[w.agent,w.weightPct??w.weight]);$('router').innerHTML=(entries.length?entries:[['TREND',84],['MEAN REVERSION',62],['LIQUIDITY',38],['BREAKOUT',79]]).map(([k,v])=>`<div class="route"><span>${esc(k)}</span><b>${n(v,0)}%</b></div>`).join('');}
 function renderOutcomeChart(){const t=state.timeline||[];const last=t.at(-1);if(!last)return;const labels=['DECISION','+1 SCAN','+3 SCAN','+5 SCAN','+10 SCAN'];const vals=[0,last.outcomes?.plus1Scan?.directedReactionPct,last.outcomes?.plus3Scan?.directedReactionPct,last.outcomes?.plus5Scan?.directedReactionPct,last.outcomes?.plus10Scan?.directedReactionPct].map(v=>v==null?null:Number(v));if(!window.Chart)return;const ctx=$('outcomeChart');if(outcomeChart)outcomeChart.destroy();outcomeChart=new Chart(ctx,{type:'line',data:{labels,datasets:[{data:vals,borderColor:'#00ff88',backgroundColor:'#00ff8820',fill:true,tension:.35,pointRadius:4,pointBackgroundColor:'#d8f9ff',pointBorderColor:'#00ff88'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#123040'},ticks:{color:'#6f91a4',font:{size:8}}},y:{grid:{color:'#123040'},ticks:{color:'#6f91a4',font:{size:8},callback:v=>v+'%'}}}}});$('outcomeStats').innerHTML=[['MAX ADVERSE',pct(last.maePct)],['MAX FAVORABLE',pct(last.mfePct)],['FINAL OUTCOME',pct(last.outcomes?.plus10Scan?.directedReactionPct)],['QUALITY',last.outcomeQuality||'PENDING'],['CONFIDENCE',n(last.confidence,1)+'%'],['EVENTS',last.eventCount||0]].map(x=>`<div class="obox"><span>${x[0]}</span><b class="${String(x[1]).startsWith('-')?'bad':String(x[1]).startsWith('+')?'good':''}">${esc(x[1])}</b></div>`).join('');}
 
@@ -375,9 +388,10 @@ async function load(){
     api(`/api/dashboard/execution?symbol=${encodeURIComponent(state.symbol)}`),
     api('/api/dashboard/portfolio-learning'),
     api('/api/dashboard/connection'),
-    api(`/api/dashboard/attribution?symbol=${encodeURIComponent(state.symbol)}&horizon=20`)
+    api(`/api/dashboard/attribution?symbol=${encodeURIComponent(state.symbol)}&horizon=20`),
+    api('/api/dashboard/outcome-forensics?limit=300')
   ]);
-  const [agents,regime,router,timeline,scanHistory,execution,portfolio,connection,attribution]=results;
+  const [agents,regime,router,timeline,scanHistory,execution,portfolio,connection,attribution,allOutcomes]=results;
   if(agents.status==='fulfilled' && agents.value) state.agents=agents.value;
   if(regime.status==='fulfilled') state.regime=regime.value;
   if(router.status==='fulfilled') state.router=router.value;
@@ -387,6 +401,7 @@ async function load(){
   if(portfolio.status==='fulfilled') state.portfolio=portfolio.value;
   if(connection.status==='fulfilled') state.connection=connection.value;
   if(attribution.status==='fulfilled') state.attribution=attribution.value?.agents||[];
+  if(allOutcomes.status==='fulfilled') state.allOutcomes=allOutcomes.value||null;
 
   $('heroSymbol').textContent=state.symbol;$('chartSymbol').textContent=state.symbol;
   $('regime').textContent=state.regime?.currentRegime||state.regime?.phase||state.regime?.live?.phase||state.intel?.current?.marketPhase||'—';

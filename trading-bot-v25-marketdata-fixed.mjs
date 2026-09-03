@@ -5419,7 +5419,7 @@ app.use((req, res, next) => {
 });
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v25.0.18 Institutional Edition | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v25.0.20 Institutional Edition | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 
@@ -6429,13 +6429,38 @@ app.get('/api/dashboard/coin-timeline', async (req, res) => {
     const now = Date.now();
     const fromTs = Number.isFinite(Number(req.query.from)) ? Number(req.query.from) : now - 24 * 60 * 60 * 1000;
     const toTs = Number.isFinite(Number(req.query.to)) ? Number(req.query.to) : now;
-    const symbol = String(req.query.symbol || dashboardScanUniverse[0] || 'BTC-USDT').toUpperCase();
+    // Never hard-code a symbol. The dashboard may be opened before the first
+    // scan, so prefer the requested symbol, then the live scan universe, then
+    // the most recently observed live coin. Historical replay is only one
+    // source; current production EventBus events are merged in as well.
+    const requestedSymbol = String(req.query.symbol || '').trim().toUpperCase();
+    const fallbackSymbol = dashboardScanUniverse[0] || [...dashboardLiveCoinSnapshots.keys()][0] || '';
+    const symbol = requestedSymbol || fallbackSymbol;
     const limit = Math.min(300, Math.max(10, Number(req.query.limit || 120)));
     const events = [];
-    await jarvisHistoricalReplay.run({ fromTs, toTs, onEvent: async e => {
-      if (String(e.symbol || '').toUpperCase() === symbol) events.push(e);
-    }});
-    const timeline = buildCoinTimeline(events, symbol).slice(-limit);
+    const seen = new Set();
+    const addEvent = (e) => {
+      if (!e || !e.type) return;
+      const sym = String(e.symbol || e.payload?.symbol || '').toUpperCase();
+      if (!symbol || sym !== symbol) return;
+      const id = e.eventId || `${e.type}:${e.ts}:${sym}:${JSON.stringify(e.payload || {}).slice(0,120)}`;
+      if (seen.has(id)) return;
+      seen.add(id);
+      events.push({ ...e, symbol: sym });
+    };
+    // Historical source (when available on disk).
+    await jarvisHistoricalReplay.run({ fromTs, toTs, onEvent: async e => addEvent(e) });
+    // Live source: the production scanner emits these events even when no
+    // historical replay files exist on the Render instance.
+    try {
+      const liveEvents = jarvisEventBus.recent({ limit: 1000, symbol, types: null }) || [];
+      for (const e of liveEvents) {
+        const ts = Number(e.ts || 0);
+        if (ts >= fromTs && ts <= toTs) addEvent(e);
+      }
+    } catch (_) { logger.warn?.(`[Dashboard Coin Timeline] live event merge failed: ${_.message || _}`); }
+    events.sort((a,b) => Number(a.ts || 0) - Number(b.ts || 0));
+    const timeline = symbol ? buildCoinTimeline(events, symbol).slice(-limit) : [];
     const scans = timeline.length;
     const decisions = timeline.filter(x => x.decision).length;
     const passes = timeline.filter(x => String(x.snapshot?.gateStatus || '').toUpperCase() === 'PASS').length;
@@ -6445,7 +6470,8 @@ app.get('/api/dashboard/coin-timeline', async (req, res) => {
     const positiveReactionRate = reactions.length ? reactions.filter(x=>x>0).length/reactions.length*100 : null;
     res.setHeader('Cache-Control','no-store');
     res.json({
-      timestamp: now, mode: 'READ_ONLY_COIN_FORENSICS', symbol,
+      timestamp: now, mode: 'READ_ONLY_COIN_FORENSICS', symbol: symbol || null,
+      source: { historicalReplay: true, liveEventBus: true, hardCodedSymbol: false },
       range: { from: fromTs, to: toTs },
       summary: { scans, decisions, passes, rejects, avgDirectedReactionPct: avgReaction, positiveReactionRate },
       timeline
@@ -6453,6 +6479,60 @@ app.get('/api/dashboard/coin-timeline', async (req, res) => {
   } catch (err) {
     logger.warn(`[Dashboard Coin Timeline] ${err.message}`);
     res.status(500).json({ error: 'COIN_TIMELINE_FAILED', message: err.message });
+  }
+});
+
+app.get('/api/dashboard/outcome-forensics', async (req, res) => {
+  try {
+    const now = Date.now();
+    const fromTs = Number.isFinite(Number(req.query.from)) ? Number(req.query.from) : now - 24 * 60 * 60 * 1000;
+    const toTs = Number.isFinite(Number(req.query.to)) ? Number(req.query.to) : now;
+    const limit = Math.min(1000, Math.max(20, Number(req.query.limit || 300)));
+    const requested = String(req.query.symbol || '').trim().toUpperCase();
+    const symbols = new Set();
+    const events = [];
+    const seen = new Set();
+    const add = (e) => {
+      if (!e || !e.type) return;
+      const sym = String(e.symbol || e.payload?.symbol || '').toUpperCase();
+      if (!sym || (requested && sym !== requested)) return;
+      const ts = Number(e.ts || 0);
+      if (ts < fromTs || ts > toTs) return;
+      symbols.add(sym);
+      const id = e.eventId || `${e.type}:${e.ts}:${sym}:${JSON.stringify(e.payload || {}).slice(0,120)}`;
+      if (!seen.has(id)) { seen.add(id); events.push({ ...e, symbol: sym }); }
+    };
+    await jarvisHistoricalReplay.run({ fromTs, toTs, onEvent: async e => add(e) });
+    try {
+      const liveEvents = jarvisEventBus.recent({ limit: 3000, symbol: requested || null, types: null }) || [];
+      for (const e of liveEvents) add(e);
+    } catch (_) { logger.warn?.(`[Dashboard Outcome Forensics] live event merge failed: ${_.message || _}`); }
+    for (const sym of dashboardLiveCoinSnapshots.keys()) if (!requested || sym === requested) symbols.add(sym);
+    const rows = [...symbols].sort().map(sym => {
+      const timeline = buildCoinTimeline(events, sym).slice(-limit);
+      const reactions = timeline.map(x => Number(x.directedReactionPct)).filter(Number.isFinite);
+      const positive = reactions.filter(x => x > 0).length;
+      const mfe = timeline.map(x => Number(x.mfePct)).filter(Number.isFinite);
+      const mae = timeline.map(x => Number(x.maePct)).filter(Number.isFinite);
+      return {
+        symbol: sym,
+        scans: timeline.length,
+        decisions: timeline.filter(x => x.decision || x.action !== 'REJECT').length,
+        pending: timeline.filter(x => x.outcomeQuality === 'PENDING').length,
+        positive: timeline.filter(x => x.outcomeQuality === 'POSITIVE').length,
+        negative: timeline.filter(x => x.outcomeQuality === 'NEGATIVE').length,
+        avgDirectedReactionPct: reactions.length ? reactions.reduce((a,b)=>a+b,0)/reactions.length : null,
+        positiveReactionRate: reactions.length ? positive / reactions.length * 100 : null,
+        maxMfePct: mfe.length ? Math.max(...mfe) : null,
+        maxMaePct: mae.length ? Math.min(...mae) : null,
+        latest: timeline.at(-1) || null
+      };
+    });
+    res.setHeader('Cache-Control','no-store');
+    res.json({ timestamp: now, mode:'READ_ONLY_MULTI_COIN_OUTCOME_FORENSICS', requestedSymbol: requested || null, symbols: rows.map(x=>x.symbol), rows, source:{historicalReplay:true,liveEventBus:true,hardCodedSymbol:false}, range:{from:fromTs,to:toTs} });
+  } catch (err) {
+    logger.warn(`[Dashboard Outcome Forensics] ${err.message}`);
+    res.status(500).json({ error:'OUTCOME_FORENSICS_FAILED', message:err.message });
   }
 });
 
@@ -7133,7 +7213,7 @@ process.on('unhandledRejection', async (reason) => {
 // 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
 if (!config.TEST_MODE) (async () => {
-  logger.info('🚀 Starte Trading Bot v25.0.18 Institutional Edition (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
+  logger.info('🚀 Starte Trading Bot v25.0.20 Institutional Edition (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
