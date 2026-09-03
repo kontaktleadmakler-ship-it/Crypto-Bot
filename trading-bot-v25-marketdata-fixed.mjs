@@ -12,7 +12,6 @@ import { SymbolExecutionLock } from './symbol-execution-lock.mjs';
 // any order is submitted. This top-level import was unused/redundant and
 // has been removed - it gave the false impression the gate needed wiring
 // here when the actual enforcement already happens one layer down.
-import { RecoveryCoordinator } from './execution-core/recovery-coordinator.mjs';
 import { protectedSubmit } from './execution-core/protected-submit.mjs';
 import { CriticalStateQueue } from './execution-core/critical-state-queue.mjs';
 import { createRequire } from 'node:module';
@@ -25,7 +24,7 @@ const __dirname = path.dirname(__filename);
 
 /**
  * ============================================================================
- * TRADING SIGNAL BOT - v25.0.9 INSTITUTIONAL EDITION
+ * TRADING SIGNAL BOT - v25.0.17 INSTITUTIONAL EDITION
  * (Mit adaptivem TensorFlow.js ML, Deep Q-Network Agent, globaler Telegram-Queue,
  *  State-Persistenz, Hurst-Exponent, Marktphasen-Logging & Dynamic Filter Control)
  * ============================================================================
@@ -67,6 +66,7 @@ const { GeminiLLMEngine } = require('./llm-engine');
 const { WalkForwardEngine } = require('./walk-forward-engine');
 const { ModelDriftMonitor } = require('./model-drift-monitor');
 const { AgentAttribution } = require('./agent-attribution');
+const { createPipeline, transition: pipelineTransition, reject: pipelineReject, withTimeout: pipelineWithTimeout } = require('./signal-pipeline-controller');
 const { SafetyController } = require('./institutional-core/safety-controller');
 const { PortfolioLedger } = require('./institutional-core/portfolio-ledger');
 const { ProductionReadinessGate } = require('./institutional-core/readiness-gate');
@@ -643,6 +643,7 @@ function envBoolOrProfile(envVal, profileVal, trueLiteral) {
 }
 
 const config = {
+  TEST_MODE: process.env.BOT_TEST_MODE === 'true',
   PORT: parseInt(process.env.PORT, 10) || 10000,
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
@@ -708,6 +709,13 @@ const config = {
   SCAN_CONCURRENCY: parseInt(process.env.SCAN_CONCURRENCY, 10) || 3,
   SCAN_ITEM_TIMEOUT_MS: parseInt(process.env.SCAN_ITEM_TIMEOUT_MS, 10) || 75000,
   MARKET_DATA_CONCURRENCY: parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 3,
+  // Futures API is a separate pool from market-data bundle concurrency.
+  // Keeping this bounded prevents each scan worker's sequential futures calls
+  // from competing with the market-data fan-out and gives queued requests a
+  // deterministic upper bound instead of waiting forever.
+  FUTURES_API_CONCURRENCY: parseInt(process.env.FUTURES_API_CONCURRENCY, 10) || Math.max(8, (parseInt(process.env.MARKET_DATA_CONCURRENCY, 10) || 3) * 2),
+  FUTURES_API_QUEUE_TIMEOUT_MS: parseInt(process.env.FUTURES_API_QUEUE_TIMEOUT_MS, 10) || 5000,
+  MARKET_DATA_QUEUE_TIMEOUT_MS: parseInt(process.env.MARKET_DATA_QUEUE_TIMEOUT_MS, 10) || 10000,
   SCAN_WATCHDOG_MS: parseInt(process.env.SCAN_WATCHDOG_MS, 10) || 300000,
   MAX_CONSECUTIVE_PRICE_FAILURES: parseInt(process.env.MAX_CONSECUTIVE_PRICE_FAILURES, 10) || 10,
   LEVERAGE: parseInt(process.env.LEVERAGE, 10) || 3,
@@ -1163,16 +1171,35 @@ function predictSignalSuccess(features) {
   return mlModel.predict(features);
 }
 
+// Production scanner path must use the async ML API. The synchronous
+// mlModel.predict() path uses dataSync() and can block Node's event loop under
+// tfjs-node. Keep the sync helper for explicitly synchronous dashboard/legacy
+// callers, but never use it from scanMarket().
+async function predictSignalSuccessAsync(features) {
+  if (!config.ML_ENABLED || !isModelTrained) {
+    return { probability: 0.5, class: 'UNKNOWN', confidence: 0, trained: false };
+  }
+  if (typeof mlModel.predictAsync === 'function') return await mlModel.predictAsync(features);
+  return predictSignalSuccess(features);
+}
+
 async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 1000) {
   if (Date.now() < kucoinCircuitOpenUntil) {
     throw new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
   }
 
+  // Callers may disable retries for latency-sensitive scan requests.
+  if (typeof options.retries === 'number') retries = Math.max(0, options.retries);
+
   await apiRateLimiter.checkLimit();
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const startTime = Date.now();
-      const response = await axios.get(url, { timeout: options.timeout || 5000, ...options });
+      const requestOptions = { ...options };
+      delete requestOptions.retries;
+      delete requestOptions.futuresQueueTimeoutMs;
+      delete requestOptions.futuresPriority;
+      const response = await axios.get(url, { timeout: options.timeout || 5000, ...requestOptions });
       apiLatencyStats.record('kucoin', Date.now() - startTime);
       kucoinErrorCount = 0;
       return response;
@@ -1182,11 +1209,27 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
         continue;
       }
       if (attempt === retries) {
-        kucoinErrorCount++;
-        if (kucoinErrorCount >= KUCOIN_CIRCUIT_THRESHOLD) {
-          kucoinCircuitOpenUntil = Date.now() + KUCOIN_CIRCUIT_COOLDOWN_MS;
-          logger.error(`🚨 KuCoin API Fehlerhäufung! Circuit Breaker für 5 Minuten aktiviert.`);
-          sendTelegramAlert(`⚠️ <b>KuCoin API Schutz aktiv:</b> Zu viele Fehler. Scans pausieren für 5 Minuten.`);
+        const status = Number(error?.response?.status || 0);
+        const code = String(error?.code || '');
+        const transient =
+          !status ||
+          status === 408 ||
+          status === 429 ||
+          status >= 500 ||
+          code === 'ECONNABORTED' ||
+          code === 'ETIMEDOUT' ||
+          code === 'ECONNRESET' ||
+          code === 'ENETUNREACH' ||
+          code === 'EAI_AGAIN';
+
+        // Per-symbol 4xx failures (invalid/unsupported symbols, bad params)
+        // must not open the global circuit breaker for every other symbol.
+        if (transient) {
+          kucoinErrorCount++;
+          if (kucoinErrorCount >= KUCOIN_CIRCUIT_THRESHOLD) {
+            kucoinCircuitOpenUntil = Date.now() + KUCOIN_CIRCUIT_COOLDOWN_MS;
+            logger.warn(`⚠️ KuCoin transient-error protection active for ${Math.ceil(KUCOIN_CIRCUIT_COOLDOWN_MS / 1000)}s (${kucoinErrorCount} consecutive errors)`);
+          }
         }
       }
       throw error;
@@ -1195,20 +1238,51 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
 }
 
 const futuresApiSemaphore = {
-  active: 0, queue: [],
-  async acquire() {
-    if (this.active < 6) { this.active++; return; }
-    await new Promise(resolve => this.queue.push(resolve));
-    this.active++;
+  active: 0, queue: [], sequence: 0, timeoutCount: 0,
+  acquire(timeoutMs = config.FUTURES_API_QUEUE_TIMEOUT_MS, priority = 'normal') {
+    const limit = Math.max(2, Math.min(12, Number(config.FUTURES_API_CONCURRENCY) || 6));
+    if (this.active < limit) { this.active++; return Promise.resolve(); }
+    const waitMs = Math.max(250, Number(timeoutMs) || 5000);
+    return new Promise((resolve, reject) => {
+      const entry = {
+        id: ++this.sequence,
+        priority: priority === 'high' ? 0 : priority === 'low' ? 2 : 1,
+        resolve, reject, timer: null
+      };
+      entry.timer = setTimeout(() => {
+        const idx = this.queue.indexOf(entry);
+        if (idx !== -1) this.queue.splice(idx, 1);
+        this.timeoutCount++;
+        const err = new Error(`Futures API semaphore acquire timeout after ${waitMs}ms`);
+        err.code = 'SEMAPHORE_ACQUIRE_TIMEOUT';
+        reject(err);
+      }, waitMs);
+      this.queue.push(entry);
+      this.queue.sort((a, b) => a.priority - b.priority || a.id - b.id);
+    });
   },
   release() {
-    this.active--;
-    if (this.queue.length > 0) this.queue.shift()();
+    this.active = Math.max(0, this.active - 1);
+    const next = this.queue.shift();
+    if (!next) return;
+    clearTimeout(next.timer);
+    this.active++;
+    next.resolve();
+  },
+  snapshot() {
+    return {
+      active: this.active,
+      queued: this.queue.length,
+      timeoutCount: this.timeoutCount,
+      limit: Math.max(2, Math.min(12, Number(config.FUTURES_API_CONCURRENCY) || 6))
+    };
   }
 };
 
 async function futuresApiGetWithRetry(url, options = {}, retries = 3, backoffMs = 1000) {
-  await futuresApiSemaphore.acquire();
+  const queueTimeoutMs = Number(options.futuresQueueTimeoutMs ?? config.FUTURES_API_QUEUE_TIMEOUT_MS);
+  const priority = options.futuresPriority || 'normal';
+  await futuresApiSemaphore.acquire(queueTimeoutMs, priority);
   try { return await axiosGetWithRetry(url, options, retries, backoffMs); }
   finally { futuresApiSemaphore.release(); }
 }
@@ -2530,7 +2604,7 @@ async function getMarketDataBundle(symbol) {
   if (existing) return existing;
 
   const task = (async () => {
-    const acquired = await marketDataSemaphore.acquire(10000);
+    const acquired = await marketDataSemaphore.acquire(config.MARKET_DATA_QUEUE_TIMEOUT_MS);
     if (!acquired) {
       const err = new Error(`${symbol} market-data concurrency queue timeout after 10000ms`);
       err.code = 'MARKET_DATA_QUEUE_TIMEOUT';
@@ -2744,7 +2818,7 @@ async function checkRiskLevels() {
 }
 
 function formatScanStatsReport(stats) {
-  const lines = [`🔎 <b>SCAN-DIAGNOSE v25.0.9 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
+  const lines = [`🔎 <b>SCAN-DIAGNOSE v25.0.17 (${escapeHtml(STRATEGY_PROFILE_NAME)})</b>`];
   lines.push(`Coins geprüft: ${stats.total} | Signale gesendet: ${stats.signalsSent}`);
   if (stats.avgSignalScore !== undefined) lines.push(`Ø Signal-Score: ${stats.avgSignalScore}/100`);
   lines.push(`Marktphase: ${currentMarketPhase}`);
@@ -3294,6 +3368,13 @@ async function asyncPool(concurrency, items, iteratorFn, itemTimeoutMs = config.
   return Promise.allSettled(results);
 }
 
+function resolveSignalDirection(primaryDir, primaryFail, secondaryFail, enableShortSignals) {
+  if (!primaryFail) return primaryDir;
+  const secondaryDir = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
+  if (secondaryDir === 'SHORT' && !enableShortSignals) return null;
+  return !secondaryFail ? secondaryDir : null;
+}
+
 function evaluateDirectionGates(dir, p, scanStats, gateConfig) {
   const isLong = dir === 'LONG';
   const config = gateConfig || moduleConfig;
@@ -3388,6 +3469,28 @@ function evaluateDirectionGates(dir, p, scanStats, gateConfig) {
   return null;
 }
 
+function applyTimeFilterPenalty(baseConfig, timeStats, date = new Date(), scanStats = {}) {
+  if (!timeStats) return baseConfig;
+  const currentHour = date.getUTCHours();
+  const currentDay = date.getUTCDay();
+  const hStat = timeStats.hourlyStats?.[currentHour];
+  const dStat = timeStats.dailyStats?.[currentDay];
+  const hourBad = hStat && hStat.trades >= 5 && hStat.pnl < 0;
+  const dayBad = dStat && dStat.trades >= 8 && dStat.pnl < 0;
+  if (!hourBad && !dayBad) return baseConfig;
+
+  const penalty = hourBad && dayBad
+    ? Number(baseConfig.TIME_FILTER_SCORE_PENALTY ?? 15)
+    : Number(baseConfig.TIME_FILTER_SCORE_PENALTY_SOFT ?? 7);
+  scanStats.timeThrottled = (scanStats.timeThrottled || 0) + 1;
+  if (hourBad && dayBad) {
+    logger.info(`⏰ [Time-Filter] Stunde (${currentHour} UTC) UND Wochentag (${currentDay}) historisch im Minus. Gate-Score-Anforderung um ${penalty} erhöht (Drosselung statt Vollsperre).`);
+  } else {
+    logger.info(`⏰ [Time-Filter] Stunde (${currentHour} UTC) oder Wochentag (${currentDay}) historisch leicht im Minus. Gate-Score-Anforderung um ${penalty} erhöht.`);
+  }
+  return { ...baseConfig, MIN_GATE_SCORE: Number(baseConfig.MIN_GATE_SCORE || 0) + penalty };
+}
+
 function createEmptyScanStats() {
   return {
     total: 0, signalsSent: 0, totalSignalScore: 0, avgSignalScore: 0,
@@ -3403,7 +3506,8 @@ function createEmptyScanStats() {
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
     timeBlocked: 0, timeThrottled: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0,
-    marketDataTimeouts: 0, marketDataQueueTimeouts: 0, marketDataFailures: 0, circuitBreakerSkips: 0
+    marketDataTimeouts: 0, marketDataQueueTimeouts: 0, marketDataFailures: 0, circuitBreakerSkips: 0,
+    pipelineRejected: 0, pipelineStages: {}, pipelineTimeouts: 0
   };
 }
 
@@ -3434,11 +3538,28 @@ function isNewsBlackout(now = Date.now()) {
   return newsEvents.some(t => now >= t - NEWS_BLACKOUT_BEFORE_MS && now <= t + NEWS_BLACKOUT_AFTER_MS);
 }
 
+function recordSignalPipelineStage(pipeline, symbol, stage, patch = {}, reason = null) {
+  if (reason) pipelineReject(pipeline, reason, patch);
+  else pipelineTransition(pipeline, stage, patch);
+  try {
+    jarvisEventBus.emitEvent('SIGNAL:PIPELINE', {
+      symbol: String(symbol).toUpperCase(), scanId: pipeline.scanId, signalId: pipeline.signalId,
+      stage: pipeline.stage, status: pipeline.status, reason: pipeline.reason, ...patch
+    }, { source: 'signal-pipeline', severity: reason ? 'WARN' : 'INFO', persist: false, persistReplay: true });
+  } catch (_) {}
+}
+
+function countPipelineRejection(scanStats, pipeline, reason = null) {
+  scanStats.pipelineRejected = (scanStats.pipelineRejected || 0) + 1;
+  const key = String(reason || pipeline.reason || pipeline.stage || 'UNKNOWN');
+  scanStats.pipelineStages[key] = (scanStats.pipelineStages[key] || 0) + 1;
+}
+
 async function scanMarket() {
   if (isScanning) return;
   isScanning = true;
   lastScanTime = Date.now();
-  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v25.0.9 (mit DQN)...`);
+  logger.info(`[${new Date().toISOString().slice(0, 16)}] 🔍 Starte Scan v25.0.17 (mit DQN)...`);
 
   // BUGFIX: hard safety net. Even with the asyncPool per-item timeout,
   // anything awaited *before* the pool (macro/sentiment check, BTC
@@ -3534,25 +3655,7 @@ async function scanMarket() {
     let timeFilterConfig = config;
     if (filterState.timetrend.enabled && config.ENABLE_TIME_FILTER) {
       const timeStats = await getTimeBasedAnalysis();
-      if (timeStats) {
-        const currentHour = new Date().getUTCHours();
-        const currentDay = new Date().getUTCDay();
-        const hStat = timeStats.hourlyStats[currentHour];
-        const dStat = timeStats.dailyStats[currentDay];
-        const hourBad = hStat && hStat.trades >= 5 && hStat.pnl < 0;
-        const dayBad = dStat && dStat.trades >= 8 && dStat.pnl < 0;
-        if (hourBad && dayBad) {
-          const penalty = Number(config.TIME_FILTER_SCORE_PENALTY ?? 15);
-          timeFilterConfig = { ...config, MIN_GATE_SCORE: config.MIN_GATE_SCORE + penalty };
-          scanStats.timeThrottled = (scanStats.timeThrottled || 0) + 1;
-          logger.info(`⏰ [Time-Filter] Stunde (${currentHour} UTC) UND Wochentag (${currentDay}) historisch im Minus. Gate-Score-Anforderung um ${penalty} erhöht (Drosselung statt Vollsperre).`);
-        } else if (hourBad || dayBad) {
-          const penalty = Number(config.TIME_FILTER_SCORE_PENALTY_SOFT ?? 7);
-          timeFilterConfig = { ...config, MIN_GATE_SCORE: config.MIN_GATE_SCORE + penalty };
-          scanStats.timeThrottled = (scanStats.timeThrottled || 0) + 1;
-          logger.info(`⏰ [Time-Filter] Stunde (${currentHour} UTC) oder Wochentag (${currentDay}) historisch leicht im Minus. Gate-Score-Anforderung um ${penalty} erhöht.`);
-        }
-      }
+      timeFilterConfig = applyTimeFilterPenalty(config, timeStats, new Date(), scanStats);
     }
 
     logger.info(`📊 Phase: ${currentMarketPhase} | Sentiment: ${macroStatus.sentimentClass} (${macroStatus.sentimentValue}) | ADX: ${adaptiveADX.toFixed(1)} | Risk: ${adaptiveRisk.toFixed(2)}%`);
@@ -3627,6 +3730,7 @@ async function scanMarket() {
     let signalsSent = 0;
 
     await asyncPool(config.SCAN_CONCURRENCY, dynamicWatchlist, async (symbol) => {
+      const pipeline = createPipeline(symbol, scanCounter + 1);
       scanStats.total++;
       dashboardScanState.checked = scanStats.total;
 
@@ -3717,42 +3821,81 @@ async function scanMarket() {
         // while marketDataEvaluated means the symbol reached the strategy gates.
         scanStats.marketDataEvaluated++;
 
-        var direction = null;
-        const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
-        let primaryFail = evaluateDirectionGates(primaryDir, gateParams, scanStats, timeFilterConfig);
-
-        // BUGFIX (short signals unreliable): the previous condition was
-        // `config.ENABLE_SHORT_SIGNALS || primaryDir === 'LONG'`. Because of
-        // the `|| primaryDir === 'LONG'` clause, whenever the PRIMARY
-        // direction was already LONG, the secondary-direction check ran
-        // unconditionally - so a SHORT could still be evaluated and traded
-        // even with ENABLE_SHORT_SIGNALS=false. Conversely this offered no
-        // protection in the other direction either, since it never actually
-        // gated on whether the SECONDARY candidate was a SHORT. Now the
-        // secondary direction is computed first and the short-signal switch
-        // is checked against that actual direction, so SHORT setups are
-        // evaluated (and can be traded) whenever ENABLE_SHORT_SIGNALS is
-        // true - reliably, regardless of what the primary direction was.
-        if (!primaryFail) {
-          direction = primaryDir;
-        } else {
-          const secondaryDir = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
-          if (secondaryDir === 'SHORT' && !config.ENABLE_SHORT_SIGNALS) {
-            scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
-          } else {
-            const secondaryFail = evaluateDirectionGates(
-              secondaryDir,
-              gateParams,
-              scanStats,
-              timeFilterConfig
-            );
-            if (!secondaryFail) {
-              direction = secondaryDir;
-            } else {
-              scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
-            }
-          }
+        // AGENT-TELEMETRY (ported from trading-bot-v24.6-runtime.mjs): a
+        // lightweight, pre-gate agent snapshot so operators/dashboard can see
+        // agent scores even for candidates that never clear the direction
+        // gates below (and therefore never reach the full post-gate
+        // agentSuite.evaluate() call further down). Observational only -
+        // does not affect gating or trade decisions.
+        try {
+          const telemetryDirection = trend1h === 'BEARISH' ? 'SHORT' : 'LONG';
+          const telemetryScore = calculateSignalScore({
+            adx, rsi, relativeVolume, trend1h, trend4h,
+            direction: telemetryDirection, marketPhase: currentMarketPhase,
+            macdHistogram: macd.histogram
+          });
+          const ev = agentSuite.evaluate({
+            symbol, direction: telemetryDirection,
+            spreadPct: Number(orderBookMetrics?.spreadPct || 0),
+            depthUSD: Number(orderBookMetrics?.depthUSD || futuresData?.volume24h || 0),
+            orderSizeUSD: Math.max(1, Number(currentPrice || 0) * 0.001),
+            apiLatencyMs: apiLatencyStats.getAverage('kucoin'),
+            candleDelayMs: Math.max(0, Date.now() - new Date(raw15m?.at(-1)?.time || Date.now()).getTime()),
+            exposurePct: (() => {
+              const eq = Math.max(config.CAPITAL_USD + dailyNetPnL, 1);
+              const gross = [...activeTrades.values()].reduce((sum, t) => sum + Math.abs(Number(t.notionalUSD || 0)), 0);
+              return gross / eq * 100;
+            })(),
+            maxExposurePct: Math.max(0, Number(config.MAX_EXPOSURE_RATIO || 0)) * Math.max(1, Number(config.LEVERAGE || 1)) * 100,
+            drawdownPct: Math.max(0, peakCapital > 0 ? ((peakCapital - (config.CAPITAL_USD + dailyNetPnL)) / peakCapital) * 100 : 0),
+            maxDrawdownPct: MAX_DRAWDOWN_PERCENT,
+            dailyLossPct: Math.max(0, -(dailyNetPnL / Math.max(config.CAPITAL_USD, 1)) * 100),
+            maxDailyLossPct: Math.max(0, Number(config.MAX_DAILY_LOSS_USD || 0) / Math.max(config.CAPITAL_USD, 1) * 100),
+            killSwitch: safetyController.isActive('kill-switch') || isPaused,
+            circuitBreaker: Date.now() < kucoinCircuitOpenUntil,
+            regime: { confidence: currentMarketPhase === 'RANGING' || currentMarketPhase === 'TRENDING' ? 0.75 : 0.5 },
+            oosScore: Number(mlModel.getStats().validationAccuracy || 0),
+            driftScore: Number(modelDriftMonitor.status().score || 0)
+          });
+          const teleNodes = [
+            ['risk-supervisor', 'RISK SUPERVISOR', ev.riskSupervisor.score, ev.riskSupervisor.decision, ev.riskSupervisor.hardBlock ? 'BLOCK' : 'PASS'],
+            ['portfolio-allocation', 'PORTFOLIO', Math.min(1, Number(ev.portfolioAllocation.scale || 0)), 'ALLOCATE', 'PASS'],
+            ['anomaly-detection', 'ANOMALY', 1 - Number(ev.anomaly.score || 0), ev.anomaly.severity, ev.anomaly.severity === 'HIGH' ? 'VETO' : 'PASS'],
+            ['liquidity', 'LIQUIDITY', ev.liquidity.score, ev.liquidity.decision, ev.liquidity.decision === 'BLOCK' ? 'WARN' : 'PASS'],
+            ['exit-evaluation', 'EXIT EVALUATOR', ev.exit.score, ev.exit.decision, 'MONITOR'],
+            ['strategy-evaluation', 'STRATEGY', ev.strategy.score, ev.strategy.health, ev.strategy.health === 'DISABLED' ? 'WARN' : 'PASS'],
+            ['meta-supervisor', 'META SUPERVISOR', ev.meta.confidence, ev.meta.decision, ev.meta.hardBlock ? 'VETO' : 'PASS']
+          ].map(([id, label, score, decision, status]) => ({ id, label, score, decision, status }));
+          const teleConsensus = teleNodes.filter(n => ['PASS', 'MONITOR'].includes(String(n.status))).length;
+          const teleVetoes = teleNodes.filter(n => String(n.status).includes('VETO') || String(n.status).includes('BLOCK')).map(n => ({ agent: n.label, reason: n.decision }));
+          jarvisEventBus.emitEvent('AGENTS:EVALUATED', {
+            symbol, direction: telemetryDirection, nodes: teleNodes,
+            dqn: { enabled: Boolean(config.DQN_ENABLED), initialized: Boolean(dqnAgent.isInitialized), action: 'OBSERVATION', epsilon: dqnAgent.epsilon },
+            confidence: Math.round(Math.max(0, Math.min(1, Number(ev.meta.confidence || 0) * 0.7 + (teleConsensus / Math.max(1, teleNodes.length)) * 0.3)) * 100),
+            consensus: teleConsensus, vetoes: teleVetoes, finalAction: ev.meta.hardBlock ? 'NO_TRADE' : 'OBSERVE',
+            phase: currentMarketPhase, gateStage:'PRE_GATE', signalScore: telemetryScore
+          }, { source: 'agent-suite', severity: teleVetoes.length ? 'WARN' : 'INFO', persist: false, persistReplay: true });
+        } catch (telemetryError) {
+          logger.warn(`[AGENT-TELEMETRY] ${symbol}: ${telemetryError.message || telemetryError}`);
         }
+
+        const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
+        const primaryFail = evaluateDirectionGates(primaryDir, gateParams, scanStats, timeFilterConfig);
+        const secondaryDir = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
+        const secondaryFail = primaryFail && !(secondaryDir === 'SHORT' && !config.ENABLE_SHORT_SIGNALS)
+          ? evaluateDirectionGates(secondaryDir, gateParams, scanStats, timeFilterConfig)
+          : null;
+
+        // SHORT is disabled at the direction-resolution boundary, after the
+        // actual secondary direction has been computed. This prevents the
+        // old `... || primaryDir === 'LONG'` bug from leaking SHORT setups.
+        const direction = resolveSignalDirection(
+          primaryDir,
+          primaryFail,
+          secondaryFail,
+          config.ENABLE_SHORT_SIGNALS
+        );
+        if (!direction && primaryFail) scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
 
         if (direction !== null) scanStats.gatePassed++;
         else scanStats.gateRejected++;
@@ -3860,7 +4003,7 @@ async function scanMarket() {
             volatilityRatio: btcATR > 0 ? atr / btcATR : 1
           });
 
-          const mlPrediction = predictSignalSuccess(mlFeatures);
+          const mlPrediction = await predictSignalSuccessAsync(mlFeatures);
           if (mlPrediction.trained && mlPrediction.probability < config.ML_MIN_PREDICTION_PROBABILITY) {
             scanStats.mlBlocked++;
             return;
@@ -3871,7 +4014,9 @@ async function scanMarket() {
           // ==========================================
           safetyController.set('pause', isPaused, isPaused ? 'runtime-paused' : 'runtime-active');
           safetyController.set('kill-switch', Boolean(riskEngine.killSwitch), riskEngine.killSwitch ? 'risk-engine-kill-switch' : 'risk-engine-clear');
-          const agentEvaluation = agentSuite.evaluate({
+          recordSignalPipelineStage(pipeline, symbol, 'AGENTS_EVALUATING');
+
+          const agentEvaluation = await pipelineWithTimeout(() => agentSuite.evaluate({
             symbol, direction,
             spreadPct: orderBookMetrics.spreadPct,
             depthUSD: Number(orderBookMetrics.depthUSD || futuresData?.volume24h || 0),
@@ -3887,6 +4032,9 @@ async function scanMarket() {
             killSwitch: safetyController.isActive('kill-switch') || isPaused, circuitBreaker: Date.now() < kucoinCircuitOpenUntil,
             regime: { confidence: currentMarketPhase === 'RANGING' || currentMarketPhase === 'TRENDING' ? 0.75 : 0.5 },
             oosScore: Number(mlModel.getStats().validationAccuracy || 0), driftScore: Number(modelDriftMonitor.status().score || 0)
+          }), 3000, 'AGENT_SUITE_TIMEOUT');
+          recordSignalPipelineStage(pipeline, symbol, 'AGENTS_EVALUATED', {
+            hardBlock: Boolean(agentEvaluation.meta?.hardBlock), decision: agentEvaluation.meta?.decision || null
           });
           if (agentEvaluation.meta.hardBlock) {
             scanStats.agentBlocked = (scanStats.agentBlocked || 0) + 1;
@@ -3999,9 +4147,20 @@ async function scanMarket() {
             logger.warn(`[RISK-ENGINE] Signal blockiert: ${riskCheck.reason}`); return;
           }
 
+          // A valid signal is a strategy + risk decision, independent of the
+          // downstream paper-execution simulation - emit it now so
+          // consumers (dashboard.html evt.type==='SIGNAL:GENERATED' handler,
+          // the decision-history filter further below) see it even if paper
+          // execution subsequently rejects the fill.
+          const signalId = `${symbol}:${direction}:${Date.now()}:${scanCounter}`;
+          jarvisEventBus.emitEvent('SIGNAL:GENERATED', {
+            symbol, direction, signalId, signalScore: Number(signalScore || 0),
+            entryPrice: Number(entryPrice), stopLoss: Number(stopLoss), tp1: Number(tp1), tp2: Number(tp2),
+            paperExecution: 'PENDING'
+          }, { source: 'scanner', severity: 'INFO', persist: true, persistReplay: true, persistMinIntervalMs: 0 });
+
           let paperOrder = null;
           if (config.PAPER_EXECUTION_ENABLED) {
-            const signalId = `${symbol}:${direction}:${Date.now()}:${scanCounter}`;
             try {
               const executionResult = await executePaperExecutionThroughCore({
                 symbol,
@@ -4155,6 +4314,13 @@ async function scanMarket() {
         }
       } catch (e) {
         scanStats.runtimeErrors++;
+        if (e?.code === 'AGENT_SUITE_TIMEOUT' || e?.code === 'ASYNC_POOL_ITEM_TIMEOUT') {
+          scanStats.pipelineTimeouts = (scanStats.pipelineTimeouts || 0) + 1;
+        }
+        if (typeof pipeline !== 'undefined' && pipeline.stage !== 'REJECTED' && pipeline.stage !== 'EXECUTED') {
+          countPipelineRejection(scanStats, pipeline, e.code || 'RUNTIME_ERROR');
+          recordSignalPipelineStage(pipeline, symbol, 'ERROR', {}, e.code || 'RUNTIME_ERROR');
+        }
         logger.error(`[SCAN ERROR] ${symbol}: ${e.message}`);
       }
     });
@@ -4168,6 +4334,7 @@ async function scanMarket() {
     }
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
+    logger.info(`[SCAN-DIAGNOSTICS-PIPELINE] rejected=${scanStats.pipelineRejected || 0} timeouts=${scanStats.pipelineTimeouts || 0} stages=${JSON.stringify(scanStats.pipelineStages || {})}`);
     logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
 
     if (marketPhaseLogsCollection && isDbConnected) {
@@ -4235,7 +4402,7 @@ async function handleTelegramCommand(chatId, text) {
   const args = parts.slice(1);
 
   // ==========================================
-  // 🤖 AI / AGENT CONTROL CENTER (v25.0.9)
+  // 🤖 AI / AGENT CONTROL CENTER (v25.0.17)
   // Advisory controls only: hard RiskEngine/Paper safety gates remain authoritative.
   // ==========================================
   const agentAlias = (name) => {
@@ -4253,7 +4420,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/commands' || command === '/aicommands') {
     await sendTelegramReply(chatId,
-      `<b>🤖 AI CONTROL CENTER v25.0.9</b>\n━━━━━━━━━━━━━━━━━━\n` +
+      `<b>🤖 AI CONTROL CENTER v25.0.17</b>\n━━━━━━━━━━━━━━━━━━\n` +
       `<b>Agents</b>\n/agents /agents_status /agent &lt;name&gt;\n/agent_on &lt;name&gt; /agent_off &lt;name&gt;\n/agents_on /agents_off /agent_weights\n` +
       `<b>LLM</b>\n/llm /llm_status /llm_on /llm_off /llm_test\n` +
       `<b>Analyse</b>\n/signals /top_signals /anomalies /regime /signal &lt;symbol&gt;\n/explain &lt;symbol&gt; /confluence &lt;symbol&gt; /risk\n` +
@@ -4390,7 +4557,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/help' || command === '/start') {
     await sendTelegramReply(chatId,
-      `<b>🤖 TRADING BOT v25.0.9 - INSTITUTIONAL PAPER/SHADOW</b>\n` +
+      `<b>🤖 TRADING BOT v25.0.17 - INSTITUTIONAL PAPER/SHADOW</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
       `<b>⚙️ DYNAMISCHE FILTER-STEUERUNG:</b>\n` +
       `/filters - Zeigt alle Indikator-Status & Werte an\n` +
@@ -5078,7 +5245,7 @@ async function handleTelegramCommand(chatId, text) {
 
   if (command === '/status') {
     const lines = [];
-    lines.push(`🤖 <b>BOT STATUS v25.0.9 INSTITUTIONAL EDITION</b>`);
+    lines.push(`🤖 <b>BOT STATUS v25.0.17 INSTITUTIONAL EDITION</b>`);
     lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━`);
     lines.push(`Profil: ${escapeHtml(STRATEGY_PROFILE_NAME)} | Phase: ${currentMarketPhase}`);
     lines.push(`DB: ${isDbConnected ? '✅ verbunden' : '🔴 GETRENNT'}`);
@@ -5252,7 +5419,7 @@ app.use((req, res, next) => {
 });
 
 app.get('/', (req, res) => {
-  res.send(`🤖 Trading Bot v25.0.9 Institutional Edition | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
+  res.send(`🤖 Trading Bot v25.0.17 Institutional Edition | Phase: ${currentMarketPhase} | DB: ${isDbConnected ? '✅' : '🔴'}`);
 });
 
 
@@ -5743,7 +5910,7 @@ async function getDashboardAgentNetwork(symbol) {
       btcTrend: trend1h, direction, marketPhase: currentMarketPhase,
       orderBookImbalance: Number(book.bidAskRatio || 1), spreadPct: Number(book.spreadPct || 0), volatilityRatio: 1
     });
-    const ml = predictSignalSuccess(mlFeatures);
+    const ml = await predictSignalSuccessAsync(mlFeatures);
     if (Number.isFinite(ml?.probability)) mlProbability = Number(ml.probability);
   } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
 
@@ -6713,9 +6880,11 @@ app.get('/api/ml/status', (req, res) => {
   });
 });
 
-const server = app.listen(config.PORT, '0.0.0.0', () => { 
-  logger.info(`🌐 Webserver bindet sich an Port ${config.PORT} für Render...`); 
-});
+const server = config.TEST_MODE
+  ? { close() {} }
+  : app.listen(config.PORT, '0.0.0.0', () => { 
+      logger.info(`🌐 Webserver bindet sich an Port ${config.PORT} für Render...`); 
+    });
 
 // ==========================================
 // 19. TIMERS & SHUTDOWN
@@ -6723,8 +6892,27 @@ const server = app.listen(config.PORT, '0.0.0.0', () => {
 const cronJobs = [];
 const intervalTimers = [];
 let executionLeaseHeartbeat = null;
+let lastMLTrainingAttemptAt = 0;
+let mlTrainingInProgress = false;
 
+async function runMLTrainingSafely(force = false, source = 'unknown') {
+  if (mlTrainingInProgress) {
+    logger.info(`🧠 [TensorFlow.js ML] Training übersprungen: bereits aktiv source=${source}`);
+    return { trained: false, skipped: true, reason: 'training-in-progress' };
+  }
+  if (isScanning) {
+    logger.info(`🧠 [TensorFlow.js ML] Training verschoben: Scan aktiv source=${source}`);
+    return { trained: false, skipped: true, reason: 'scan-in-progress' };
+  }
+  mlTrainingInProgress = true;
+  try {
+    return await trainSignalMLModel(force);
+  } finally {
+    mlTrainingInProgress = false;
+  }
+}
 
+if (!config.TEST_MODE) {
 intervalTimers.push(setInterval(async () => {
   try { await checkActiveTrades(); }
   catch (e) { logger.error(`[TRACKER INTERVAL ERROR] ${e.message}\n${e.stack}`); }
@@ -6744,27 +6932,6 @@ cronJobs.push(cron.schedule('59 23 * * *', async () => {
     logger.error(`[DAILY RESET CRON ERROR] ${e.message}\n${e.stack}`);
   }
 }, { timezone: 'UTC' }));
-
-let lastMLTrainingAttemptAt = 0;
-let mlTrainingInProgress = false;
-
-async function runMLTrainingSafely(force = false, source = 'unknown') {
-  if (mlTrainingInProgress) {
-    logger.info(`🧠 [TensorFlow.js ML] Training übersprungen: bereits aktiv source=${source}`);
-    return { trained: false, skipped: true, reason: 'training-in-progress' };
-  }
-  // Never let scheduled ML work contend with the market scanner.
-  if (isScanning) {
-    logger.info(`🧠 [TensorFlow.js ML] Training verschoben: Scan aktiv source=${source}`);
-    return { trained: false, skipped: true, reason: 'scan-in-progress' };
-  }
-  mlTrainingInProgress = true;
-  try {
-    return await trainSignalMLModel(force);
-  } finally {
-    mlTrainingInProgress = false;
-  }
-}
 
 cronJobs.push(cron.schedule('0 * * * *', async () => {
   try {
@@ -6787,6 +6954,8 @@ cronJobs.push(cron.schedule('0 * * * *', async () => {
     logger.error(`[ML CRON ERROR] ${e.message}\n${e.stack}`);
   }
 }, { timezone: 'UTC' }));
+
+}
 
 
 async function runExecutionRecovery() {
@@ -6963,8 +7132,8 @@ process.on('unhandledRejection', async (reason) => {
 // ==========================================
 // 20. BOT START (ASYNCHRON & ABSICHERT & DAUERHAFT)
 // ==========================================
-(async () => {
-  logger.info('🚀 Starte Trading Bot v25.0.9 Institutional Edition (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
+if (!config.TEST_MODE) (async () => {
+  logger.info('🚀 Starte Trading Bot v25.0.17 Institutional Edition (Full Features, TensorFlow.js ML, DQN Agent, Cross-Hedging, Volatility Surface & Order Flow)...');
   
   await initDatabase();
   await loadFuturesContractSpecs();
@@ -6993,3 +7162,16 @@ intervalTimers.push(scanTimer);
   
   logger.info(`🔄 Bot-Dauerschleife aktiv. Nächster Scan in ${SCAN_INTERVAL_MS / 60000} Minuten.`);
 })();
+
+
+// Test-only surface: enabled exclusively through BOT_TEST_MODE so production
+// imports do not expose mutable internals accidentally.
+export const __test = config.TEST_MODE ? {
+  config,
+  evaluateDirectionGates,
+  resolveSignalDirection,
+  applyTimeFilterPenalty,
+  futuresApiSemaphore,
+  marketDataSemaphore,
+  predictSignalSuccessAsync
+} : undefined;

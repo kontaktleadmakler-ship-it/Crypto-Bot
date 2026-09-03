@@ -560,45 +560,7 @@ class TensorFlowSignalModel {
     return true;
   }
 
-  async predictAsync(features) {
-    if (!this.model || !this.scaler || !this.trained) {
-      return { probability: 0.5, class: 'UNKNOWN', confidence: 0, trained: false };
-    }
-    if (!Array.isArray(features) || features.length !== FEATURE_NAMES.length) {
-      throw new Error(`Ungültige ML-Features: erwartet ${FEATURE_NAMES.length}, erhalten ${features?.length}`);
-    }
 
-    const scaled = this.scaleMatrix([features], this.scaler)[0];
-    // IMPORTANT: dataSync() blocks Node's event loop with tfjs-node. The
-    // scanner uses this async variant so inference yields to I/O/timers while
-    // the native TensorFlow backend copies the result back to JavaScript.
-    const rawProbability = await tf.tidy(() => {
-      const input = tf.tensor2d([scaled], [1, FEATURE_NAMES.length]);
-      const output = this.model.predict(input);
-      return output.data();
-    });
-    const probability = clamp(Number(rawProbability?.[0]), 0, 1);
-
-    const confidence = Math.abs(probability - 0.5) * 2;
-    const className = probability >= this.strongSignalProbability
-      ? 'STRONG_LONG_SETUP'
-      : probability >= this.minPredictionProbability
-        ? 'LONG_SETUP'
-        : probability <= (1 - this.strongSignalProbability)
-          ? 'STRONG_NO_TRADE'
-          : probability <= (1 - this.minPredictionProbability)
-            ? 'NO_TRADE'
-            : 'NEUTRAL';
-
-    return {
-      probability,
-      class: className,
-      confidence,
-      trained: true,
-      validationQuality: this.stats.validationQuality || null,
-      modelVersion: this.stats.modelVersion || null
-    };
-  }
 
   async predictAsync(features) {
     if (!this.model || !this.scaler || !this.trained) {
