@@ -3707,22 +3707,37 @@ async function scanMarket() {
         const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
         let primaryFail = evaluateDirectionGates(primaryDir, gateParams, scanStats, timeFilterConfig);
 
+        // BUGFIX (short signals unreliable): the previous condition was
+        // `config.ENABLE_SHORT_SIGNALS || primaryDir === 'LONG'`. Because of
+        // the `|| primaryDir === 'LONG'` clause, whenever the PRIMARY
+        // direction was already LONG, the secondary-direction check ran
+        // unconditionally - so a SHORT could still be evaluated and traded
+        // even with ENABLE_SHORT_SIGNALS=false. Conversely this offered no
+        // protection in the other direction either, since it never actually
+        // gated on whether the SECONDARY candidate was a SHORT. Now the
+        // secondary direction is computed first and the short-signal switch
+        // is checked against that actual direction, so SHORT setups are
+        // evaluated (and can be traded) whenever ENABLE_SHORT_SIGNALS is
+        // true - reliably, regardless of what the primary direction was.
         if (!primaryFail) {
           direction = primaryDir;
-        } else if (config.ENABLE_SHORT_SIGNALS || primaryDir === 'LONG') {
-          const secondaryFail = evaluateDirectionGates(
-            primaryDir === 'LONG' ? 'SHORT' : 'LONG', 
-            gateParams,
-            scanStats,
-            timeFilterConfig
-          );
-          if (!secondaryFail) {
-            direction = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
-          } else {
-            scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
-          }
         } else {
-          scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
+          const secondaryDir = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
+          if (secondaryDir === 'SHORT' && !config.ENABLE_SHORT_SIGNALS) {
+            scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
+          } else {
+            const secondaryFail = evaluateDirectionGates(
+              secondaryDir,
+              gateParams,
+              scanStats,
+              timeFilterConfig
+            );
+            if (!secondaryFail) {
+              direction = secondaryDir;
+            } else {
+              scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
+            }
+          }
         }
 
         if (direction !== null) scanStats.gatePassed++;
