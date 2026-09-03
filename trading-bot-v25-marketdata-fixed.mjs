@@ -6095,8 +6095,20 @@ function dashboardCanonicalState(symbol = null) {
     connection: { connected: Boolean(market && ageMs !== null && ageMs <= 30000), ageMs },
     nodes: Array.isArray(agent?.nodes) ? agent.nodes : [],
     dqn: agent?.dqn || null,
+    ml: (()=>{ try { return { ...mlModel.getStats(), validationAccuracy: Number(mlModel.getStats().validationAccuracy || 0) }; } catch (_) { return null; } })(),
     confidence: Number(agent?.confidence || decision?.confidence || 0),
-    finalAction: agent?.finalAction || decision?.action || 'WAITING'
+    finalAction: agent?.finalAction || decision?.action || 'WAITING',
+    readiness: dashboardReadinessSnapshot(),
+    systemHealth: {
+      dbConnected: Boolean(isDbConnected),
+      paused: Boolean(isPaused),
+      shuttingDown: Boolean(isShuttingDown),
+      kucoinErrorCount: Number(kucoinErrorCount || 0),
+      circuitBreakerOpen: Date.now() < Number(kucoinCircuitOpenUntil || 0),
+      activeTrades: activeTrades.size,
+      scanCounter: Number(scanCounter || 0),
+      lastScanStats: lastScanStats || null
+    }
   };
 }
 

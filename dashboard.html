@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>JARVIS 6.15 // Neural Brain Command Center</title>
+<title>JARVIS 6.16 // Neural Intelligence Command Center</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Orbitron:wght@500;600;700;800&display=swap" rel="stylesheet">
@@ -16,6 +16,28 @@
 .heat{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;overflow:auto}.heatcell{min-height:35px;border:1px solid #0b3448;border-radius:5px;padding:5px;text-align:center;display:flex;flex-direction:column;justify-content:center}.heatcell b{font-size:9px}.heatcell span{font-size:8px;margin-top:2px}.heatpos{background:linear-gradient(#00ff882b,#00ff8808)}.heatneg{background:linear-gradient(#ff33662d,#ff336608)}.heatneu{background:#0c1722}.agent-mini{display:grid;gap:6px}.live-control{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:7px}.control-box{border:1px solid #10384b;border-radius:5px;padding:5px;background:#08131e}.control-box span{display:block;font-size:6px;color:var(--muted)}.control-box b{display:block;font-size:9px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.diag-line{grid-column:1/-1;display:flex;justify-content:space-between;font-size:7px;color:#83a6b7;padding-top:2px}.diag-line b{color:#d8f9ff}.agent-row{display:grid;grid-template-columns:105px 1fr 35px;gap:6px;align-items:center;font-size:8px}.bar{height:5px;border-radius:4px;background:#102431;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--cyan),var(--purple));box-shadow:0 0 8px #00f0ff88}.navmini{display:grid;grid-template-columns:repeat(2,1fr);gap:5px}.navmini button{background:#0b1622;border:1px solid #103c50;color:#7ea8ba;border-radius:5px;padding:6px;font:8px 'JetBrains Mono';cursor:pointer}.navmini button:hover{border-color:var(--cyan);color:#fff}
 .brain-panel{padding:8px;display:flex;flex-direction:column}.brain-head{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr;gap:6px;margin-bottom:5px}.stat{border:1px solid #10384b;border-radius:5px;padding:5px 7px;background:#091421}.stat label{display:block;font-size:7px;color:var(--muted)}.stat b{font-size:11px}.brain{position:relative;flex:1;min-height:0;border-radius:7px;background:radial-gradient(circle at 50% 50%,#00f0ff0b,transparent 50%),linear-gradient(135deg,#07101d,#071421);overflow:hidden}.brain svg{width:100%;height:100%;display:block}.brain-glow{filter:drop-shadow(0 0 7px #00f0ff77)}.brain-outline{fill:#07182a;stroke:#386c9a;stroke-width:2;opacity:.9}.brain-inner{fill:none;stroke:#6f55ff66;stroke-width:1.2}.conn{fill:none;stroke:#00d9ff88;stroke-width:1.1;stroke-dasharray:3 4;animation:flow 2s linear infinite}.conn.goodline{stroke:#00ff88aa}.conn.badline{stroke:#ff3366aa}.conn.goldline{stroke:#ffd700aa}@keyframes flow{to{stroke-dashoffset:-35}}.node{fill:#081827;stroke:var(--cyan);stroke-width:1.6}.node.goodnode{stroke:var(--green)}.node.goldnode{stroke:var(--gold)}.node.badnode{stroke:var(--red)}.nodeText{fill:#d8f9ff;font:700 11px 'JetBrains Mono';text-anchor:middle}.nodeSub{fill:#7095a8;font:8px 'JetBrains Mono';text-anchor:middle}.inputNode{fill:#08131e;stroke:#2780a0}.outNode{fill:#061d18;stroke:var(--green)}.outBad{fill:#210a14;stroke:var(--red)}.decisionCore{fill:#082a24;stroke:var(--green);stroke-width:2.4}.brain-caption{position:absolute;left:12px;bottom:8px;color:#496f83;font-size:8px}.legend{position:absolute;right:10px;top:8px;font-size:8px;display:grid;gap:3px}.legend i{display:inline-block;width:18px;height:2px;margin-right:5px;vertical-align:middle}.lcyan{background:var(--cyan)}.lgreen{background:var(--green)}.lgold{background:var(--gold)}.lred{background:var(--red)}
 .outcome-panel{display:grid;grid-template-columns:1fr 235px;gap:8px}.chartwrap{min-height:0}.chartwrap canvas{width:100%!important;height:150px!important}.outcome-stats{display:grid;grid-template-columns:1fr 1fr;gap:6px}.obox{border:1px solid #10394b;border-radius:5px;padding:7px;background:#08131e}.obox span{font-size:7px;color:var(--muted);display:block}.obox b{font-size:13px}.timeline{display:grid;gap:6px;overflow:auto;max-height:calc(100% - 24px)}.event{display:grid;grid-template-columns:9px 60px 1fr;gap:7px;align-items:start;font-size:8px}.event .rail{width:7px;height:7px;border-radius:50%;background:var(--cyan);box-shadow:0 0 7px #00f0ff88;margin-top:3px}.event.good .rail{background:var(--green);box-shadow:0 0 7px #00ff8888}.event.bad .rail{background:var(--red);box-shadow:0 0 7px #ff336688}.event .etype{color:var(--cyan);font-weight:700}.event .desc{color:#9fc0ce}.event .time{color:#6a8d9d}.forensic-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-bottom:7px}.fstat{border:1px solid #10384b;border-radius:5px;padding:5px}.fstat span{display:block;font-size:7px;color:var(--muted)}.fstat b{font-size:11px}.router{display:grid;grid-template-columns:1fr 1fr;gap:5px}.route{border:1px solid #10384b;border-radius:5px;padding:6px;background:#09131e}.route span{display:block;color:var(--muted);font-size:7px}.route b{font-size:10px}.radar{height:90px}.footer{display:flex;align-items:center;justify-content:space-between;padding:0 12px;font-size:8px;color:#557c90}.footer nav{display:flex;gap:4px}.footer button{background:#091522;border:1px solid #10384b;color:#6f9aac;border-radius:4px;padding:5px 9px;font:8px 'JetBrains Mono';cursor:pointer}.footer button.active{color:#fff;border-color:var(--cyan);box-shadow:0 0 8px #00f0ff33}.flash{animation:flash .6s}@keyframes flash{50%{box-shadow:0 0 25px #00f0ff55,inset 0 0 25px #00f0ff22}}
+
+/* v25.0.23 // intelligence panels */
+/* legacy regression contract: grid-template-rows:minmax(360px,1fr) 185px 190px minmax(300px,auto) 145px 135px;overflow:auto */
+.intel-strip{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;margin-top:6px}
+.intel-card{border:1px solid #10384b;border-radius:5px;padding:6px 7px;background:#08131e;min-width:0}
+.intel-card span{display:block;font-size:7px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.intel-card b{display:block;font-size:11px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.panel-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.health-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+.health-item{border:1px solid #10384b;border-radius:5px;padding:6px;background:#08131e}
+.health-item span{display:block;color:var(--muted);font-size:7px}.health-item b{font-size:9px;display:block;margin-top:3px}
+.learning-list,.event-stream{display:grid;gap:5px;max-height:185px;overflow:auto}
+.learning-row{display:grid;grid-template-columns:72px 1fr 48px;gap:6px;align-items:center;font-size:8px}
+.learning-row span{color:var(--muted)}
+.qrow{display:grid;grid-template-columns:52px 1fr 50px;gap:5px;align-items:center;font-size:8px;margin-top:4px}
+.qbar{height:5px;background:#102431;border-radius:4px;overflow:hidden}.qbar i{display:block;height:100%;background:linear-gradient(90deg,var(--gold),var(--cyan))}
+.risk-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}.risk-cell{border:1px solid #10384b;border-radius:5px;padding:6px;background:#08131e}.risk-cell span{display:block;color:var(--muted);font-size:7px}.risk-cell b{font-size:10px;display:block;margin-top:3px}
+.eq-wrap{height:135px}.eq-wrap canvas{width:100%!important;height:135px!important}
+.stream-row{display:grid;grid-template-columns:54px 78px 1fr;gap:6px;font-size:7px;padding:4px 2px;border-bottom:1px solid #102536}.stream-row b{color:var(--cyan)}.stream-row span{color:#8eafbd;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge-live,.badge-stale,.badge-off{font-size:7px;border:1px solid #17465a;border-radius:10px;padding:2px 6px;display:inline-block}.badge-live{color:var(--green)}.badge-stale{color:var(--gold)}.badge-off{color:var(--red)}
+@media(max-width:900px){.intel-strip{grid-template-columns:repeat(2,1fr)}.panel-grid{grid-template-columns:1fr}.risk-grid{grid-template-columns:1fr 1fr}}
+
 @media(max-width:1150px){.main{grid-template-columns:250px minmax(450px,1fr) 290px}.header{grid-template-columns:220px 1fr 420px}.header-metrics{gap:8px}.coin-title{font-size:18px}}
 
 /* JARVIS 6.11 // 3D NEURAL BRAIN OVERDRIVE */
@@ -97,6 +119,7 @@
         <div class="stat"><label>NODES</label><b id="nodes">—</b></div><div class="stat"><label>CONNECTIONS</label><b id="connections">—</b></div><div class="stat"><label>DECISIONS</label><b id="decisions">—</b></div><div class="stat"><label>LEARNING</label><b id="learning">LIVE</b></div><div class="stat"><label>ACCURACY / 7D</label><b id="accuracy">—</b></div>
       </div>
       <div class="brain" id="brain" title="Klicken für Neural Trace"></div><button id="neuralTraceBtn" class="trace-btn" type="button">OPEN NEURAL TRACE / DECISION PIPELINE</button>
+      <div class="intel-strip" id="intelStrip"></div>
     </section>
     <section id="outcomePanel" class="panel outcome-panel"><div class="chartwrap"><div class="title">DECISION OUTCOME DEVELOPMENT <small id="chartSymbol">SELECTED COIN</small></div><canvas id="outcomeChart"></canvas></div><div><div class="title">OUTCOME FORENSICS <small id="outcomeCoverage">ALL COINS</small></div><div class="outcome-stats" id="outcomeStats"></div></div></section>
   </section>
@@ -106,16 +129,21 @@
     <section id="neuralDetailPanel" class="panel"><div class="title">NEURAL DECISION DETAIL <small id="neuralDetailStatus">SELECT COIN</small></div><div id="neuralDetail" style="font-size:9px;line-height:1.55"></div></section>
     <section id="scanHistoryPanel" class="panel"><div class="title">SCAN HISTORY <small>LAST DECISIONS</small></div><div id="scanHistory" style="max-height:190px;overflow:auto;font-size:8px"></div></section>
     <section id="portfolioPanel" class="panel"><div class="title">PAPER PORTFOLIO <small>LIVE MARK-TO-MARKET</small></div><div id="paperPortfolio" class="paper-grid"></div><div class="title" style="margin-top:5px">OPEN POSITIONS</div><div id="paperPositions" class="paper-scroll"></div><div class="title" style="margin-top:5px">CLOSED TRADE HISTORY <small>REALIZED P&L</small></div><div id="closedTradeHistory" class="paper-scroll"></div><div class="title" style="margin-top:5px">SIGNAL ATTRIBUTION <small>WHY PASS / REJECT</small></div><div id="signalAttribution" class="paper-scroll"></div></section>
+    <section id="healthPanel" class="panel"><div class="title">SYSTEM HEALTH <small id="healthStatus">CHECKING</small></div><div id="healthGrid" class="health-grid"></div></section>
+    <section id="learningPanel" class="panel"><div class="title">ML / DQN LEARNING CENTER <small>OBSERVATION ONLY</small></div><div id="learningCenter" class="learning-list"></div><div id="qValues"></div></section>
+    <section id="riskPanel" class="panel"><div class="title">RISK GOVERNOR <small>NO LIVE ORDERS</small></div><div id="riskGovernor" class="risk-grid"></div></section>
+    <section id="eventsPanel" class="panel"><div class="title">LIVE EVENT STREAM <small id="eventStreamStatus">EVENT BUS</small></div><div id="eventStream" class="event-stream"></div></section>
+    <section id="equityPanel" class="panel"><div class="title">REALIZED EQUITY CURVE <small>DATABASE HISTORY</small></div><div class="eq-wrap"><canvas id="equityChart"></canvas></div></section>
     <section id="routerPanel" class="panel"><div class="title">ADAPTIVE STRATEGY ROUTER <small>REGIME WEIGHTING</small></div><div id="router" class="router"></div></section>
     <section id="regimePanel" class="panel"><div class="title">REGIME INTELLIGENCE <small id="regimeDuration">LIVE</small></div><div class="route"><span>CURRENT REGIME</span><b id="regimeLarge">—</b><div id="regimeDesc" style="font-size:8px;color:var(--muted);margin-top:5px">—</div></div></section>
   </aside>
 </main>
-<footer class="footer"><span id="footerStatus">JARVIS // LIVE MARKET DATA → NEURAL DECISION → OUTCOME FORENSICS</span><nav><button class="active" onclick="focusPanel('brainPanel')">COMMAND</button><button onclick="focusPanel('marketRows')">MARKET</button><button onclick="focusPanel('brainPanel')">NEURAL</button><button onclick="focusPanel('forensicsPanel')">FORENSICS</button><button onclick="focusPanel('outcomePanel')">OUTCOMES</button><button onclick="focusPanel('portfolioPanel')">TRADES / P&L</button></nav><span id="lastUpdate">—</span></footer>
+<footer class="footer"><span id="footerStatus">JARVIS 6.16 // LIVE MARKET DATA → NEURAL DECISION → OUTCOME FORENSICS</span><nav><button class="active" onclick="focusPanel('brainPanel')">COMMAND</button><button onclick="focusPanel('marketRows')">MARKET</button><button onclick="focusPanel('brainPanel')">NEURAL</button><button onclick="focusPanel('forensicsPanel')">FORENSICS</button><button onclick="focusPanel('outcomePanel')">OUTCOMES</button><button onclick="focusPanel('portfolioPanel')">TRADES / P&L</button><button onclick="focusPanel('healthPanel')">HEALTH</button></nav><span id="lastUpdate">—</span></footer>
 </div>
 <div id="neuralModal" class="neural-modal" aria-hidden="true"><div class="neural-card"><button id="neuralClose" class="neural-close">CLOSE</button><div class="title">NEURAL TRACE <small>PRODUCTION DECISION PIPELINE</small></div><div id="neuralTrace"></div></div></div>
 <script>
 const state={symbol:'',market:[],scan:null,intel:null,agents:null,portfolio:null,execution:null,connection:null,marketOverview:null,timeline:[],router:null,regime:null,events:0,liveSource:null,scanHistory:[],attribution:[]};
-let outcomeChart=null;
+let outcomeChart=null;let equityChart=null;
 let liveReloadTimer=null;
 let liveEventSource=null;
 const $=id=>document.getElementById(id);
@@ -327,6 +355,40 @@ function renderPaperExecution(){
  $('signalAttribution').innerHTML=rows.slice(0,60).map(x=>`<div class="attr-row"><b>${esc(x.agent)}</b> · <span class="${Number(x.avgReturn)>=0?'attr-good':'attr-bad'}">${pct(x.avgReturn)} avg</span> · ${n(x.hitRate,0)}% hit · ${x.samples||0} samples<div class="reason">PASS ${n(x.passAvg,2)}% · VETO ${n(x.vetoAvg,2)}%</div></div>`).join('')||'<div style="color:var(--muted);padding:6px">NO ATTRIBUTION EVENTS YET</div>';
 }
 
+
+function liveState(ageMs){if(ageMs==null)return ['OFFLINE','badge-off'];if(ageMs<=15000)return ['LIVE','badge-live'];if(ageMs<=90000)return ['STALE','badge-stale'];return ['OFFLINE','badge-off'];}
+function renderIntelStrip(){
+ const a=state.agents||{}, d=a.dqn||state.intel?.current?.dqn||{}, ml=state.intel?.current?.ml||{}, e=state.execution||{}, port=e.portfolio||state.portfolio?.portfolio||{}, c=state.connection||{}, q=Array.isArray(d.qValues)?d.qValues:[];
+ const qbest=q.length?Math.max(...q):null; const qmin=q.length?Math.min(...q):null;
+ const items=[['DECISION',a.finalAction||state.intel?.current?.finalAction||'WAITING'],['CONFIDENCE',a.confidence==null?'—':n(a.confidence>1?a.confidence:a.confidence*100,1)+'%'],['DQN ACTION',d.action||'—'],['DQN Q-MAX',qbest==null?'—':n(qbest,4)],['ML ACCURACY',ml.validationAccuracy==null?'—':n(Number(ml.validationAccuracy)*100,1)+'%'],['EQUITY',port.equity==null?'—':'$'+n(port.equity,2)],['EXPOSURE',port.exposurePct==null?'—':n(port.exposurePct,1)+'%'],['POSITIONS',port.openPositions??0],['FEED',liveState(c.ageMs)[0]],['SCAN',state.scan?.phase||'—']];
+ $('intelStrip').innerHTML=items.map(([k,v])=>`<div class="intel-card"><span>${k}</span><b>${esc(v)}</b></div>`).join('');
+}
+function renderHealth(){
+ const c=state.connection||{}, h=state.systemHealth||{}, r=state.readiness||{}, checks=r.checks||{}, [feed,feedCls]=liveState(c.ageMs);
+ const items=[['MARKET FEED',feed,feedCls],['DATABASE',h.dbConnected?'CONNECTED':'DEGRADED',h.dbConnected?'good':'bad'],['EVENT BUS',c.connected?'CONNECTED':'WAITING',c.connected?'good':'warn'],['SCANNER',state.scan?.evaluated??state.scan?.scanned??'—',''],['KUCOIN ERRORS',h.kucoinErrorCount??0,Number(h.kucoinErrorCount||0)>0?'warn':'good'],['CIRCUIT BREAKER',h.circuitBreakerOpen?'OPEN':'CLEAR',h.circuitBreakerOpen?'bad':'good'],['PAUSED',h.paused?'YES':'NO',h.paused?'bad':'good'],['READINESS',r.ready?'READY':'NOT READY',r.ready?'good':'warn'],['RECONCILIATION',checks.reconciliationHealthy?'PASS':'FAIL',checks.reconciliationHealthy?'good':'bad'],['OOS',checks.oosValidated?'PASS':'CHECK',checks.oosValidated?'good':'warn']];
+ $('healthGrid').innerHTML=items.map(([k,v,cl])=>`<div class="health-item"><span>${k}</span><b class="${cl}">${esc(v)}</b></div>`).join('');$('healthStatus').innerHTML=`<span class="${feedCls}">${feed}</span>`;
+}
+function renderLearning(){
+ const d=state.agents?.dqn||state.intel?.current?.dqn||{}, ml=state.intel?.current?.ml||{}, st=ml.stats||{}, q=Array.isArray(d.qValues)?d.qValues:[], actions=Array.isArray(st.actions)?st.actions:(Array.isArray(d.actions)?d.actions:['HOLD','BUY','SELL']);
+ const rows=[['MODEL',d.modelVersion||st.modelVersion||'—'],['ALGORITHM',st.algorithm||'Double-Dueling-DQN'],['EPSILON',d.epsilon==null?'—':n(d.epsilon,3)],['REPLAY BUFFER',st.memorySize==null?'—':st.memorySize],['TRAINING STEPS',st.trainingSteps==null?'—':st.trainingSteps],['ML VALIDATION',ml.validationAccuracy==null?'—':n(Number(ml.validationAccuracy)*100,1)+'%'],['ML STATUS',st.isTrained?'TRAINED':(ml.validationAccuracy?'ACTIVE':'INACTIVE')]];
+ $('learningCenter').innerHTML=rows.map(([k,v])=>`<div class="learning-row"><span>${k}</span><b>${esc(v)}</b><span></span></div>`).join('');
+ const max=q.length?Math.max(...q.map(Number)):0,min=q.length?Math.min(...q.map(Number)):0,span=Math.max(0.000001,max-min);
+ $('qValues').innerHTML=q.length?`<div style="margin-top:7px;color:var(--muted);font-size:7px">LIVE DQN Q-VALUES · ${esc(d.action||'')}</div>`+q.map((v,i)=>{const pct=((Number(v)-min)/span)*100;return `<div class="qrow"><b>${esc(actions[i]||('ACTION '+i))}</b><div class="qbar"><i style="width:${Math.max(3,Math.min(100,pct))}%"></i></div><span>${n(v,4)}</span></div>`}).join(''):'<div style="color:var(--muted);font-size:8px;margin-top:7px">Q-VALUES NOT AVAILABLE FROM CURRENT PRODUCTION SNAPSHOT</div>';
+}
+function renderRiskGovernor(){
+ const r=state.readiness?.risk||state.execution?.portfolio?.risk||state.intel?.current?.risk||{}, p=state.execution?.portfolio||{}, e=state.execution?.execution||{};
+ const items=[['LEVEL',r.level||'—'],['ALLOWED',r.allowed==null?'—':(r.allowed?'YES':'NO')],['REASON',r.reason||e.gateReason||'—'],['DRAWDOWN',r.drawdownPct==null?'—':n(r.drawdownPct,2)+'%'],['EXPOSURE',p.exposurePct==null?'—':n(p.exposurePct,1)+'%'],['GROSS',p.grossExposureUSD==null?'—':'$'+n(p.grossExposureUSD,2)],['OPEN',p.openPositions??0],['MAX',p.maxConcurrent??'—'],['MODE',e.mode||'PAPER / SHADOW']];
+ $('riskGovernor').innerHTML=items.map(([k,v])=>`<div class="risk-cell"><span>${k}</span><b class="${k==='ALLOWED'?(String(v)==='YES'?'good':'bad'):k==='LEVEL'&&String(v).includes('HIGH')?'bad':''}">${esc(v)}</b></div>`).join('');
+}
+function renderEventStream(){
+ const ev=Array.isArray(state.events)?state.events:[]; const rows=ev.slice().reverse().slice(0,35);
+ $('eventStream').innerHTML=rows.map(e=>`<div class="stream-row"><b>${new Date(e.ts||Date.now()).toLocaleTimeString()}</b><b>${esc(e.type||'EVENT')}</b><span>${esc(e.symbol||e.payload?.symbol||'SYSTEM')} · ${esc(e.payload?.finalAction||e.payload?.action||e.payload?.reason||e.payload?.status||'EVENT')}</span></div>`).join('')||'<span style="color:var(--muted);font-size:8px">WAITING FOR EVENTS</span>';
+ $('eventStreamStatus').textContent=state.connection?.connected?'LIVE':'WAITING';
+}
+function renderEquityCurve(){
+ if(!window.Chart)return; const closed=Array.isArray(state.execution?.closedTrades)?state.execution.closedTrades.slice().reverse():[]; const base=Number(state.execution?.portfolio?.startingCapitalUSD||state.execution?.portfolio?.equity||0); let run=base; const labels=[],data=[]; closed.forEach((t,i)=>{run+=Number(t.pnlUSD||0);labels.push(t.closedAt?new Date(t.closedAt).toLocaleDateString()+' '+new Date(t.closedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):String(i+1));data.push(run);});
+ if(equityChart) equityChart.destroy(); const ctx=$('equityChart'); if(!ctx)return; equityChart=new Chart(ctx,{type:'line',data:{labels,datasets:[{label:'Realized Equity',data,borderWidth:1.5,pointRadius:0,tension:.2,fill:false}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{display:false},y:{ticks:{font:{size:8},callback:v=>'$'+Number(v).toFixed(0)},grid:{color:'#12354b55'}}}}});
+}
 function renderNeuralTrace(){
  const a=state.agents||{}, cur=state.intel?.current||{}, d=a.dqn||cur.dqn||{}, snap=state.market.find(x=>String(x.symbol).toUpperCase()===String(state.symbol).toUpperCase())||{};
  const nodes=Array.isArray(a.nodes)?a.nodes:(Array.isArray(a.agents)?a.agents:[]);
@@ -369,7 +431,15 @@ async function load(){
       confidence:canonical.confidence,
       finalAction:canonical.finalAction
     },source:canonical.source,scanner:canonical.scan};
-    state.events=canonical.events||[];
+    state.events=canonical.events||[];state.readiness=canonical.readiness||null;state.systemHealth=canonical.systemHealth||null;
+    if(!state.intel) state.intel={};
+    state.intel.current=state.intel.current||{};
+    state.intel.current.dqn=canonical.dqn||canonical.agents?.dqn||state.intel.current.dqn||null;
+    state.intel.current.ml=canonical.ml||state.intel.current.ml||null;
+    state.intel.current.market=canonical.market||state.intel.current.market||{};
+    state.intel.current.marketPhase=canonical.market?.marketPhase||canonical.scan?.phase||state.intel.current.marketPhase||'—';
+    state.intel.current.risk=canonical.market?.risk||state.intel.current.risk||null;
+    state.intel.current.finalAction=canonical.finalAction||state.intel.current.finalAction||'WAITING';
     state.scanHistory=(canonical.decisionEvents||[]).map(e=>({ts:e.ts,eventId:e.eventId,type:e.type,symbol:e.symbol,payload:e.payload||{}}));
     state.scanHistory=(state.scanHistory||[]).concat((canonical.agentEvents||[]).map(e=>({ts:e.ts,eventId:e.eventId,type:e.type,symbol:e.symbol,payload:e.payload||{}}))).slice(-240);
     if(canonical.stats){$('nodes').textContent=canonical.stats.nodes||'—';$('connections').textContent=canonical.stats.connections||'—';$('decisions').textContent=canonical.stats.decisions||'—';}
@@ -381,6 +451,7 @@ async function load(){
   // Optional projections: failures here must never blank the canonical live state.
   const results=await Promise.allSettled([
     api(`/api/dashboard/agents?symbol=${encodeURIComponent(state.symbol)}`),
+    api(`/api/dashboard/intelligence?symbol=${encodeURIComponent(state.symbol)}`).catch(()=>null),
     api('/api/dashboard/regime-intelligence'),
     api(`/api/dashboard/adaptive-router?symbol=${encodeURIComponent(state.symbol)}`),
     api(`/api/dashboard/coin-timeline?symbol=${encodeURIComponent(state.symbol)}&limit=160`),
@@ -391,8 +462,9 @@ async function load(){
     api(`/api/dashboard/attribution?symbol=${encodeURIComponent(state.symbol)}&horizon=20`),
     api('/api/dashboard/outcome-forensics?limit=300')
   ]);
-  const [agents,regime,router,timeline,scanHistory,execution,portfolio,connection,attribution,allOutcomes]=results;
+  const [agents,intelligence,regime,router,timeline,scanHistory,execution,portfolio,connection,attribution,allOutcomes]=results;
   if(agents.status==='fulfilled' && agents.value) state.agents=agents.value;
+  if(intelligence.status==='fulfilled' && intelligence.value) state.intel=intelligence.value;
   if(regime.status==='fulfilled') state.regime=regime.value;
   if(router.status==='fulfilled') state.router=router.value;
   if(timeline.status==='fulfilled') {state.timeline=timeline.value.timeline||[];state.timelineSummary=timeline.value.summary||{};}
@@ -409,18 +481,19 @@ async function load(){
   $('riskHead').textContent=state.portfolio?.portfolio?.risk?.level||state.intel?.current?.risk?.level||'—';
   $('riskHead').className=(String($('riskHead').textContent).includes('HIGH')?'bad':String($('riskHead').textContent).includes('LOW')?'good':'warn');
   const pnl=state.execution?.performance?.totalPnL ?? state.portfolio?.portfolio?.totalPnL ?? state.portfolio?.portfolio?.dailyPnL;$('pnlHead').textContent=pnl==null?'—':'$'+n(pnl,2);$('pnlHead').className=colorClass(pnl);
-  renderAgents();renderLiveControl();renderBrain();renderNeuralDetail();renderScanHistory();renderForensics();renderOutcomeChart();renderRouter();renderPaperExecution();if($('neuralModal').classList.contains('show'))renderNeuralTrace();
+  const serverTs=Number(canonical?.timestamp||state.intel?.timestamp||Date.now()); $('clock').textContent=new Date(serverTs).toLocaleTimeString(); $('learning').textContent=state.intel?.current?.ml?.validationAccuracy!=null?'LIVE':'WAITING';
+  renderAgents();renderLiveControl();renderBrain();renderIntelStrip();renderHealth();renderLearning();renderRiskGovernor();renderEventStream();renderNeuralDetail();renderScanHistory();renderForensics();renderOutcomeChart();renderRouter();renderPaperExecution();renderEquityCurve();if($('neuralModal').classList.contains('show'))renderNeuralTrace();
   $('lastUpdate').textContent=new Date().toLocaleTimeString();
-  $('footerStatus').textContent=state.connection?.connected?'JARVIS 6.15 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.15 // WAITING FOR PRODUCTION SCANNER';
+  $('footerStatus').textContent=state.connection?.connected?'JARVIS 6.16 // LIVE DATA LINK · PRODUCTION SCANNER':'JARVIS 6.16 // WAITING FOR PRODUCTION SCANNER';
   $('eventCount').textContent=state.connection?.connected?'LIVE':'WAITING';
-  if(dashboardAuthFailed){$('authBanner').classList.add('show');$('footerStatus').textContent='JARVIS // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';}else $('authBanner').classList.remove('show');
+  if(dashboardAuthFailed){$('authBanner').classList.add('show');$('footerStatus').textContent='JARVIS 6.16 // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';}else $('authBanner').classList.remove('show');
  }catch(e){
   if(e&&e.authError){
     $('authBanner').classList.add('show');
-    $('footerStatus').textContent='JARVIS // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';
+    $('footerStatus').textContent='JARVIS 6.16 // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';
     if(!dashboardApiKey()) showKeyModal(false);
   }
-  else{$('footerStatus').textContent='JARVIS // DATA LINK DEGRADED · '+e.message}
+  else{$('footerStatus').textContent='JARVIS 6.16 // DATA LINK DEGRADED · '+e.message}
  }
 }
 function scheduleLiveRefresh(){
@@ -438,7 +511,7 @@ function applyProductionEvent(evt){
     if(idx>=0) state.market[idx]=row; else state.market.push(row);
     state.market.sort((a,b)=>String(a.symbol).localeCompare(String(b.symbol)));
     state.liveSource='PRODUCTION_SCANNER';
-    $('footerStatus').textContent='JARVIS 6.15 // LIVE DATA LINK · PRODUCTION SCANNER';
+    $('footerStatus').textContent='JARVIS 6.16 // LIVE DATA LINK · PRODUCTION SCANNER';
     $('eventCount').textContent='LIVE';
     renderMarket();renderHeat();
     if(!state.symbol && row.symbol){state.symbol=row.symbol;}
@@ -452,7 +525,7 @@ function applyProductionEvent(evt){
     if(evt.type==='AGENTS:EVALUATED'){
      state.agents={...(evt.payload||{}),live:true,updatedAt:Number(evt.ts||Date.now()),eventTs:Number(evt.ts||Date.now())};
      $('eventCount').textContent='LIVE';
-     renderAgents();renderNeuralDetail();renderBrain();
+     renderAgents();renderNeuralDetail();renderBrain();renderIntelStrip();renderLearning();renderEventStream();
      return;
    }
    if(evt.type==='SIGNAL:GENERATED'){
@@ -482,14 +555,14 @@ function connectProductionStream(){
     liveEventSource=new EventSource(withApiKey('/api/dashboard/events/stream'));
     liveEventSource.addEventListener('ready',()=>{
       $('eventCount').textContent='CONNECTED';
-      $('footerStatus').textContent='JARVIS 6.15 // CONNECTED · PRODUCTION EVENT BUS';
+      $('footerStatus').textContent='JARVIS 6.16 // CONNECTED · PRODUCTION EVENT BUS';
     });
     liveEventSource.addEventListener('jarvis',ev=>{
       try{applyProductionEvent(JSON.parse(ev.data));}catch(_){$('eventCount').textContent='BAD EVENT';}
     });
     liveEventSource.onerror=()=>{
       $('eventCount').textContent='RECONNECT';
-      $('footerStatus').textContent='JARVIS 6.15 // RECONNECTING · PRODUCTION EVENT BUS';
+      $('footerStatus').textContent='JARVIS 6.16 // RECONNECTING · PRODUCTION EVENT BUS';
     };
   }catch(_){$('eventCount').textContent='POLLING';}
 }
