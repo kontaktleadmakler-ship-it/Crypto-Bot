@@ -4,6 +4,6 @@ services:
     runtime: node
     plan: starter
     buildCommand: npm install
-    startCommand: node trading-bot-v25.js
+    startCommand: node trading-bot-v25-marketdata-fixed.mjs
     healthCheckPath: /health
     autoDeploy: true

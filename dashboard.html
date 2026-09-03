@@ -60,7 +60,7 @@
 <div id="authBanner" onclick="showKeyModal(true)">⚠ API-KEY UNGÜLTIG ODER FEHLT — KLICKEN ZUM NEU EINGEBEN</div>
 <div class="app">
 <header class="header">
-  <div><div class="brand">◉ JARVIS <span style="color:var(--cyan)">6.11</span></div><small>NEURAL COMMAND CENTER</small></div>
+  <div><div class="brand">◉ JARVIS <span style="color:var(--cyan)">6.15</span></div><small>NEURAL COMMAND CENTER</small></div>
   <div class="center-title"><div class="coin-title">► <span id="heroSymbol">BTC-USDT</span> ◄</div><div id="heroSub" style="font-size:8px;color:var(--muted);margin-top:3px">LIVE KUCOIN FUTURES // DECISION → OUTCOME GRAPH</div></div>
   <div class="header-metrics">
     <div class="metric"><span>LIVE SYSTEM</span><b class="online"><i class="dot"></i> ONLINE</b></div>
@@ -102,6 +102,8 @@
 <script>
 const state={symbol:'BTC-USDT',market:[],scan:null,intel:null,agents:null,portfolio:null,execution:null,connection:null,marketOverview:null,timeline:[],router:null,regime:null,events:0,liveSource:null,scanHistory:[],attribution:[]};
 let outcomeChart=null;
+let liveReloadTimer=null;
+let liveEventSource=null;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
 const n=(v,d=2)=>Number.isFinite(Number(v))?Number(v).toFixed(d):'—';
@@ -125,6 +127,7 @@ function showKeyModal(isRetry){
   $('authOverlay').classList.remove('hidden');
   $('authInput').focus();
 }
+if(!dashboardApiKey()) showKeyModal(false);
 function hideKeyModal(){$('authOverlay').classList.add('hidden');}
 $('authSubmit').addEventListener('click',()=>{
   const v=$('authInput').value.trim();
@@ -134,6 +137,13 @@ $('authSubmit').addEventListener('click',()=>{
   load();
 });
 $('authInput').addEventListener('keydown',e=>{if(e.key==='Enter')$('authSubmit').click();});
+$('coinSelect').addEventListener('change',e=>{
+  const sym=e.target.value; if(!sym||sym===state.symbol)return;
+  state.symbol=sym;
+  $('heroSymbol').textContent=sym;$('chartSymbol').textContent=sym;
+  renderBrain();renderNeuralDetail();renderForensics();renderOutcomeChart();renderScanHistory();
+  load().catch(()=>{});
+});
 function withApiKey(path){
   const key=dashboardApiKey();
   if(!key)return path;
@@ -144,8 +154,8 @@ async function api(path){
   const key=dashboardApiKey();
   if(!key){dashboardAuthFailed=true;throw Object.assign(new Error(`NO_API_KEY ${path}`),{authError:true});}
   const r=await fetch(path,{cache:'no-store',headers:{'X-API-Key':key}});
-  if(r.status===401){dashboardAuthFailed=true;throw Object.assign(new Error(`401 ${path}`),{authError:true});}
-  dashboardAuthFailed=dashboardAuthFailed&&false;
+  if(r.status===401){dashboardAuthFailed=true;throw Object.assign(new Error(`401 ${path}`),{authError:true,rejected:true});}
+  dashboardAuthFailed=false;
   if(!r.ok)throw new Error(`${r.status} ${path}`);
   return r.json();
 }
@@ -256,8 +266,8 @@ function startBrain3D(){
   window.addEventListener('resize',resize);resize();requestAnimationFrame(frame);
 }
 
-function renderForensics(){const t=state.timeline||[];const s=state.intel?.current||{};const summary=state.timelineSummary||{};$('forensicSummary').innerHTML=[['SCANS',summary.scans||t.length],['DECISIONS',summary.decisions||t.filter(x=>x.decision).length],['PASS',summary.passes||t.filter(x=>String(x.snapshot?.gateStatus||'').toUpperCase()==='PASS').length],['REJECT',summary.rejects??Math.max(0,t.length-(summary.passes||0))],['AVG REACTION',pct(summary.avgDirectedReactionPct)],['POSITIVE',summary.positiveReactionRate==null?'—':`${n(summary.positiveReactionRate,1)}%`],['MFE',t.length?pct(Math.max(...t.map(x=>Number(x.mfePct)).filter(Number.isFinite))):'—'],['MAE',t.length?pct(Math.min(...t.map(x=>Number(x.maePct)).filter(Number.isFinite))):'—']].map(x=>`<div class="fstat"><span>${x[0]}</span><b class="${String(x[1]).startsWith('-')?'bad':String(x[1]).includes('+')?'good':''}">${esc(x[1])}</b></div>`).join('');$('timeline').innerHTML=t.slice(-80).reverse().map(x=>{const q=x.outcomeQuality||'PENDING';const a=x.action||'REJECT';const r=x.outcomes?.plus10Scan?.directedReactionPct;return `<div class="event ${q==='POSITIVE'?'good':q==='NEGATIVE'?'bad':''}"><i class="rail"></i><span class="time">${new Date(x.scanTs).toLocaleTimeString()}</span><div><div class="etype">${esc(a)} · ${n(x.confidence,0)}%</div><div class="desc">SCAN · ${formatPrice(x.snapshot?.price)} · RSI ${n(x.snapshot?.rsi,1)} · OI ${n(x.snapshot?.openInterest,0)} · outcome +10 ${r==null?'PENDING':pct(r)} · MFE ${pct(x.mfePct)} · MAE ${pct(x.maePct)}</div></div></div>`}).join('')||'<div style="color:var(--muted);font-size:8px">NO HISTORICAL SCAN SNAPSHOTS YET</div>';}
-function renderRouter(){const r=state.router||{};const weights=r.weights||r.recommendedWeights||{};const entries=Object.entries(weights).slice(0,8);$('router').innerHTML=(entries.length?entries:[['TREND',84],['MEAN REVERSION',62],['LIQUIDITY',38],['BREAKOUT',79]]).map(([k,v])=>`<div class="route"><span>${esc(k)}</span><b>${n(typeof v==='object'?v.weight:v,0)}%</b></div>`).join('');}
+function renderForensics(){const t=state.timeline||[];const s=state.intel?.current||{};const summary=state.timelineSummary||{};$('forensicSummary').innerHTML=[['SCANS',summary.scans||t.length],['DECISIONS',summary.decisions||t.filter(x=>x.decision).length],['PASS',summary.passes||t.filter(x=>String(x.snapshot?.gateStatus||'').toUpperCase()==='PASS').length],['REJECT',summary.rejects??Math.max(0,t.length-(summary.passes||0))],['AVG REACTION',pct(summary.avgDirectedReactionPct)],['POSITIVE',summary.positiveReactionRate==null?'—':`${n(summary.positiveReactionRate,1)}%`],['MFE',(()=>{const v=t.map(x=>Number(x.mfePct)).filter(Number.isFinite);return v.length?pct(Math.max(...v)):'—'})()],['MAE',(()=>{const v=t.map(x=>Number(x.maePct)).filter(Number.isFinite);return v.length?pct(Math.min(...v)):'—'})()]].map(x=>`<div class="fstat"><span>${x[0]}</span><b class="${String(x[1]).startsWith('-')?'bad':String(x[1]).includes('+')?'good':''}">${esc(x[1])}</b></div>`).join('');$('timeline').innerHTML=t.slice(-80).reverse().map(x=>{const q=x.outcomeQuality||'PENDING';const a=x.action||'REJECT';const r=x.outcomes?.plus10Scan?.directedReactionPct;return `<div class="event ${q==='POSITIVE'?'good':q==='NEGATIVE'?'bad':''}"><i class="rail"></i><span class="time">${new Date(x.scanTs).toLocaleTimeString()}</span><div><div class="etype">${esc(a)} · ${n(x.confidence,0)}%</div><div class="desc">SCAN · ${formatPrice(x.snapshot?.price)} · RSI ${n(x.snapshot?.rsi,1)} · OI ${n(x.snapshot?.openInterest,0)} · outcome +10 ${r==null?'PENDING':pct(r)} · MFE ${pct(x.mfePct)} · MAE ${pct(x.maePct)}</div></div></div>`}).join('')||'<div style="color:var(--muted);font-size:8px">NO HISTORICAL SCAN SNAPSHOTS YET</div>';}
+function renderRouter(){const r=state.router||{};const weights=Array.isArray(r.weights)?r.weights:[];const entries=weights.slice(0,8).map(w=>[w.agent,w.weightPct??w.weight]);$('router').innerHTML=(entries.length?entries:[['TREND',84],['MEAN REVERSION',62],['LIQUIDITY',38],['BREAKOUT',79]]).map(([k,v])=>`<div class="route"><span>${esc(k)}</span><b>${n(v,0)}%</b></div>`).join('');}
 function renderOutcomeChart(){const t=state.timeline||[];const last=t.at(-1);if(!last)return;const labels=['DECISION','+1 SCAN','+3 SCAN','+5 SCAN','+10 SCAN'];const vals=[0,last.outcomes?.plus1Scan?.directedReactionPct,last.outcomes?.plus3Scan?.directedReactionPct,last.outcomes?.plus5Scan?.directedReactionPct,last.outcomes?.plus10Scan?.directedReactionPct].map(v=>v==null?null:Number(v));if(!window.Chart)return;const ctx=$('outcomeChart');if(outcomeChart)outcomeChart.destroy();outcomeChart=new Chart(ctx,{type:'line',data:{labels,datasets:[{data:vals,borderColor:'#00ff88',backgroundColor:'#00ff8820',fill:true,tension:.35,pointRadius:4,pointBackgroundColor:'#d8f9ff',pointBorderColor:'#00ff88'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'#123040'},ticks:{color:'#6f91a4',font:{size:8}}},y:{grid:{color:'#123040'},ticks:{color:'#6f91a4',font:{size:8},callback:v=>v+'%'}}}}});$('outcomeStats').innerHTML=[['MAX ADVERSE',pct(last.maePct)],['MAX FAVORABLE',pct(last.mfePct)],['FINAL OUTCOME',pct(last.outcomes?.plus10Scan?.directedReactionPct)],['QUALITY',last.outcomeQuality||'PENDING'],['CONFIDENCE',n(last.confidence,1)+'%'],['EVENTS',last.eventCount||0]].map(x=>`<div class="obox"><span>${x[0]}</span><b class="${String(x[1]).startsWith('-')?'bad':String(x[1]).startsWith('+')?'good':''}">${esc(x[1])}</b></div>`).join('');}
 
 function renderNeuralDetail(){
@@ -296,8 +306,8 @@ function renderPaperExecution(){
  $('paperPortfolio').innerHTML=cards.map(([k,v])=>`<div class="paper-card"><span>${k}</span><b class="${String(k).includes('P&L')?colorClass(v):''}">${v==null?'—':(String(k).includes('RATE')?n(v,1)+'%':String(k).includes('P&L')?'$'+n(v,2):typeof v==='number'?n(v,2):esc(v))}</b></div>`).join('');
  const positions=Array.isArray(e.positions)?e.positions:(Array.isArray(port.positions)?port.positions:[]);
  $('paperPositions').innerHTML=positions.length?`<table class="paper-table"><thead><tr><th>COIN</th><th>SIDE</th><th>ENTRY</th><th>MARK</th><th>P&L</th><th>SL</th><th>TP</th></tr></thead><tbody>${positions.map(x=>`<tr><td>${esc(x.symbol)}</td><td>${esc(x.direction)}</td><td>${formatPrice(x.entry)}</td><td>${formatPrice(x.mark??x.markPrice)}</td><td class="${colorClass(x.unrealizedPnL)}">$${n(x.unrealizedPnL,2)}</td><td>${formatPrice(x.stopLoss)}</td><td>${formatPrice(x.tp1||x.takeProfit)}</td></tr>`).join('')}</tbody></table>`:'<div style="color:var(--muted);padding:6px">NO OPEN PAPER POSITIONS</div>';
- const rows=state.attribution||[];
- $('signalAttribution').innerHTML=rows.slice(0,60).map(x=>`<div class="attr-row"><b>${new Date(x.ts||Date.now()).toLocaleTimeString()}</b> · <b>${esc(x.symbol)}</b> · <span class="${String(x.decision).toUpperCase()==='APPROVED'?'attr-good':'attr-bad'}">${esc(x.decision)}</span> · ${esc(x.stage||'—')}<div class="reason">${esc(x.reason||'—')}</div></div>`).join('')||'<div style="color:var(--muted);padding:6px">NO ATTRIBUTION EVENTS YET</div>';
+ const rows=(state.attribution||[]).slice().sort((a,b)=>Number(b.avgReturn||0)-Number(a.avgReturn||0));
+ $('signalAttribution').innerHTML=rows.slice(0,60).map(x=>`<div class="attr-row"><b>${esc(x.agent)}</b> · <span class="${Number(x.avgReturn)>=0?'attr-good':'attr-bad'}">${pct(x.avgReturn)} avg</span> · ${n(x.hitRate,0)}% hit · ${x.samples||0} samples<div class="reason">PASS ${n(x.passAvg,2)}% · VETO ${n(x.vetoAvg,2)}%</div></div>`).join('')||'<div style="color:var(--muted);padding:6px">NO ATTRIBUTION EVENTS YET</div>';
 }
 
 async function load(){
@@ -306,6 +316,15 @@ async function load(){
   // remain available for historical panels, but the Brain and live matrix never
   // depend on them being healthy.
   const canonical=await api(`/api/dashboard/state?symbol=${encodeURIComponent(state.symbol||'BTC-USDT')}`);
+  // Full scanned universe (all coins), not just the currently selected symbol.
+  // Previously missing entirely: the market table/heatmap only ever showed the
+  // single symbol from /state, so anything beyond the default coin never appeared
+  // until a matching SCAN:COIN SSE event happened to arrive.
+  const overview=await api('/api/dashboard/market-overview').catch(()=>null);
+  if(overview && Array.isArray(overview.rows) && overview.rows.length){
+    state.market=overview.rows;
+    state.scan={...(state.scan||{}),...(overview.scan||{})};
+  }
   if(canonical && canonical.ok){
     state.market=canonical.market?[canonical.market,...(state.market||[]).filter(x=>String(x.symbol).toUpperCase()!==String(canonical.market.symbol).toUpperCase())]:(state.market||[]);
     state.market=state.market.filter(Boolean);
@@ -341,7 +360,7 @@ async function load(){
     api(`/api/dashboard/execution?symbol=${encodeURIComponent(state.symbol)}`),
     api('/api/dashboard/portfolio-learning'),
     api('/api/dashboard/connection'),
-    api(`/api/dashboard/attribution-live?symbol=${encodeURIComponent(state.symbol)}&limit=200`)
+    api(`/api/dashboard/attribution?symbol=${encodeURIComponent(state.symbol)}&horizon=20`)
   ]);
   const [agents,regime,router,timeline,scanHistory,execution,portfolio,connection,attribution]=results;
   if(agents.status==='fulfilled' && agents.value) state.agents=agents.value;
@@ -352,7 +371,7 @@ async function load(){
   if(execution.status==='fulfilled') state.execution=execution.value;
   if(portfolio.status==='fulfilled') state.portfolio=portfolio.value;
   if(connection.status==='fulfilled') state.connection=connection.value;
-  if(attribution.status==='fulfilled') state.attribution=attribution.value?.rows||[];
+  if(attribution.status==='fulfilled') state.attribution=attribution.value?.agents||[];
 
   $('heroSymbol').textContent=state.symbol;$('chartSymbol').textContent=state.symbol;
   $('regime').textContent=state.regime?.currentRegime||state.regime?.phase||state.regime?.live?.phase||state.intel?.current?.marketPhase||'—';
@@ -366,7 +385,11 @@ async function load(){
   $('eventCount').textContent=state.connection?.connected?'LIVE':'WAITING';
   if(dashboardAuthFailed){$('authBanner').classList.add('show');$('footerStatus').textContent='JARVIS // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';}else $('authBanner').classList.remove('show');
  }catch(e){
-  if(e&&e.authError){$('authBanner').classList.add('show');$('footerStatus').textContent='JARVIS // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';}
+  if(e&&e.authError){
+    $('authBanner').classList.add('show');
+    $('footerStatus').textContent='JARVIS // AUTH FAILED · API-KEY UNGÜLTIG ODER FEHLT';
+    if(!dashboardApiKey()) showKeyModal(false);
+  }
   else{$('footerStatus').textContent='JARVIS // DATA LINK DEGRADED · '+e.message}
  }
 }

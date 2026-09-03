@@ -40,7 +40,7 @@ function route({ regime, agents=[], historicalAgents=[], action='MONITOR', gover
   });
   const sum = weights.reduce((s,x)=>s+x.weight,0) || 1;
   for (const w of weights) w.weightPct = +(w.weight/sum*100).toFixed(2);
-  weights.sort((a,b)=>b.weight-b.weight);
+  weights.sort((a,b)=>b.weight-a.weight);
 
   const vetoes = agents.filter(n => /VETO|BLOCK/i.test(String(n.status||'')));
   const dqn = agents.find(n => /DQN/i.test(String(n.label||'')));
