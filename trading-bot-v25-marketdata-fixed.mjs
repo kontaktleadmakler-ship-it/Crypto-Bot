@@ -781,6 +781,13 @@ const config = {
   BACKTEST_API_ENABLED: process.env.BACKTEST_API_ENABLED === 'true',
 };
 
+// Stable reference to the base config object, used as the fallback inside
+// evaluateDirectionGates() when no per-scan override (e.g. the time-filter's
+// throttled MIN_GATE_SCORE) is supplied. `config` itself is a const and its
+// properties are mutated in place (never reassigned), so this alias always
+// reflects the current live config.
+const moduleConfig = config;
+
 function validateConfig() {
   const numericFields = [
     'PORT', 'CAPITAL_USD', 'RISK_PERCENT', 'TOP_COIN_LIMIT', 'MAX_SIGNALS_PER_SCAN',
@@ -3273,8 +3280,9 @@ async function asyncPool(concurrency, items, iteratorFn, itemTimeoutMs = config.
   return Promise.allSettled(results);
 }
 
-function evaluateDirectionGates(dir, p, scanStats) {
+function evaluateDirectionGates(dir, p, scanStats, gateConfig) {
   const isLong = dir === 'LONG';
+  const config = gateConfig || moduleConfig;
 
   // --- Hard gates: structural preconditions. Without trend alignment and a
   // break of structure this isn't the strategy the bot claims to trade, so
@@ -3380,7 +3388,7 @@ function createEmptyScanStats() {
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0,
+    timeBlocked: 0, timeThrottled: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0,
     marketDataTimeouts: 0, marketDataQueueTimeouts: 0, marketDataFailures: 0, circuitBreakerSkips: 0
   };
 }
@@ -3496,7 +3504,20 @@ async function scanMarket() {
       }
     }
 
-    let timeFilterBlocked = false;
+    // BUGFIX (signal drought): this used to set `timeFilterBlocked = true` and
+    // then `return` for EVERY candidate in the scan as soon as a SINGLE hour
+    // or day had >=3/>=5 historically negative trades - a hard 100% block for
+    // the whole scan cycle, not the "throttling" the log message claimed.
+    // Because the stats are drawn from the last 30 days and a slot that never
+    // gets new (winning) trades never recovers on its own, this was
+    // self-reinforcing: one bad stretch could zero out every future scan
+    // during that UTC hour/weekday indefinitely - which is exactly the
+    // "no signals for a while" symptom. It now requires a larger, more
+    // reliable sample and raises the required gate score for this scan
+    // instead of suppressing every candidate outright - genuinely strong
+    // setups still get through, weak ones don't, which is what "throttle" is
+    // supposed to mean.
+    let timeFilterConfig = config;
     if (filterState.timetrend.enabled && config.ENABLE_TIME_FILTER) {
       const timeStats = await getTimeBasedAnalysis();
       if (timeStats) {
@@ -3504,9 +3525,18 @@ async function scanMarket() {
         const currentDay = new Date().getUTCDay();
         const hStat = timeStats.hourlyStats[currentHour];
         const dStat = timeStats.dailyStats[currentDay];
-        if ((hStat && hStat.trades >= 3 && hStat.pnl < 0) || (dStat && dStat.trades >= 5 && dStat.pnl < 0)) {
-          timeFilterBlocked = true;
-          logger.info(`⏰ [Time-Filter] Aktuelle Stunde (${currentHour} UTC) oder Wochentag (${currentDay}) historisch im Minus. Signale werden gedrosselt.`);
+        const hourBad = hStat && hStat.trades >= 5 && hStat.pnl < 0;
+        const dayBad = dStat && dStat.trades >= 8 && dStat.pnl < 0;
+        if (hourBad && dayBad) {
+          const penalty = Number(config.TIME_FILTER_SCORE_PENALTY ?? 15);
+          timeFilterConfig = { ...config, MIN_GATE_SCORE: config.MIN_GATE_SCORE + penalty };
+          scanStats.timeThrottled = (scanStats.timeThrottled || 0) + 1;
+          logger.info(`⏰ [Time-Filter] Stunde (${currentHour} UTC) UND Wochentag (${currentDay}) historisch im Minus. Gate-Score-Anforderung um ${penalty} erhöht (Drosselung statt Vollsperre).`);
+        } else if (hourBad || dayBad) {
+          const penalty = Number(config.TIME_FILTER_SCORE_PENALTY_SOFT ?? 7);
+          timeFilterConfig = { ...config, MIN_GATE_SCORE: config.MIN_GATE_SCORE + penalty };
+          scanStats.timeThrottled = (scanStats.timeThrottled || 0) + 1;
+          logger.info(`⏰ [Time-Filter] Stunde (${currentHour} UTC) oder Wochentag (${currentDay}) historisch leicht im Minus. Gate-Score-Anforderung um ${penalty} erhöht.`);
         }
       }
     }
@@ -3601,11 +3631,6 @@ async function scanMarket() {
         return; 
       }
 
-      if (timeFilterBlocked) {
-        scanStats.timeBlocked++;
-        return;
-      }
-
       const preCheck = riskEngine.assess({ equity: config.CAPITAL_USD + dailyNetPnL, peakEquity: peakCapital, dailyPnL: dailyNetPnL, openPositions: [...activeTrades.values()] });
       if (!preCheck.allowed) {
         if (preCheck.reason && scanStats.hasOwnProperty(preCheck.reason)) {
@@ -3680,7 +3705,7 @@ async function scanMarket() {
 
         var direction = null;
         const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
-        let primaryFail = evaluateDirectionGates(primaryDir, gateParams, scanStats);
+        let primaryFail = evaluateDirectionGates(primaryDir, gateParams, scanStats, timeFilterConfig);
 
         if (!primaryFail) {
           direction = primaryDir;
@@ -3688,7 +3713,8 @@ async function scanMarket() {
           const secondaryFail = evaluateDirectionGates(
             primaryDir === 'LONG' ? 'SHORT' : 'LONG', 
             gateParams,
-            scanStats
+            scanStats,
+            timeFilterConfig
           );
           if (!secondaryFail) {
             direction = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
