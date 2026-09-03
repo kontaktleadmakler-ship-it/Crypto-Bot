@@ -201,8 +201,109 @@ const DAILY_PROFIT_TARGET = parseFloat(process.env.DAILY_PROFIT_TARGET) || 500;
 
 let kucoinErrorCount = 0;
 let kucoinCircuitOpenUntil = 0;
+let kucoinCircuitOpenedAt = 0;
+let kucoinCircuitTrips = 0;
+let kucoinLastFailureAt = 0;
+let kucoinLastSuccessAt = 0;
+let kucoinLastError = null;
+let kucoinRequests = 0;
+let kucoinFailedRequests = 0;
+let kucoinBlockedRequests = 0;
+let kucoinProbeInFlight = false;
+let kucoinLastProbeAt = 0;
+let kucoinLastProbeResult = 'NONE';
+let kucoinLastRateLimitAt = 0;
+let kucoinLastRateLimitResetMs = 0;
 const KUCOIN_CIRCUIT_THRESHOLD = 3;
-const KUCOIN_CIRCUIT_COOLDOWN_MS = 300000;
+const KUCOIN_CIRCUIT_COOLDOWN_MS = Math.max(30000, parseInt(process.env.KUCOIN_CIRCUIT_COOLDOWN_MS, 10) || 300000);
+const KUCOIN_CIRCUIT_MAX_COOLDOWN_MS = Math.max(KUCOIN_CIRCUIT_COOLDOWN_MS, parseInt(process.env.KUCOIN_CIRCUIT_MAX_COOLDOWN_MS, 10) || 1800000);
+const KUCOIN_CIRCUIT_PROBE_TIMEOUT_MS = Math.max(5000, parseInt(process.env.KUCOIN_CIRCUIT_PROBE_TIMEOUT_MS, 10) || 15000);
+let kucoinLastWarningAt = 0;
+let kucoinLastBlockedWarningAt = 0;
+
+function isKucoinCircuitOpen() {
+  return Date.now() < kucoinCircuitOpenUntil;
+}
+
+function kucoinCooldownMs() {
+  const exponent = Math.max(0, Math.min(6, kucoinCircuitTrips - 1));
+  return Math.min(KUCOIN_CIRCUIT_MAX_COOLDOWN_MS, KUCOIN_CIRCUIT_COOLDOWN_MS * Math.pow(2, exponent));
+}
+
+function kucoinErrorDetails(error) {
+  const status = Number(error?.response?.status || 0);
+  const body = error?.response?.data;
+  const apiCode = String(body?.code || body?.data?.code || error?.code || '');
+  const message = String(body?.msg || body?.message || error?.message || 'Unknown KuCoin error');
+  return { status, apiCode, message };
+}
+
+function isKucoinTransientError(error) {
+  const { status, apiCode } = kucoinErrorDetails(error);
+  const code = String(error?.code || '');
+  return !status || status === 408 || status === 429 || status >= 500 ||
+    apiCode === '429000' || apiCode === '110188' ||
+    ['ECONNABORTED','ETIMEDOUT','ECONNRESET','ENETUNREACH','EAI_AGAIN'].includes(code);
+}
+
+function noteKucoinCircuitFailure(error) {
+  kucoinErrorCount++;
+  kucoinFailedRequests++;
+  kucoinLastFailureAt = Date.now();
+  kucoinLastError = kucoinErrorDetails(error);
+  if (!isKucoinTransientError(error)) return;
+  if (kucoinErrorCount < KUCOIN_CIRCUIT_THRESHOLD) return;
+  kucoinCircuitTrips++;
+  const cooldown = kucoinCooldownMs();
+  kucoinCircuitOpenUntil = Date.now() + cooldown;
+  kucoinCircuitOpenedAt = Date.now();
+  kucoinProbeInFlight = false;
+  if (Date.now() - kucoinLastWarningAt > 30000) {
+    kucoinLastWarningAt = Date.now();
+    logger.warn(`⚠️ KuCoin API protection OPEN: ${Math.ceil(cooldown / 1000)}s cooldown (${kucoinErrorCount} consecutive transient failures)`);
+  }
+}
+
+function kucoinCircuitError() {
+  const remaining = Math.max(0, kucoinCircuitOpenUntil - Date.now());
+  const err = new Error(`KuCoin Circuit Breaker aktiv (API-Schutz) – ${Math.ceil(remaining / 1000)}s verbleibend`);
+  err.code = 'KUCOIN_CIRCUIT_OPEN';
+  err.retryAfterMs = remaining;
+  return err;
+}
+
+async function waitForKucoinProbe() {
+  const started = Date.now();
+  while (kucoinProbeInFlight && Date.now() - started < KUCOIN_CIRCUIT_PROBE_TIMEOUT_MS) {
+    await sleep(250);
+  }
+}
+
+async function ensureKucoinRequestAllowed() {
+  if (isKucoinCircuitOpen()) {
+    kucoinBlockedRequests++;
+    if (Date.now() - kucoinLastBlockedWarningAt > 30000) {
+      kucoinLastBlockedWarningAt = Date.now();
+      logger.warn(`⏸️ KuCoin request suppressed by circuit breaker (${Math.ceil((kucoinCircuitOpenUntil - Date.now()) / 1000)}s remaining)`);
+    }
+    throw kucoinCircuitError();
+  }
+  // Half-open state: exactly one request is allowed to probe recovery.
+  if (kucoinCircuitOpenedAt > 0 && !kucoinProbeInFlight && Date.now() >= kucoinCircuitOpenUntil && kucoinLastProbeAt < kucoinCircuitOpenedAt) {
+    kucoinProbeInFlight = true;
+    kucoinLastProbeAt = Date.now();
+    kucoinLastProbeResult = 'IN_FLIGHT';
+    return;
+  }
+  if (kucoinProbeInFlight) {
+    await waitForKucoinProbe();
+    if (kucoinProbeInFlight || kucoinLastProbeResult !== 'SUCCESS') {
+      kucoinBlockedRequests++;
+      throw kucoinCircuitError();
+    }
+  }
+}
+
 
 const manualBlacklist = new Set();
 
@@ -352,7 +453,7 @@ function queueTelegramMessage(taskFn) {
   telegramQueue = telegramQueue.then(async () => {
     try {
       await taskFn();
-    } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
+    } catch (e) { if (e?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
   });
   return telegramQueue;
 }
@@ -467,7 +568,7 @@ async function persistAlertHistoryEntry(key, timestamp) {
       4000, null
     );
     if (timedOut) logger.warn?.(`[STATE] persistAlertHistoryEntry(${key}) DB-Timeout nach 4000ms`);
-  } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
+  } catch (e) { if (e?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
 }
 
 async function sendDeduplicatedAlert(key, text, cooldownMs = 300000) {
@@ -1184,56 +1285,55 @@ async function predictSignalSuccessAsync(features) {
 }
 
 async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 1000) {
-  if (Date.now() < kucoinCircuitOpenUntil) {
-    throw new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
-  }
+  // Never create another KuCoin request while the global breaker is open.
+  await ensureKucoinRequestAllowed();
 
-  // Callers may disable retries for latency-sensitive scan requests.
   if (typeof options.retries === 'number') retries = Math.max(0, options.retries);
-
   await apiRateLimiter.checkLimit();
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const startTime = Date.now();
-      const requestOptions = { ...options };
-      delete requestOptions.retries;
-      delete requestOptions.futuresQueueTimeoutMs;
-      delete requestOptions.futuresPriority;
-      const response = await axios.get(url, { timeout: options.timeout || 5000, ...requestOptions });
-      apiLatencyStats.record('kucoin', Date.now() - startTime);
-      kucoinErrorCount = 0;
-      return response;
-    } catch (error) {
-      if (error.response && error.response.status === 429 && attempt < retries) {
-        await sleep(backoffMs * Math.pow(2, attempt));
-        continue;
-      }
-      if (attempt === retries) {
-        const status = Number(error?.response?.status || 0);
-        const code = String(error?.code || '');
-        const transient =
-          !status ||
-          status === 408 ||
-          status === 429 ||
-          status >= 500 ||
-          code === 'ECONNABORTED' ||
-          code === 'ETIMEDOUT' ||
-          code === 'ECONNRESET' ||
-          code === 'ENETUNREACH' ||
-          code === 'EAI_AGAIN';
+  kucoinRequests++;
 
-        // Per-symbol 4xx failures (invalid/unsupported symbols, bad params)
-        // must not open the global circuit breaker for every other symbol.
-        if (transient) {
-          kucoinErrorCount++;
-          if (kucoinErrorCount >= KUCOIN_CIRCUIT_THRESHOLD) {
-            kucoinCircuitOpenUntil = Date.now() + KUCOIN_CIRCUIT_COOLDOWN_MS;
-            logger.warn(`⚠️ KuCoin transient-error protection active for ${Math.ceil(KUCOIN_CIRCUIT_COOLDOWN_MS / 1000)}s (${kucoinErrorCount} consecutive errors)`);
-          }
+  try {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const startTime = Date.now();
+        const requestOptions = { ...options };
+        delete requestOptions.retries;
+        delete requestOptions.futuresQueueTimeoutMs;
+        delete requestOptions.futuresPriority;
+        const response = await axios.get(url, { timeout: options.timeout || 5000, ...requestOptions });
+        apiLatencyStats.record('kucoin', Date.now() - startTime);
+        kucoinErrorCount = 0;
+        kucoinLastSuccessAt = Date.now();
+        kucoinLastError = null;
+        kucoinLastProbeResult = 'SUCCESS';
+        kucoinCircuitTrips = 0;
+        kucoinCircuitOpenUntil = 0;
+        kucoinProbeInFlight = false;
+        return response;
+      } catch (error) {
+        const { status, apiCode } = kucoinErrorDetails(error);
+        if (status === 429 || apiCode === '429000' || apiCode === '110188') {
+          kucoinLastRateLimitAt = Date.now();
+          const headerReset = Number(error?.response?.headers?.['gw-ratelimit-reset'] || error?.response?.headers?.['retry-after'] || 0);
+          kucoinLastRateLimitResetMs = headerReset > 0 ? (headerReset < 1000 ? headerReset * 1000 : headerReset) : 0;
         }
+        if ((status === 429 || apiCode === '429000' || apiCode === '110188') && attempt < retries) {
+          const headerWait = kucoinLastRateLimitResetMs || 0;
+          const waitMs = Math.min(30000, Math.max(backoffMs * Math.pow(2, attempt), headerWait));
+          await sleep(waitMs);
+          continue;
+        }
+        if (attempt === retries) {
+          noteKucoinCircuitFailure(error);
+          kucoinProbeInFlight = false;
+          kucoinLastProbeResult = kucoinCircuitTrips > 0 ? 'FAILED' : kucoinLastProbeResult;
+        }
+        throw error;
       }
-      throw error;
     }
+  } catch (error) {
+    kucoinProbeInFlight = false;
+    throw error;
   }
 }
 
@@ -1561,7 +1661,7 @@ async function acquireInstanceLock() {
           const remainingLeaseMs = ageMs === null ? null : Math.max(0, config.LOCK_STALE_AFTER_MS - ageMs);
           ownerInfo = ` owner=${lockDoc.instanceId} ageMs=${ageMs ?? 'unknown'} remainingLeaseMs=${remainingLeaseMs ?? 'unknown'} staleAfterMs=${config.LOCK_STALE_AFTER_MS}`;
         }
-      } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
+      } catch (_) { if (_?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
 
       const remainingMs = Math.max(0, deadline - Date.now());
       logger.warn(`[INSTANCE-LOCK] busy; retry ${attempt}/${maxAttempts} remainingMs=${remainingMs}${ownerInfo}`);
@@ -1707,7 +1807,7 @@ async function logFilterChange(filterKey, action, oldValue, newValue, user = 'Te
         newValue,
         user
       });
-    } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
+    } catch (e) { if (e?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
   }
   logger.info(`⚙️ [FILTER CHANGE] ${filterKey} (${action}): ${oldValue} -> ${newValue}`);
 }
@@ -1779,7 +1879,7 @@ async function initDatabase() {
       await filterChangeLogCollection.createIndex({ timestamp: -1 });
       await paperOrdersCollection.createIndex({ symbol: 1, simulatedAt: -1 });
       await executionIdempotencyCollection.createIndex({ createdAt: 1 }, { expireAfterSeconds: 7 * 24 * 3600 });
-    } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
+    } catch (e) { if (e?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
 
     if (dbReconnectInterval) { clearInterval(dbReconnectInterval); dbReconnectInterval = null; }
     const runtimeDoc = await botStateCollection.findOne({ _id: 'runtimeConfig' });
@@ -2141,7 +2241,7 @@ async function isCoinDynamicallyBlacklisted(symbol) {
         return true;
       }
     }
-  } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
+  } catch (e) { if (e?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
   return false;
 }
 
@@ -2401,17 +2501,17 @@ function deriveHigherTimeframes(candles15m, targetTimeframe) {
 
 async function fetchKucoinTickerPrice(symbol) {
   try { return await exchangeAdapter.getTicker(symbol); }
-  catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
+  catch (e) { if (e?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
 }
 
 async function fetchKucoinMarkPrice(symbol) {
   try { return await exchangeAdapter.getMarkPrice(symbol); }
-  catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
+  catch (e) { if (e?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
 }
 
 async function fetchFuturesData(symbol) {
   try { return await exchangeAdapter.getContract(symbol); }
-  catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
+  catch (e) { if (e?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
 }
 
 async function fetchOrderBookMetrics(symbol) {
@@ -2522,7 +2622,7 @@ async function processPreloadQueue() {
   isPreloading = true;
   while (preloadQueue.length > 0) {
     const { symbol, timeframe, limit } = preloadQueue.shift();
-    try { await fetchKucoinKlinesCached(symbol, timeframe, limit); } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
+    try { await fetchKucoinKlinesCached(symbol, timeframe, limit); } catch (e) { if (e?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
     await sleep(50);
   }
   isPreloading = false;
@@ -2588,15 +2688,9 @@ const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
   Math.max(5000, config.SCAN_ITEM_TIMEOUT_MS - 1000)
 );
 
-function isKucoinCircuitOpen() {
-  return Date.now() < kucoinCircuitOpenUntil;
-}
-
 async function getMarketDataBundle(symbol) {
   if (isKucoinCircuitOpen()) {
-    const err = new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
-    err.code = 'KUCOIN_CIRCUIT_OPEN';
-    throw err;
+    throw kucoinCircuitError();
   }
 
   const key = `bundle:${symbol}`;
@@ -2786,7 +2880,7 @@ async function getPeriodPerformanceStats(daysBack) {
       sharpeRatio: calculateSharpeRatio(dailyPnLs).toFixed(2),
       startDate: startDate.toISOString().slice(0, 10), endDate: now.toISOString().slice(0, 10)
     };
-  } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
+  } catch (e) { if (e?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
 }
 
 async function getTimeBasedAnalysis() {
@@ -2803,7 +2897,7 @@ async function getTimeBasedAnalysis() {
       dailyStats[dy].trades++; dailyStats[dy].pnl += pnl; if (pnl > 0) dailyStats[dy].wins++;
     });
     return { hourlyStats, dailyStats };
-  } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
+  } catch (e) { if (e?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); return null; }
 }
 
 async function checkRiskLevels() {
@@ -3775,7 +3869,7 @@ async function scanMarket() {
           else if (/timed out/i.test(e?.message || '')) scanStats.marketDataTimeouts++;
           else scanStats.marketDataFailures++;
           if (e?.code === 'KLINES_UNAVAILABLE') scanStats.missingKlines++;
-          logger.warn(`[MARKET-DATA] ${symbol}: ${e?.message || e}`);
+          if (e?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn(`[MARKET-DATA] ${symbol}: ${e?.message || e}`);
           return;
         }
 
@@ -5533,7 +5627,7 @@ function dashboardReadinessSnapshot() {
     apiKeyConfigured: Boolean(config.API_KEY || config.ALLOW_UNAUTHENTICATED_API),
     paperExecution: Boolean(config.PAPER_EXECUTION_ENABLED),
     reconciliationHealthy: recon.healthy !== false,
-    dataFeedHealthy: kucoinErrorCount < 3 && Date.now() >= kucoinCircuitOpenUntil,
+    dataFeedHealthy: kucoinErrorCount < 3 && !isKucoinCircuitOpen() && !kucoinProbeInFlight,
     riskEngineHealthy: risk.allowed === true,
     oosValidated: Number(mlModel.getStats().validationAccuracy || 0) >= Number(process.env.PRODUCTION_MIN_OOS_ACCURACY || 0.55),
     rollbackReady: Boolean(process.env.MODEL_REGISTRY_DIR || process.env.DQN_REGISTRY_DIR),
@@ -5567,7 +5661,7 @@ async function getDashboardPortfolioLearning() {
   for (const [sym, trade] of activeTrades.entries()) {
     const direction = String(trade.direction || 'LONG').toUpperCase();
     let mark = Number(trade.entry || 0);
-    try { mark = Number(await fetchKucoinTickerPrice(sym)) || mark; } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
+    try { mark = Number(await fetchKucoinTickerPrice(sym)) || mark; } catch (_) { if (_?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
     const units = Number(trade.positionSizeUnits || trade.quantity || 0);
     const notional = Number(trade.notionalUSD || (Math.abs(units) * mark) || 0);
     const entry = Number(trade.entry || mark);
@@ -5588,7 +5682,7 @@ async function getDashboardPortfolioLearning() {
       const closes=(candles||[]).map(c=>Number(c.close)).filter(Number.isFinite);
       const returns=[]; for(let i=1;i<closes.length;i++) returns.push(closes[i]/closes[i-1]-1);
       series.set(sym, returns.slice(-50));
-    } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
+    } catch (_) { if (_?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
   });
   const correlations=[];
   const syms=[...series.keys()];
@@ -5600,7 +5694,7 @@ async function getDashboardPortfolioLearning() {
 
   let closed=[];
   if (closedTradesCollection && isDbConnected) {
-    try { closed = await closedTradesCollection.find({isPartial:{$ne:true},closeTime:{$exists:true}}).sort({closeTime:-1}).limit(500).toArray(); } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
+    try { closed = await closedTradesCollection.find({isPartial:{$ne:true},closeTime:{$exists:true}}).sort({closeTime:-1}).limit(500).toArray(); } catch (_) { if (_?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
   }
   const rewards=closed.map(t=>DeepQTheTradingAgent.riskAdjustedReward({pnlUSD:Number(t.pnlUSD||0),drawdownPct:Number(t.drawdownPct||0),slippagePct:Number(t.slippagePct||0),exposurePct:Number(t.exposurePct||0),goodExit:Boolean(t.goodExit)}));
   const avgReward=rewards.length?rewards.reduce((a,b)=>a+b,0)/rewards.length:0;
@@ -5912,7 +6006,7 @@ async function getDashboardAgentNetwork(symbol) {
     });
     const ml = await predictSignalSuccessAsync(mlFeatures);
     if (Number.isFinite(ml?.probability)) mlProbability = Number(ml.probability);
-  } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
+  } catch (_) { if (_?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
 
   const equity = config.CAPITAL_USD + dailyNetPnL;
   const gross = [...activeTrades.values()].reduce((sum, t) => sum + Math.abs(Number(t.notionalUSD || 0)), 0);
@@ -6104,7 +6198,18 @@ function dashboardCanonicalState(symbol = null) {
       paused: Boolean(isPaused),
       shuttingDown: Boolean(isShuttingDown),
       kucoinErrorCount: Number(kucoinErrorCount || 0),
-      circuitBreakerOpen: Date.now() < Number(kucoinCircuitOpenUntil || 0),
+      circuitBreakerOpen: isKucoinCircuitOpen(),
+      circuitBreakerRemainingMs: Math.max(0, Number(kucoinCircuitOpenUntil || 0) - Date.now()),
+      circuitBreakerTrips: Number(kucoinCircuitTrips || 0),
+      kucoinRequests: Number(kucoinRequests || 0),
+      kucoinFailedRequests: Number(kucoinFailedRequests || 0),
+      kucoinBlockedRequests: Number(kucoinBlockedRequests || 0),
+      kucoinLastError: kucoinLastError,
+      kucoinLastSuccessAt: kucoinLastSuccessAt || null,
+      kucoinLastFailureAt: kucoinLastFailureAt || null,
+      kucoinLastProbeResult,
+      kucoinLastRateLimitAt: kucoinLastRateLimitAt || null,
+      kucoinLastRateLimitResetMs: Number(kucoinLastRateLimitResetMs || 0),
       activeTrades: activeTrades.size,
       scanCounter: Number(scanCounter || 0),
       lastScanStats: lastScanStats || null
@@ -6530,7 +6635,7 @@ app.get('/api/dashboard/events/stream', (req, res) => {
   try {
     const replay = jarvisEventBus.recent({ limit: 200, symbol, types: null }).reverse();
     for (const event of replay) send(event);
-  } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
+  } catch (_) { if (_?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
   const heartbeat = setInterval(() => res.write(`: heartbeat ${Date.now()}\n\n`), 15000);
   req.on('close', () => { clearInterval(heartbeat); jarvisEventBus.off('event', send); });
 });
@@ -6915,7 +7020,7 @@ app.get('/api/dashboard/historical/status', (req, res) => {
   const fs = require('node:fs');
   const dir = jarvisHistoricalReplay.dir;
   let files = [];
-  try { files = fs.existsSync(dir) ? fs.readdirSync(dir).filter(f => f.endsWith('.jsonl')).sort() : []; } catch (_) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
+  try { files = fs.existsSync(dir) ? fs.readdirSync(dir).filter(f => f.endsWith('.jsonl')).sort() : []; } catch (_) { if (_?.code !== 'KUCOIN_CIRCUIT_OPEN') logger.warn?.(`[RUNTIME] Best-effort operation failed: ${_.message || _}`); }
   res.json({ timestamp: Date.now(), mode: 'READ_ONLY', directory: dir, available: files.length > 0, files: files.slice(-31), liveExecutionTouched: false });
 });
 
@@ -6927,7 +7032,7 @@ app.get('/api/v24/readiness', (req, res) => {
     apiKeyConfigured: Boolean(config.API_KEY || config.ALLOW_UNAUTHENTICATED_API),
     paperExecution: Boolean(config.PAPER_EXECUTION_ENABLED),
     reconciliationHealthy: recon.healthy !== false,
-    dataFeedHealthy: kucoinErrorCount < 3 && Date.now() >= kucoinCircuitOpenUntil,
+    dataFeedHealthy: kucoinErrorCount < 3 && !isKucoinCircuitOpen() && !kucoinProbeInFlight,
     riskEngineHealthy: risk.allowed === true,
     oosValidated: Number(mlModel.getStats().validationAccuracy || 0) >= Number(process.env.PRODUCTION_MIN_OOS_ACCURACY || 0.55),
     rollbackReady: Boolean(process.env.MODEL_REGISTRY_DIR || process.env.DQN_REGISTRY_DIR),
