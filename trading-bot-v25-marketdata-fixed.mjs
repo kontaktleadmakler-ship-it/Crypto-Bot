@@ -419,10 +419,30 @@ async function sendTelegramReply(chatId, text) {
   });
 }
 
+// Wraps a DB-bound promise with a hard timeout so a degraded/hanging Mongo
+// connection can't block the caller indefinitely. A plain try/catch does NOT
+// protect against this: it only catches rejections, not an await that simply
+// never resolves. When several candidates hit this concurrently the only
+// thing that used to stop them was the outer 75s asyncPool watchdog, which
+// then times out many items at once (see [ASYNC-POOL] item timed out logs).
+function withDbTimeout(promise, ms = 4000, fallback = null) {
+  let timer;
+  const timeout = new Promise(resolve => {
+    timer = setTimeout(() => resolve({ timedOut: true, value: fallback }), ms);
+  });
+  return Promise.race([
+    Promise.resolve(promise).then(value => ({ timedOut: false, value })),
+    timeout
+  ]).finally(() => clearTimeout(timer));
+}
+
 async function getAlertTimestamp(key) {
   if (!botStateCollection || !isDbConnected) return 0;
   try {
-    const doc = await botStateCollection.findOne({ _id: `alert_${key}` });
+    const { timedOut, value: doc } = await withDbTimeout(
+      botStateCollection.findOne({ _id: `alert_${key}` }), 4000, null
+    );
+    if (timedOut) { logger.warn?.(`[STATE] getAlertTimestamp(${key}) DB-Timeout nach 4000ms`); return 0; }
     return doc ? doc.lastSent : 0;
   } catch (e) {
     return 0;
@@ -432,11 +452,15 @@ async function getAlertTimestamp(key) {
 async function persistAlertHistoryEntry(key, timestamp) {
   if (!botStateCollection || !isDbConnected) return;
   try {
-    await botStateCollection.updateOne(
-      { _id: `alert_${key}` },
-      { $set: { lastSent: timestamp } },
-      { upsert: true }
+    const { timedOut } = await withDbTimeout(
+      botStateCollection.updateOne(
+        { _id: `alert_${key}` },
+        { $set: { lastSent: timestamp } },
+        { upsert: true }
+      ),
+      4000, null
     );
+    if (timedOut) logger.warn?.(`[STATE] persistAlertHistoryEntry(${key}) DB-Timeout nach 4000ms`);
   } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
 }
 
@@ -1201,9 +1225,26 @@ async function loadPauseState() {
   } catch (e) { logger.warn?.(`[STATE] botControl-Laden fehlgeschlagen: ${e.message}`); }
 }
 
+// A transient Mongo hiccup trips riskEngine.setKillSwitch(true, ...) in the
+// catch/guard branches below. Nothing previously cleared it again once the DB
+// recovered, so a single blip permanently halted signal generation for the
+// rest of the process lifetime (assess() rejects every candidate before the
+// market-data fetch). This only clears kill-switches raised for that reason —
+// it never overrides an EMERGENCY set for an actual risk breach (drawdown etc).
+function clearStatePersistenceKillSwitch(label) {
+  if (riskEngine.killSwitch && /^state-(persistence|load)-/.test(riskEngine.killReason || '')) {
+    riskEngine.clearKillSwitch(`state-persistence-recovered:${label}`);
+    logger.info?.(`[STATE] Kill-Switch aufgehoben nach erfolgreichem ${label}-Write (Grund war: ${riskEngine.killReason})`);
+  }
+}
+
 async function persistPauseState() {
   if (!botStateCollection || !isDbConnected) { riskEngine.setKillSwitch(true, 'state-persistence-unavailable:botControl'); return false; }
-  try { await botStateCollection.updateOne({ _id: 'botControl' }, { $set: { isPaused } }, { upsert: true }); } catch (e) { logger.error?.(`[STATE] botControl-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:botControl'); return false; }
+  try {
+    await botStateCollection.updateOne({ _id: 'botControl' }, { $set: { isPaused } }, { upsert: true });
+    clearStatePersistenceKillSwitch('botControl');
+    return true;
+  } catch (e) { logger.error?.(`[STATE] botControl-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:botControl'); return false; }
 }
 
 let lastMLHistoryRecoveryAt = 0;
@@ -1747,12 +1788,20 @@ async function loadDailyPnLState() {
 
 async function persistDailyPnLState() {
   if (!botStateCollection || !isDbConnected) { riskEngine.setKillSwitch(true, 'state-persistence-unavailable:dailyPnL'); return false; }
-  try { await botStateCollection.updateOne({ _id: 'dailyPnL' }, { $set: { value: dailyNetPnL, dateUTC: todayUTCString() } }, { upsert: true }); } catch (e) { logger.error?.(`[STATE] dailyPnL-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:dailyPnL'); return false; }
+  try {
+    await botStateCollection.updateOne({ _id: 'dailyPnL' }, { $set: { value: dailyNetPnL, dateUTC: todayUTCString() } }, { upsert: true });
+    clearStatePersistenceKillSwitch('dailyPnL');
+    return true;
+  } catch (e) { logger.error?.(`[STATE] dailyPnL-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:dailyPnL'); return false; }
 }
 
 async function persistPeakCapital() {
   if (!botStateCollection || !isDbConnected) { riskEngine.setKillSwitch(true, 'state-persistence-unavailable:peakCapital'); return false; }
-  try { await botStateCollection.updateOne({ _id: 'peakCapital' }, { $set: { value: peakCapital } }, { upsert: true }); } catch (e) { logger.error?.(`[STATE] peakCapital-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:peakCapital'); return false; }
+  try {
+    await botStateCollection.updateOne({ _id: 'peakCapital' }, { $set: { value: peakCapital } }, { upsert: true });
+    clearStatePersistenceKillSwitch('peakCapital');
+    return true;
+  } catch (e) { logger.error?.(`[STATE] peakCapital-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:peakCapital'); return false; }
 }
 
 async function persistCriticalState(operation, label) {
@@ -1979,11 +2028,15 @@ async function isCoinDynamicallyBlacklisted(symbol) {
   if (manualBlacklist.has(symbol)) return true;
   try {
     if (!closedTradesCollection || !isDbConnected) return false;
-    const recentTrades = await closedTradesCollection
-      .find({ symbol: symbol })
-      .sort({ closeTime: -1 })
-      .limit(3)
-      .toArray();
+    const { timedOut, value: recentTrades } = await withDbTimeout(
+      closedTradesCollection
+        .find({ symbol: symbol })
+        .sort({ closeTime: -1 })
+        .limit(3)
+        .toArray(),
+      4000, []
+    );
+    if (timedOut) { logger.warn?.(`[RUNTIME] isCoinDynamicallyBlacklisted(${symbol}) DB-Timeout nach 4000ms`); return false; }
 
     if (recentTrades.length < 2) return false;
 
