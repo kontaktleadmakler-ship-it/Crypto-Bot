@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { ReconciliationEngine } from '../execution-core/reconciliation-engine.mjs';
 import fs from 'node:fs';
 
-const runtime = fs.readFileSync(new URL('../trading-bot-v24.6-runtime.mjs', import.meta.url), 'utf8');
+const runtime = fs.readFileSync(new URL('../trading-bot-v25-marketdata-fixed.mjs', import.meta.url), 'utf8');
 
 function exchange(snapshot) {
   return {

@@ -13,7 +13,7 @@ const { DynamicTimeStopAgent } = require('../dynamic-time-stop-agent');
   const budgetExhausted = await agent.evaluate({ trade: { entry: 100, direction: 'LONG', timeStopExtensionUsedHours: 2 }, candles, currentPrice: 116, hoursElapsed: 6, normalMaxHoldHours: 4, absoluteMaxHoldHours: 24 });
   assert.strictEqual(budgetExhausted.decision, 'EXIT');
 
-  const runtime = fs.readFileSync(path.join(__dirname, '..', 'trading-bot-v24.6-runtime.mjs'), 'utf8');
+  const runtime = fs.readFileSync(path.join(__dirname, '..', 'trading-bot-v25-marketdata-fixed.mjs'), 'utf8');
   assert.ok(runtime.includes("if (req.path === '/health') return next();"));
   assert.ok(runtime.includes("res.status(200).json({"));
   assert.ok(runtime.includes("app.get('/ready'"));

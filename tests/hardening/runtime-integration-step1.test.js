@@ -8,7 +8,7 @@ import { CriticalStateQueue } from '../../execution-core/critical-state-queue.mj
 import { ExecutionState, ExecutionStateMachine } from '../../execution-core/execution-state-machine.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const runtime = fs.readFileSync(path.join(here, '../../trading-bot-v24.6-runtime.mjs'), 'utf8');
+const runtime = fs.readFileSync(path.join(here, '../../trading-bot-v25-marketdata-fixed.mjs'), 'utf8');
 
 test('runtime routes paper opening execution through protectedSubmit', () => {
   assert.match(runtime, /protectedSubmit\(/);

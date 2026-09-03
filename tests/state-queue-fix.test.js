@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { CriticalStateQueue } from '../execution-core/critical-state-queue.mjs';
 
-const runtime = fs.readFileSync(new URL('../trading-bot-v24.6-runtime.mjs', import.meta.url), 'utf8');
+const runtime = fs.readFileSync(new URL('../trading-bot-v25-marketdata-fixed.mjs', import.meta.url), 'utf8');
 
 assert.match(runtime, /CriticalStateQueue/);
 assert.match(runtime, /persistCriticalState/);
