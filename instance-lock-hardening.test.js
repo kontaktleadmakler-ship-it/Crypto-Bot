@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
 
-const runtime = fs.readFileSync(path.join(__dirname, '..', 'trading-bot-v24.6-runtime.mjs'), 'utf8');
+const runtime = fs.readFileSync(path.join(__dirname, '..', 'trading-bot-v25-marketdata-fixed.mjs'), 'utf8');
 const env = fs.readFileSync(path.join(__dirname, '..', 'env.example'), 'utf8');
 
 assert.match(runtime, /function createInstanceLockIdentity\(\)/);

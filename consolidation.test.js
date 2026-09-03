@@ -3,7 +3,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const root = path.join(__dirname, '..');
-const runtime = fs.readFileSync(path.join(root, 'trading-bot-v24.6-runtime.mjs'), 'utf8');
+const runtime = fs.readFileSync(path.join(root, 'trading-bot-v25-marketdata-fixed.mjs'), 'utf8');
 const backtest = fs.readFileSync(path.join(root, 'backtest-engine.js'), 'utf8');
 const adapter = fs.readFileSync(path.join(root, 'exchange-adapter.js'), 'utf8');
 
