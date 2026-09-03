@@ -1,3 +1,16 @@
+// NOTE: this root-level copy is a stale duplicate of
+// tests/hardening/runtime-integration-step1.test.js. Its relative imports
+// (`../../execution-core/...`) assume a location two directories deep (like
+// tests/hardening/), so from the repo root they resolve outside the repo and
+// this file cannot run standalone (confirmed pre-existing: same
+// ERR_MODULE_NOT_FOUND occurs regardless of which runtime .mjs is
+// referenced below). It is not picked up by `npm test`
+// (scripts/run-all-tests.js only scans tests/*.test.js, non-recursively) and
+// is not the canonical suite entry - that is
+// tests/hardening/runtime-integration-step1.test.js, which passes (5/5).
+// Left un-executed here rather than "fixed" to run standalone, since
+// deduplicating/relocating stray root files is outside this task's scope
+// (aligning the runtime import target).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import fs from 'node:fs';
@@ -8,7 +21,7 @@ import { CriticalStateQueue } from '../../execution-core/critical-state-queue.mj
 import { ExecutionState, ExecutionStateMachine } from '../../execution-core/execution-state-machine.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const runtime = fs.readFileSync(path.join(here, '../../trading-bot-v24.6-runtime.mjs'), 'utf8');
+const runtime = fs.readFileSync(path.join(here, '../../trading-bot-v25-marketdata-fixed.mjs'), 'utf8');
 
 test('runtime routes paper opening execution through protectedSubmit', () => {
   assert.match(runtime, /protectedSubmit\(/);

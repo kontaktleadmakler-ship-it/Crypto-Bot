@@ -1,20 +1,14 @@
 
 // P1-P4 execution hardening integration
-import { ExecutionState, ExecutionStateMachine } from './execution-core/execution-state-machine.mjs';
-import { AtomicIdempotency } from './execution-core/atomic-idempotency.mjs';
-import { ExecutionEventStore } from './execution-core/execution-event-store.mjs';
-import { FencingLease } from './execution-core/fencing-lease.mjs';
-import { SymbolExecutionLock } from './symbol-execution-lock.mjs';
-// NOTE (2026-09-03 cleanup): assertPreTradeSafe() is NOT called directly in
-// this file. It is already enforced on every paper-execution submission
-// inside protectedSubmit() (execution-core/protected-submit.mjs), which
-// imports pre-trade-gate.mjs itself and calls assertPreTradeSafe(ctx) before
-// any order is submitted. This top-level import was unused/redundant and
-// has been removed - it gave the false impression the gate needed wiring
-// here when the actual enforcement already happens one layer down.
-import { RecoveryCoordinator } from './execution-core/recovery-coordinator.mjs';
-import { protectedSubmit } from './execution-core/protected-submit.mjs';
-import { CriticalStateQueue } from './execution-core/critical-state-queue.mjs';
+import { ExecutionState, ExecutionStateMachine } from './execution-core/execution-state-machine.js';
+import { AtomicIdempotency } from './execution-core/atomic-idempotency.js';
+import { ExecutionEventStore } from './execution-core/execution-event-store.js';
+import { FencingLease } from './execution-core/fencing-lease.js';
+import { SymbolExecutionLock } from './symbol-execution-lock.js';
+import { assertPreTradeSafe } from './pre-trade-gate.js';
+import { RecoveryCoordinator } from './execution-core/recovery-coordinator.js';
+import { protectedSubmit } from './execution-core/protected-submit.js';
+import { CriticalStateQueue } from './execution-core/critical-state-queue.js';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -181,6 +175,30 @@ const logger = winston.createLogger({
     memoryLogTransport
   ]
 });
+
+// DIAGNOSE (2026-08-29): Event-Loop-Lag-Monitor. Hintergrund: massenhafte,
+// exakt gleichzeitige "asyncPool item timed out"-Meldungen bei mehreren
+// Symbolen sind nicht zwingend Netzwerk-/Queue-Kongestion - sie treten auch
+// auf, wenn der Node-Event-Loop durch synchrone CPU-Last (z.B. Indikator-
+// Berechnung, ML/DQN-Inferenz über viele Symbole) blockiert wird, sodass
+// selbst die kürzeren inneren Timeouts (Market-Data-Bundle, Semaphore) nicht
+// pünktlich feuern und alles gemeinsam erst im äußeren 75s-Timeout auffliegt.
+// Rein additiv, per Default an, per Env-Var abschaltbar; nur ein warn-Log,
+// keine Verhaltensänderung an der Trading-/Scan-Logik.
+const ENABLE_EVENTLOOP_LAG_LOG = process.env.ENABLE_EVENTLOOP_LAG_LOG !== 'false';
+const EVENTLOOP_LAG_CHECK_MS = 1000;
+const EVENTLOOP_LAG_WARN_THRESHOLD_MS = 1000;
+if (ENABLE_EVENTLOOP_LAG_LOG) {
+  let lastLagCheck = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    const drift = now - lastLagCheck - EVENTLOOP_LAG_CHECK_MS;
+    lastLagCheck = now;
+    if (drift > EVENTLOOP_LAG_WARN_THRESHOLD_MS) {
+      logger.warn(`⏱️ [EVENT-LOOP] Verzögerung erkannt: Timer war ${drift}ms zu spät dran (Event-Loop war blockiert/überlastet). Das kann kurz vor "asyncPool item timed out"-Meldungen auf CPU-Blockierung statt Netzwerk-Kongestion hindeuten.`);
+    }
+  }, EVENTLOOP_LAG_CHECK_MS).unref?.();
+}
 
 let isShuttingDown = false;
 let currentMarketPhase = 'RANGING';
@@ -425,30 +443,10 @@ async function sendTelegramReply(chatId, text) {
   });
 }
 
-// Wraps a DB-bound promise with a hard timeout so a degraded/hanging Mongo
-// connection can't block the caller indefinitely. A plain try/catch does NOT
-// protect against this: it only catches rejections, not an await that simply
-// never resolves. When several candidates hit this concurrently the only
-// thing that used to stop them was the outer 75s asyncPool watchdog, which
-// then times out many items at once (see [ASYNC-POOL] item timed out logs).
-function withDbTimeout(promise, ms = 4000, fallback = null) {
-  let timer;
-  const timeout = new Promise(resolve => {
-    timer = setTimeout(() => resolve({ timedOut: true, value: fallback }), ms);
-  });
-  return Promise.race([
-    Promise.resolve(promise).then(value => ({ timedOut: false, value })),
-    timeout
-  ]).finally(() => clearTimeout(timer));
-}
-
 async function getAlertTimestamp(key) {
   if (!botStateCollection || !isDbConnected) return 0;
   try {
-    const { timedOut, value: doc } = await withDbTimeout(
-      botStateCollection.findOne({ _id: `alert_${key}` }), 4000, null
-    );
-    if (timedOut) { logger.warn?.(`[STATE] getAlertTimestamp(${key}) DB-Timeout nach 4000ms`); return 0; }
+    const doc = await botStateCollection.findOne({ _id: `alert_${key}` });
     return doc ? doc.lastSent : 0;
   } catch (e) {
     return 0;
@@ -458,15 +456,11 @@ async function getAlertTimestamp(key) {
 async function persistAlertHistoryEntry(key, timestamp) {
   if (!botStateCollection || !isDbConnected) return;
   try {
-    const { timedOut } = await withDbTimeout(
-      botStateCollection.updateOne(
-        { _id: `alert_${key}` },
-        { $set: { lastSent: timestamp } },
-        { upsert: true }
-      ),
-      4000, null
+    await botStateCollection.updateOne(
+      { _id: `alert_${key}` },
+      { $set: { lastSent: timestamp } },
+      { upsert: true }
     );
-    if (timedOut) logger.warn?.(`[STATE] persistAlertHistoryEntry(${key}) DB-Timeout nach 4000ms`);
   } catch (e) { logger.warn?.(`[RUNTIME] Best-effort operation failed: ${e.message}`); }
 }
 
@@ -683,14 +677,8 @@ const config = {
   SLIPPAGE_PERCENT: parseFloat(process.env.SLIPPAGE_PERCENT) || 0.05,
   FEE_PERCENT: parseFloat(process.env.FEE_PERCENT) || 0.1,
 
-  // Phase B1-B4: paper execution only.
-  // EXECUTION_MODE=paper is the explicit operator mode. In paper mode the
-  // simulator MUST be enabled unless the operator explicitly disables it.
-  // Live execution remains impossible in this runtime.
-  EXECUTION_MODE: (process.env.EXECUTION_MODE || 'paper').toLowerCase(),
-  PAPER_EXECUTION_ENABLED: (process.env.EXECUTION_MODE || 'paper').toLowerCase() === 'paper'
-    ? process.env.PAPER_EXECUTION_ENABLED !== 'false'
-    : false,
+  // Phase B1-B4: paper execution only. Live execution remains impossible.
+  PAPER_EXECUTION_ENABLED: process.env.PAPER_EXECUTION_ENABLED !== 'false',
   PAPER_EXECUTION_LATENCY_MS: parseFloat(process.env.PAPER_EXECUTION_LATENCY_MS) || 150,
   PAPER_SPREAD_PERCENT: parseFloat(process.env.PAPER_SPREAD_PERCENT) || 0,
   PAPER_SLIPPAGE_PERCENT: parseFloat(process.env.PAPER_SLIPPAGE_PERCENT) || (parseFloat(process.env.SLIPPAGE_PERCENT) || 0.05),
@@ -745,10 +733,11 @@ const config = {
   ENABLE_ORDERBOOK_ANALYSIS: process.env.ENABLE_ORDERBOOK_ANALYSIS !== 'false',
   ENABLE_CORRELATION_LIMITS: process.env.ENABLE_CORRELATION_LIMITS !== 'false',
   ENABLE_MULTI_TF_DERIVATION: process.env.ENABLE_MULTI_TF_DERIVATION !== 'false',
-  // Root-cause fix (v25.0.13): background Kline preloading competes with the
-  // scanner for the same exchange/rate-limit budget and was a contributor to
-  // market-data queue congestion. Made opt-in instead of enabled by default.
-  // See MARKET_DATA_ROOT_CAUSE_FIX_V25.0.13.md.
+  // FIX (Regression von v25.0.13 rückgängig gemacht, 2026-08-29): Preloading
+  // lief unbeobachtet parallel zum Scan und hat sich mit ihm um dieselbe
+  // Rate-Limiter-/Futures-Semaphore-Kapazität gestritten -> Kongestion ->
+  // asyncPool item timeout auf breiter Front. War laut
+  // MARKET_DATA_ROOT_CAUSE_FIX_V25.0.13.md bereits als opt-in vorgesehen.
   ENABLE_PRELOADING: process.env.ENABLE_PRELOADING === 'true',
   ENABLE_BATCH_SIGNALS: process.env.ENABLE_BATCH_SIGNALS !== 'false',
   ENABLE_TIME_FILTER: process.env.ENABLE_TIME_FILTER !== 'false',
@@ -790,13 +779,6 @@ const config = {
   ALLOW_UNAUTHENTICATED_API: process.env.ALLOW_UNAUTHENTICATED_API === 'true',
   BACKTEST_API_ENABLED: process.env.BACKTEST_API_ENABLED === 'true',
 };
-
-// Stable reference to the base config object, used as the fallback inside
-// evaluateDirectionGates() when no per-scan override (e.g. the time-filter's
-// throttled MIN_GATE_SCORE) is supplied. `config` itself is a const and its
-// properties are mutated in place (never reassigned), so this alias always
-// reflects the current live config.
-const moduleConfig = config;
 
 function validateConfig() {
   const numericFields = [
@@ -1167,6 +1149,13 @@ async function axiosGetWithRetry(url, options = {}, retries = 3, backoffMs = 100
   if (Date.now() < kucoinCircuitOpenUntil) {
     throw new Error('KuCoin Circuit Breaker aktiv (API-Schutz)');
   }
+  // FIX (Regression von v25.0.13 rückgängig gemacht, 2026-08-29): erlaubt
+  // Aufrufern, Retries pro Request abzuschalten (options.retries: 0), statt
+  // dass ein einzelner 5s-Timeout im Scan-Pfad bis zu ~15s zusätzlicher
+  // Retry-Zeit anhäuft und den Market-Data-Pool/das Futures-Semaphore
+  // verstopft. Ohne options.retries bleibt das alte Default-Verhalten
+  // unverändert.
+  if (typeof options.retries === 'number') retries = options.retries;
 
   await apiRateLimiter.checkLimit();
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -1242,26 +1231,9 @@ async function loadPauseState() {
   } catch (e) { logger.warn?.(`[STATE] botControl-Laden fehlgeschlagen: ${e.message}`); }
 }
 
-// A transient Mongo hiccup trips riskEngine.setKillSwitch(true, ...) in the
-// catch/guard branches below. Nothing previously cleared it again once the DB
-// recovered, so a single blip permanently halted signal generation for the
-// rest of the process lifetime (assess() rejects every candidate before the
-// market-data fetch). This only clears kill-switches raised for that reason —
-// it never overrides an EMERGENCY set for an actual risk breach (drawdown etc).
-function clearStatePersistenceKillSwitch(label) {
-  if (riskEngine.killSwitch && /^state-(persistence|load)-/.test(riskEngine.killReason || '')) {
-    riskEngine.clearKillSwitch(`state-persistence-recovered:${label}`);
-    logger.info?.(`[STATE] Kill-Switch aufgehoben nach erfolgreichem ${label}-Write (Grund war: ${riskEngine.killReason})`);
-  }
-}
-
 async function persistPauseState() {
   if (!botStateCollection || !isDbConnected) { riskEngine.setKillSwitch(true, 'state-persistence-unavailable:botControl'); return false; }
-  try {
-    await botStateCollection.updateOne({ _id: 'botControl' }, { $set: { isPaused } }, { upsert: true });
-    clearStatePersistenceKillSwitch('botControl');
-    return true;
-  } catch (e) { logger.error?.(`[STATE] botControl-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:botControl'); return false; }
+  try { await botStateCollection.updateOne({ _id: 'botControl' }, { $set: { isPaused } }, { upsert: true }); } catch (e) { logger.error?.(`[STATE] botControl-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:botControl'); return false; }
 }
 
 let lastMLHistoryRecoveryAt = 0;
@@ -1805,20 +1777,12 @@ async function loadDailyPnLState() {
 
 async function persistDailyPnLState() {
   if (!botStateCollection || !isDbConnected) { riskEngine.setKillSwitch(true, 'state-persistence-unavailable:dailyPnL'); return false; }
-  try {
-    await botStateCollection.updateOne({ _id: 'dailyPnL' }, { $set: { value: dailyNetPnL, dateUTC: todayUTCString() } }, { upsert: true });
-    clearStatePersistenceKillSwitch('dailyPnL');
-    return true;
-  } catch (e) { logger.error?.(`[STATE] dailyPnL-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:dailyPnL'); return false; }
+  try { await botStateCollection.updateOne({ _id: 'dailyPnL' }, { $set: { value: dailyNetPnL, dateUTC: todayUTCString() } }, { upsert: true }); } catch (e) { logger.error?.(`[STATE] dailyPnL-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:dailyPnL'); return false; }
 }
 
 async function persistPeakCapital() {
   if (!botStateCollection || !isDbConnected) { riskEngine.setKillSwitch(true, 'state-persistence-unavailable:peakCapital'); return false; }
-  try {
-    await botStateCollection.updateOne({ _id: 'peakCapital' }, { $set: { value: peakCapital } }, { upsert: true });
-    clearStatePersistenceKillSwitch('peakCapital');
-    return true;
-  } catch (e) { logger.error?.(`[STATE] peakCapital-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:peakCapital'); return false; }
+  try { await botStateCollection.updateOne({ _id: 'peakCapital' }, { $set: { value: peakCapital } }, { upsert: true }); } catch (e) { logger.error?.(`[STATE] peakCapital-Persistenz fehlgeschlagen: ${e.message}`); riskEngine.setKillSwitch(true, 'state-persistence-failed:peakCapital'); return false; }
 }
 
 async function persistCriticalState(operation, label) {
@@ -2045,15 +2009,11 @@ async function isCoinDynamicallyBlacklisted(symbol) {
   if (manualBlacklist.has(symbol)) return true;
   try {
     if (!closedTradesCollection || !isDbConnected) return false;
-    const { timedOut, value: recentTrades } = await withDbTimeout(
-      closedTradesCollection
-        .find({ symbol: symbol })
-        .sort({ closeTime: -1 })
-        .limit(3)
-        .toArray(),
-      4000, []
-    );
-    if (timedOut) { logger.warn?.(`[RUNTIME] isCoinDynamicallyBlacklisted(${symbol}) DB-Timeout nach 4000ms`); return false; }
+    const recentTrades = await closedTradesCollection
+      .find({ symbol: symbol })
+      .sort({ closeTime: -1 })
+      .limit(3)
+      .toArray();
 
     if (recentTrades.length < 2) return false;
 
@@ -2261,7 +2221,7 @@ const exchangeAdapter = new KuCoinFuturesAdapter({
   config
 });
 
-logger.info(`🔌 Exchange Adapter: ${exchangeAdapter.name} | LiveExecution: DISABLED | MarketData: ENABLED`);
+logger.info(`🔌 Exchange Adapter: ${exchangeAdapter.name} | Execution: DISABLED | MarketData: ENABLED`);
 
 const executionSimulator = new ExecutionSimulator({ config, logger });
 const executionParity = new ExecutionParity({ config, simulator: executionSimulator });
@@ -2283,15 +2243,15 @@ let reconciliationEngine = new ReconciliationEngine({
   logger
 });
 
-logger.info(`🧪 PAPER EXECUTION ${config.PAPER_EXECUTION_ENABLED ? 'ENABLED' : 'DISABLED'} | mode=${config.EXECUTION_MODE} | startingCapital=$${Number(config.CAPITAL_USD).toFixed(2)} | LiveExecution=DISABLED`);
+logger.info('🧪 Phase-B Execution aktiv | PaperOnly + Idempotency + Reconciliation + Fee/Spread/Slippage/Latency');
 
 // ==========================================
 // 11. KUCOIN MARKET DATA
 // ==========================================
 const FUTURES_GRANULARITY_MINUTES = { '1d': 1440, '4h': 240, '1h': 60, '15m': 15, '5m': 5, '1m': 1 };
 
-async function fetchKucoinKlines(symbol, timeframe = '15m', limit = 100) {
-  try { return await exchangeAdapter.getKlines(symbol, timeframe, limit); }
+async function fetchKucoinKlines(symbol, timeframe = '15m', limit = 100, noRetry = true) {
+  try { return await exchangeAdapter.getKlines(symbol, timeframe, limit, { noRetry }); }
   catch (e) { logger.warn(`[ExchangeAdapter] Klines ${symbol}/${timeframe}: ${e.message}`); return null; }
 }
 
@@ -2509,8 +2469,13 @@ const marketDataSemaphore = {
     if (next) next();
   }
 };
+// FIX (Regression von v25.0.13 rückgängig gemacht, 2026-08-29): Default war
+// wieder auf 20000ms hochgezogen worden; der dokumentierte Fix verlangt eine
+// 10s-Deckelung, damit ein hängender Bundle-Fetch deutlich vor dem äußeren
+// 75s asyncPool-Timeout auffliegt und geloggt wird, statt im selben Moment
+// unauffällig mitzutimen.
 const MARKET_DATA_BUNDLE_TIMEOUT_MS = Math.min(
-  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 20000, 5000),
+  Math.max(parseInt(process.env.MARKET_DATA_BUNDLE_TIMEOUT_MS, 10) || 10000, 5000),
   Math.max(5000, config.SCAN_ITEM_TIMEOUT_MS - 1000)
 );
 
@@ -3267,11 +3232,7 @@ async function asyncPool(concurrency, items, iteratorFn, itemTimeoutMs = config.
     if (!itemTimeoutMs) return Promise.resolve().then(() => iteratorFn(item));
     let timer;
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => {
-        const err = new Error(`asyncPool item timed out after ${itemTimeoutMs}ms`);
-        err.code = 'ASYNC_POOL_ITEM_TIMEOUT';
-        reject(err);
-      }, itemTimeoutMs);
+      timer = setTimeout(() => reject(new Error(`asyncPool item timed out after ${itemTimeoutMs}ms`)), itemTimeoutMs);
     });
     return Promise.race([Promise.resolve().then(() => iteratorFn(item)), timeout])
       .finally(() => clearTimeout(timer));
@@ -3294,9 +3255,8 @@ async function asyncPool(concurrency, items, iteratorFn, itemTimeoutMs = config.
   return Promise.allSettled(results);
 }
 
-function evaluateDirectionGates(dir, p, scanStats, gateConfig) {
+function evaluateDirectionGates(dir, p, scanStats) {
   const isLong = dir === 'LONG';
-  const config = gateConfig || moduleConfig;
 
   // --- Hard gates: structural preconditions. Without trend alignment and a
   // break of structure this isn't the strategy the bot claims to trade, so
@@ -3393,7 +3353,7 @@ function createEmptyScanStats() {
     total: 0, signalsSent: 0, totalSignalScore: 0, avgSignalScore: 0,
     universeLoaded: 0, watchlistReturned: 0, tradableCandidates: 0, filteredNonTradable: 0,
     marketDataEvaluated: 0, gatePassed: 0, gateRejected: 0, postGatePassed: 0,
-    runtimeErrors: 0, paperExecutionRejected: 0, paperOrdersFilled: 0,
+    runtimeErrors: 0, paperExecutionRejected: 0,
     skippedActiveTrade: 0, skippedMaxSignals: 0, skippedDbDisconnected: 0,
     skippedMaxConcurrentTrades: 0, skippedDailyLossLimit: 0, skippedMaxSameDirection: 0,
     skippedExposureLimit: 0, skippedMaxDrawdown: 0, missingKlines: 0,
@@ -3402,8 +3362,9 @@ function createEmptyScanStats() {
     rsiTooLow: 0, rsiTooHigh: 0, pocVwapFail: 0, macdFail: 0, fundingBlocked: 0,
     relVolTooLow: 0, cooldownActive: 0, positionTooSmallForLot: 0, correlationBlocked: 0,
     orderBookBlocked: 0, orderFlowBlocked: 0, spreadTooHigh: 0, signalHistoryBlocked: 0, skippedDynamicBlacklist: 0,
-    timeBlocked: 0, timeThrottled: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0,
-    marketDataTimeouts: 0, marketDataQueueTimeouts: 0, marketDataFailures: 0, circuitBreakerSkips: 0
+    timeBlocked: 0, newsBlackout: 0, mlBlocked: 0, dqnBlocked: 0, lowConfluenceScore: 0,
+    marketDataTimeouts: 0, marketDataQueueTimeouts: 0, marketDataFailures: 0, circuitBreakerSkips: 0,
+    mlGateSkippedLowQuality: 0
   };
 }
 
@@ -3518,20 +3479,7 @@ async function scanMarket() {
       }
     }
 
-    // BUGFIX (signal drought): this used to set `timeFilterBlocked = true` and
-    // then `return` for EVERY candidate in the scan as soon as a SINGLE hour
-    // or day had >=3/>=5 historically negative trades - a hard 100% block for
-    // the whole scan cycle, not the "throttling" the log message claimed.
-    // Because the stats are drawn from the last 30 days and a slot that never
-    // gets new (winning) trades never recovers on its own, this was
-    // self-reinforcing: one bad stretch could zero out every future scan
-    // during that UTC hour/weekday indefinitely - which is exactly the
-    // "no signals for a while" symptom. It now requires a larger, more
-    // reliable sample and raises the required gate score for this scan
-    // instead of suppressing every candidate outright - genuinely strong
-    // setups still get through, weak ones don't, which is what "throttle" is
-    // supposed to mean.
-    let timeFilterConfig = config;
+    let timeFilterBlocked = false;
     if (filterState.timetrend.enabled && config.ENABLE_TIME_FILTER) {
       const timeStats = await getTimeBasedAnalysis();
       if (timeStats) {
@@ -3539,18 +3487,9 @@ async function scanMarket() {
         const currentDay = new Date().getUTCDay();
         const hStat = timeStats.hourlyStats[currentHour];
         const dStat = timeStats.dailyStats[currentDay];
-        const hourBad = hStat && hStat.trades >= 5 && hStat.pnl < 0;
-        const dayBad = dStat && dStat.trades >= 8 && dStat.pnl < 0;
-        if (hourBad && dayBad) {
-          const penalty = Number(config.TIME_FILTER_SCORE_PENALTY ?? 15);
-          timeFilterConfig = { ...config, MIN_GATE_SCORE: config.MIN_GATE_SCORE + penalty };
-          scanStats.timeThrottled = (scanStats.timeThrottled || 0) + 1;
-          logger.info(`⏰ [Time-Filter] Stunde (${currentHour} UTC) UND Wochentag (${currentDay}) historisch im Minus. Gate-Score-Anforderung um ${penalty} erhöht (Drosselung statt Vollsperre).`);
-        } else if (hourBad || dayBad) {
-          const penalty = Number(config.TIME_FILTER_SCORE_PENALTY_SOFT ?? 7);
-          timeFilterConfig = { ...config, MIN_GATE_SCORE: config.MIN_GATE_SCORE + penalty };
-          scanStats.timeThrottled = (scanStats.timeThrottled || 0) + 1;
-          logger.info(`⏰ [Time-Filter] Stunde (${currentHour} UTC) oder Wochentag (${currentDay}) historisch leicht im Minus. Gate-Score-Anforderung um ${penalty} erhöht.`);
+        if ((hStat && hStat.trades >= 3 && hStat.pnl < 0) || (dStat && dStat.trades >= 5 && dStat.pnl < 0)) {
+          timeFilterBlocked = true;
+          logger.info(`⏰ [Time-Filter] Aktuelle Stunde (${currentHour} UTC) oder Wochentag (${currentDay}) historisch im Minus. Signale werden gedrosselt.`);
         }
       }
     }
@@ -3645,6 +3584,11 @@ async function scanMarket() {
         return; 
       }
 
+      if (timeFilterBlocked) {
+        scanStats.timeBlocked++;
+        return;
+      }
+
       const preCheck = riskEngine.assess({ equity: config.CAPITAL_USD + dailyNetPnL, peakEquity: peakCapital, dailyPnL: dailyNetPnL, openPositions: [...activeTrades.values()] });
       if (!preCheck.allowed) {
         if (preCheck.reason && scanStats.hasOwnProperty(preCheck.reason)) {
@@ -3719,39 +3663,23 @@ async function scanMarket() {
 
         var direction = null;
         const primaryDir = trend1h === 'BULLISH' ? 'LONG' : 'SHORT';
-        let primaryFail = evaluateDirectionGates(primaryDir, gateParams, scanStats, timeFilterConfig);
+        let primaryFail = evaluateDirectionGates(primaryDir, gateParams, scanStats);
 
-        // BUGFIX (short signals unreliable): the previous condition was
-        // `config.ENABLE_SHORT_SIGNALS || primaryDir === 'LONG'`. Because of
-        // the `|| primaryDir === 'LONG'` clause, whenever the PRIMARY
-        // direction was already LONG, the secondary-direction check ran
-        // unconditionally - so a SHORT could still be evaluated and traded
-        // even with ENABLE_SHORT_SIGNALS=false. Conversely this offered no
-        // protection in the other direction either, since it never actually
-        // gated on whether the SECONDARY candidate was a SHORT. Now the
-        // secondary direction is computed first and the short-signal switch
-        // is checked against that actual direction, so SHORT setups are
-        // evaluated (and can be traded) whenever ENABLE_SHORT_SIGNALS is
-        // true - reliably, regardless of what the primary direction was.
         if (!primaryFail) {
           direction = primaryDir;
-        } else {
-          const secondaryDir = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
-          if (secondaryDir === 'SHORT' && !config.ENABLE_SHORT_SIGNALS) {
-            scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
+        } else if (config.ENABLE_SHORT_SIGNALS || primaryDir === 'LONG') {
+          const secondaryFail = evaluateDirectionGates(
+            primaryDir === 'LONG' ? 'SHORT' : 'LONG', 
+            gateParams,
+            scanStats
+          );
+          if (!secondaryFail) {
+            direction = primaryDir === 'LONG' ? 'SHORT' : 'LONG';
           } else {
-            const secondaryFail = evaluateDirectionGates(
-              secondaryDir,
-              gateParams,
-              scanStats,
-              timeFilterConfig
-            );
-            if (!secondaryFail) {
-              direction = secondaryDir;
-            } else {
-              scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
-            }
+            scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
           }
+        } else {
+          scanStats[primaryFail] = (scanStats[primaryFail] || 0) + 1;
         }
 
         if (direction !== null) scanStats.gatePassed++;
@@ -3861,7 +3789,23 @@ async function scanMarket() {
           });
 
           const mlPrediction = predictSignalSuccess(mlFeatures);
-          if (mlPrediction.trained && mlPrediction.probability < config.ML_MIN_PREDICTION_PROBABILITY) {
+          // FIX (2026-08-29): Ein Modell mit validationQuality LOW_SAMPLE
+          // oder WEAK_POSITIVE_DETECTION hat auf dem eigenen Validierungsset
+          // nicht einen einzigen Erfolgsfall korrekt erkannt (Precision/
+          // Recall 0%, siehe Trainings-Log) - es sagt de facto immer "nein".
+          // Bisher durfte so ein erkennbar unbrauchbares Modell trotzdem
+          // JEDES Signal blockieren (postGatePassed>0, signals=0 über Tage).
+          // Das Qualitäts-Label wurde beim Training zwar schon berechnet und
+          // geloggt, aber nirgends zur Gate-Entscheidung herangezogen. Bis
+          // genug Trades für ein verlässliches Modell da sind, wird das
+          // ML-Gate jetzt übersprungen (nicht "bestanden" - nur nicht als
+          // Blocker missbraucht); alle anderen Gates (Gate-Score, DQN,
+          // Risk-Engine etc.) greifen unverändert weiter.
+          const mlQualityUnreliable = mlPrediction.trained &&
+            (mlPrediction.validationQuality === 'LOW_SAMPLE' || mlPrediction.validationQuality === 'WEAK_POSITIVE_DETECTION');
+          if (mlQualityUnreliable) {
+            scanStats.mlGateSkippedLowQuality = (scanStats.mlGateSkippedLowQuality || 0) + 1;
+          } else if (mlPrediction.trained && mlPrediction.probability < config.ML_MIN_PREDICTION_PROBABILITY) {
             scanStats.mlBlocked++;
             return;
           }
@@ -4037,20 +3981,6 @@ async function scanMarket() {
                 return;
               }
               // Use the actual deterministic simulated fill for all downstream risk/TP math.
-              scanStats.paperOrdersFilled = (scanStats.paperOrdersFilled || 0) + 1;
-              jarvisEventBus.emitEvent('PAPER:ORDER_FILLED', {
-                symbol,
-                direction,
-                orderId: paperOrder.orderId,
-                signalId: paperOrder.signalId,
-                status: paperOrder.status,
-                quantity: Number(paperOrder.filledQty || 0),
-                entryPrice: Number(paperOrder.avgFillPrice || 0),
-                notionalUSD: Number(paperOrder.notionalUSD || 0),
-                feeUSD: Number(paperOrder.feeUSD || 0),
-                timestamp: Date.now()
-              }, { source: 'paper-execution', persist: true, persistReplay: true, persistMinIntervalMs: 0 });
-              logger.info(`[PAPER ORDER FILLED] ${symbol} ${direction} qty=${Number(paperOrder.filledQty || 0)} price=${Number(paperOrder.avgFillPrice || 0).toFixed(8)} notional=$${Number(paperOrder.notionalUSD || 0).toFixed(2)}`);
               entryPrice = paperOrder.avgFillPrice;
               if (paperOrder.status === 'PARTIALLY_FILLED') {
                 const filledRatio = paperOrder.filledQty / Math.max(1e-12, sizing.positionSizeUnits);
@@ -4168,7 +4098,12 @@ async function scanMarket() {
     }
 
     logger.info(`✅ Scan beendet – ${signalsSent} Signale gesendet (Phase: ${currentMarketPhase})`);
+    // FIX (2026-08-29): postGatePassed==5 aber signals==0 über mehrere Tage
+    // gemeldet - die Zähler für alles zwischen Gate-Pass und Signalversand
+    // wurden zwar schon mitgezählt, tauchten aber nie in diesem Log auf.
+    // Ergänzt, damit sichtbar ist, WELCHER Block die Kandidaten schluckt.
     logger.info(`[SCAN-DIAGNOSTICS] universe=${scanStats.universeLoaded} watchlist=${scanStats.watchlistReturned} tradable=${scanStats.tradableCandidates} filteredNonTradable=${scanStats.filteredNonTradable} candidates=${scanStats.total} evaluated=${scanStats.marketDataEvaluated} gatePassed=${scanStats.gatePassed} gateRejected=${scanStats.gateRejected} postGatePassed=${scanStats.postGatePassed} signals=${scanStats.signalsSent} runtimeErrors=${scanStats.runtimeErrors} marketDataTimeouts=${scanStats.marketDataTimeouts} marketDataFailures=${scanStats.marketDataFailures} circuitBreakerSkips=${scanStats.circuitBreakerSkips}`);
+    logger.info(`[SCAN-DIAGNOSTICS-POSTGATE] orderFlowBlocked=${scanStats.orderFlowBlocked} fundingBlocked=${scanStats.fundingBlocked} cooldownActive=${scanStats.cooldownActive} correlationBlocked=${scanStats.correlationBlocked} orderBookBlocked=${scanStats.orderBookBlocked} mlBlocked=${scanStats.mlBlocked} mlGateSkippedLowQuality=${scanStats.mlGateSkippedLowQuality || 0} agentBlocked=${scanStats.agentBlocked || 0} dqnBlocked=${scanStats.dqnBlocked} signalHistoryBlocked=${scanStats.signalHistoryBlocked} positionTooSmallForLot=${scanStats.positionTooSmallForLot} reconciliationBlocked=${scanStats.reconciliationBlocked || 0} riskEngineBlocked=${scanStats.riskEngineBlocked || 0}`);
 
     if (marketPhaseLogsCollection && isDbConnected) {
       await marketPhaseLogsCollection.insertOne({
@@ -5279,41 +5214,17 @@ const dashboardDecisionReplay = [];
 // scanner. No second synthetic market scanner is used for the live matrix.
 // ---------------------------------------------------------------------------
 const dashboardLiveCoinSnapshots = new Map();
-// Canonical production agent snapshots for the dashboard. The dashboard must
-// render the decision graph from the scanner's already-computed agent result,
-// never by launching a second ML/DQN/Risk evaluation.
-const dashboardLiveAgentSnapshots = new Map();
-const dashboardLiveDecisionSnapshots = new Map();
 let dashboardLastLiveScanCounter = 0;
 jarvisEventBus.on('event', (event) => {
-  if (!event || !event.type) return;
-  const symbol = String(event.symbol || event.payload?.symbol || '').toUpperCase();
-  if (event.type === 'SCAN:COIN' && symbol) {
-    const payload = event.payload || {};
-    dashboardLiveCoinSnapshots.set(symbol, {
-      ...payload,
-      symbol,
-      eventTs: Number(event.ts || Date.now()),
-      source: 'production-scanner'
-    });
-    dashboardLastLiveScanCounter = Math.max(dashboardLastLiveScanCounter, Number(payload.scanCounter || 0));
-  }
-  if (event.type === 'AGENTS:EVALUATED' && symbol) {
-    dashboardLiveAgentSnapshots.set(symbol, {
-      ...(event.payload || {}),
-      symbol,
-      eventTs: Number(event.ts || Date.now()),
-      source: 'production-scanner'
-    });
-  }
-  if (event.type === 'DECISION:REPLAY' && symbol) {
-    dashboardLiveDecisionSnapshots.set(symbol, {
-      ...(event.payload || {}),
-      symbol,
-      eventTs: Number(event.ts || Date.now()),
-      source: 'production-scanner'
-    });
-  }
+  if (!event || event.type !== 'SCAN:COIN' || !event.symbol) return;
+  const payload = event.payload || {};
+  dashboardLiveCoinSnapshots.set(String(event.symbol).toUpperCase(), {
+    ...payload,
+    symbol: String(event.symbol).toUpperCase(),
+    eventTs: Number(event.ts || Date.now()),
+    source: 'production-scanner'
+  });
+  dashboardLastLiveScanCounter = Math.max(dashboardLastLiveScanCounter, Number(payload.scanCounter || 0));
 });
 
 function dashboardRecordProductionScanCoin(snapshot, severity = 'INFO') {
@@ -5904,86 +5815,19 @@ async function getDashboardAutonomousSupervisor(symbol) {
   return result;
 }
 
-function marketRowsForDashboard() {
-  return dashboardLiveScannerRows();
-}
-
-function dashboardCanonicalState(symbol = null) {
-  const key = symbol ? String(symbol).toUpperCase() : null;
-  const marketRows = dashboardLiveScannerRows();
-  const market = key ? (dashboardLiveCoinSnapshots.get(key) || null) : (marketRows[0] || null);
-  const agent = key ? (dashboardLiveAgentSnapshots.get(key) || null) : (market ? dashboardLiveAgentSnapshots.get(market.symbol) : null);
-  const decision = key ? (dashboardLiveDecisionSnapshots.get(key) || null) : (agent ? dashboardLiveDecisionSnapshots.get(agent.symbol) : null);
-  const ageMs = market ? Math.max(0, Date.now() - Number(market.eventTs || 0)) : null;
-  return {
-    ok: Boolean(market || agent || decision),
-    source: 'PRODUCTION_SCANNER_SNAPSHOT',
-    timestamp: Date.now(),
-    symbol: key || market?.symbol || null,
-    market,
-    marketRows,
-    agents: agent,
-    decision,
-    scan: { ...dashboardScanState, universe: dashboardScanUniverse, lastLiveScanCounter: dashboardLastLiveScanCounter },
-    connection: { connected: Boolean(market && ageMs !== null && ageMs <= 30000), ageMs },
-    nodes: Array.isArray(agent?.nodes) ? agent.nodes : [],
-    dqn: agent?.dqn || null,
-    confidence: Number(agent?.confidence || decision?.confidence || 0),
-    finalAction: agent?.finalAction || decision?.action || 'WAITING'
-  };
-}
-
-app.get('/api/dashboard/state', (req, res) => {
-  const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : null;
-  const state = dashboardCanonicalState(symbol);
-  // Unified read-only dashboard projection. All expensive market/ML/RL work is
-  // performed by the production scanner; the dashboard only consumes snapshots
-  // and recent events. This also makes the Brain usable immediately after a
-  // scan because it receives agent nodes, decision replay and connection data
-  // from the same response.
-  const events = jarvisEventBus.recent({ limit: 120, since: 0, symbol, types: null });
-  const agentEvents = events.filter(e => e.type === 'AGENTS:EVALUATED').slice(-30).reverse();
-  const decisionEvents = events.filter(e => /DECISION|SIGNAL:GENERATED|RISK:EVALUATED|SUPERVISOR:EVALUATED/.test(String(e.type))).slice(-60).reverse();
-  const latestAgentEvent = agentEvents[0] || null;
-  const latestDecisionEvent = decisionEvents[0] || null;
-  if (!state.agents && latestAgentEvent) {
-    state.agents = { ...(latestAgentEvent.payload || {}), symbol: latestAgentEvent.symbol || symbol, eventTs: latestAgentEvent.ts, source: 'PRODUCTION_SCANNER_EVENT_BUS' };
-    state.nodes = Array.isArray(state.agents.nodes) ? state.agents.nodes : [];
-    state.dqn = state.agents.dqn || null;
-    state.confidence = Number(state.agents.confidence || 0);
-    state.finalAction = state.agents.finalAction || state.finalAction;
-  }
-  state.events = events;
-  state.agentEvents = agentEvents;
-  state.decisionEvents = decisionEvents;
-  state.latestAgentEvent = latestAgentEvent;
-  state.latestDecisionEvent = latestDecisionEvent;
-  state.stats = {
-    nodes: Array.isArray(state.nodes) ? state.nodes.length : 0,
-    connections: Array.isArray(state.nodes) ? Math.max(0, state.nodes.length - 1) + Math.max(0, state.nodes.length - 2) : 0,
-    decisions: decisionEvents.length,
-    agentEvaluations: agentEvents.length,
-    liveCoins: dashboardLiveCoinSnapshots.size
-  };
-  res.setHeader('Cache-Control', 'no-store');
-  if (!state.ok && !state.agents && !latestAgentEvent) return res.status(503).json({ ...state, error: 'DASHBOARD_STATE_UNAVAILABLE' });
-  state.ok = true;
-  res.json(state);
-});
-
 app.get('/api/dashboard/agents', async (req, res) => {
   try {
-    const symbol = String(req.query.symbol || dashboardScanUniverse[0] || 'BTC-USDT').toUpperCase();
+    const symbol = String(req.query.symbol || 'BTC-USDT').toUpperCase();
     if (!/^[A-Z0-9]+-USDT$/.test(symbol)) return res.status(400).json({ error: 'INVALID_SYMBOL' });
-    const snap = dashboardCanonicalState(symbol);
-    if (!snap.agents) return res.status(503).json({ error: 'AGENT_SNAPSHOT_UNAVAILABLE', source: 'PRODUCTION_SCANNER_SNAPSHOT' });
+    const data = await getDashboardAgentNetwork(symbol);
     res.setHeader('Cache-Control', 'no-store');
-    res.json({ ...snap.agents, canonical: true, source: 'PRODUCTION_SCANNER_SNAPSHOT', market: snap.market, decision: snap.decision });
+    res.json(data);
   } catch (e) {
     logger.warn(`[Dashboard Agents] ${e.message}`);
     res.status(503).json({ error: e.message });
   }
 });
+
 app.get('/api/dashboard/supervisor', async (req, res) => {
   try {
     const symbol = String(req.query.symbol || dashboardScanUniverse[0] || 'BTC-USDT').toUpperCase();
@@ -6048,26 +5892,27 @@ app.get('/api/dashboard/scan', async (req, res) => {
 app.get('/api/dashboard/intelligence', async (req, res) => {
   try {
     const symbol = String(req.query.symbol || dashboardScanUniverse[0] || 'BTC-USDT').toUpperCase();
-    const snap = dashboardCanonicalState(symbol);
-    if (!snap.ok) return res.status(503).json({ error: 'DASHBOARD_STATE_UNAVAILABLE', source: 'PRODUCTION_SCANNER_SNAPSHOT' });
+    const [market, agents] = await Promise.all([getDashboardData(symbol), getDashboardAgentNetwork(symbol)]);
     const mlStats = mlModel.getStats();
     const dqnStats = dqnAgent.getStats();
     const drift = modelDriftMonitor.status();
+    const readiness = dashboardReadinessSnapshot();
     const performance = dashboardAgentPerformance();
-    const replay = dashboardDecisionReplay.filter(x => String(x.symbol).toUpperCase() === symbol).slice(0, 80);
-    const a = snap.agents || {};
+    const replay = dashboardDecisionReplay.slice(0, 80);
     const current = {
-      symbol, timestamp: snap.timestamp, marketPhase: snap.market?.marketPhase || currentMarketPhase,
-      regime: snap.market?.marketPhase || currentMarketPhase,
-      macro: { value: snap.market?.sentimentValue ?? null, classification: snap.market?.sentimentClass ?? null, bias: snap.market?.sentimentBias ?? null },
-      confidence: Number(a.confidence || snap.confidence || 0), consensus: Number(a.consensus || 0), vetoes: a.vetoes || [], finalAction: a.finalAction || snap.finalAction,
+      symbol, timestamp: Date.now(), marketPhase: dashboardRegimeSnapshot(),
+      regime: dashboardRegimeSnapshot(),
+      macro: { value: market.sentiment?.value ?? null, classification: market.sentiment?.classification ?? null, bias: market.sentiment?.bias ?? null, allowed: market.sentiment?.allowed ?? null },
+      confidence: agents.confidence, consensus: agents.consensus, vetoes: agents.vetoes, finalAction: agents.finalAction,
       activeTrades: activeTrades.size, dailyPnL: dailyNetPnL, equity: config.CAPITAL_USD + dailyNetPnL,
-      risk: snap.market?.risk || null, agents: a.nodes || [], dqn: { ...(a.dqn || {}), ...dqnStats },
-      ml: { validationAccuracy: mlStats.validationAccuracy, stats: mlStats }, drift,
-      execution: null, canonical: true, source: 'PRODUCTION_SCANNER_SNAPSHOT'
+      risk: market.risk, agents: agents.nodes,
+      dqn: { ...dqnStats, action: agents.dqn?.action, qValues: agents.dqn?.qValues },
+      ml: { validationAccuracy: mlStats.validationAccuracy, stats: mlStats },
+      drift,
+      execution: readiness.execution
     };
     res.setHeader('Cache-Control','no-store');
-    res.json({ timestamp: snap.timestamp, current, replay, performance, scanner: snap.scan, regime: current.regime, source: 'PRODUCTION_SCANNER_SNAPSHOT' });
+    res.json({ timestamp: Date.now(), current, replay, performance, readiness, scanner: { ...dashboardScanState, universe: dashboardScanUniverse, intervalMs: Number(config.SCAN_INTERVAL_MS || config.SCAN_INTERVAL || 0) || null }, regime: dashboardRegimeSnapshot() });
   } catch (e) {
     logger.warn(`[Dashboard Intelligence] ${e.message}`);
     res.status(503).json({ error: e.message });
@@ -6103,26 +5948,6 @@ async function getDashboardExecutionPortfolio(symbol) {
   const longNotional = positions.filter(p => p.direction === 'LONG').reduce((a,p) => a + Math.abs(Number(p.notionalUSD || 0)), 0);
   const shortNotional = positions.filter(p => p.direction === 'SHORT').reduce((a,p) => a + Math.abs(Number(p.notionalUSD || 0)), 0);
   const unrealizedPnL = positions.reduce((a,p) => a + Number(p.unrealizedPnL || 0), 0);
-  // Paper-trade history is the source of truth for realized P&L / win rate.
-  let closedTrades = [];
-  if (closedTradesCollection && isDbConnected) {
-    try {
-      closedTrades = await closedTradesCollection.find({
-        isPartial: { $ne: true },
-        closeTime: { $exists: true }
-      }).sort({ closeTime: -1 }).limit(500).toArray();
-    } catch (e) {
-      logger.warn(`[Dashboard Execution] closed trade history unavailable: ${e.message}`);
-    }
-  }
-  const realizedPnL = closedTrades.reduce((sum,t) => sum + Number(t.pnlUSD || 0), 0);
-  const wins = closedTrades.filter(t => Number(t.pnlUSD || 0) > 0).length;
-  const losses = closedTrades.filter(t => Number(t.pnlUSD || 0) <= 0).length;
-  const totalFees = closedTrades.reduce((sum,t) =>
-    sum + Number(t.entryFeeUSD || 0) + Number(t.executionEntryFeeUSD || 0) +
-    Number(t.exitFeeUSD || 0) + Number(t.executionExitFeeUSD || 0), 0);
-  const winRate = closedTrades.length ? wins / closedTrades.length * 100 : 0;
-  const totalPnL = realizedPnL + unrealizedPnL;
   const concentration = positions.map(p => ({ symbol: p.symbol, pct: gross > 0 ? Math.abs(p.notionalUSD) / gross * 100 : 0 }));
   const maxConcentration = concentration.length ? Math.max(...concentration.map(x => x.pct)) : 0;
   const risk = riskEngine.assess({ equity, peakEquity: peakCapital, dailyPnL: dailyNetPnL, openPositions: positions });
@@ -6155,34 +5980,8 @@ async function getDashboardExecutionPortfolio(symbol) {
     lifecycle: stages,
     latestDecision: latest,
     positions,
-    closedTrades: closedTrades.slice(0, 100).map(t => ({
-      symbol: t.symbol,
-      direction: t.direction,
-      entry: Number(t.entry || t.entryPrice || 0),
-      exit: Number(t.exitPrice || t.executionExitPrice || 0),
-      pnlUSD: Number(t.pnlUSD || 0),
-      pnlPct: Number(t.pnlPct || 0),
-      closeReason: t.closeReason || 'unknown',
-      openedAt: t.openTime || t.entryTime || t.startTime || null,
-      closedAt: t.closeTime || null,
-      signalId: t.signalId || null
-    })),
-    performance: {
-      realizedPnL,
-      unrealizedPnL,
-      totalPnL,
-      winRate,
-      wins,
-      losses,
-      closedTrades: closedTrades.length,
-      totalFees
-    },
     portfolio: {
-      mode: 'PAPER',
-      startingCapitalUSD: Number(config.CAPITAL_USD || 0),
-      equity: equity + unrealizedPnL, dailyPnL: Number(dailyNetPnL || 0),
-      realizedPnL, unrealizedPnL, totalPnL, winRate, wins, losses,
-      grossExposureUSD: gross,
+      equity, dailyPnL: Number(dailyNetPnL || 0), unrealizedPnL, grossExposureUSD: gross,
       exposurePct: equity > 0 ? gross / equity * 100 : 0,
       longNotionalUSD: longNotional, shortNotionalUSD: shortNotional,
       netDirectionalUSD: longNotional - shortNotional,
@@ -6809,7 +6608,7 @@ async function runExecutionRecovery() {
     };
 
     const { ReconciliationEngine: StartupReconciliationEngine } =
-      await import('./execution-core/reconciliation-engine.mjs');
+      await import('./execution-core/reconciliation-engine.js');
 
     // Current system is intentionally paper-only. The paper adapter is the
     // authoritative remote ledger for paper mode. A future account-enabled
