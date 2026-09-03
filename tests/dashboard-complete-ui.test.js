@@ -1,0 +1,15 @@
+const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+const html = fs.readFileSync(path.join(__dirname,'..','dashboard.html'),'utf8');
+assert.match(html,/id="brainPanel"/);
+assert.match(html,/id="portfolioPanel"/);
+assert.match(html,/id="closedTradeHistory"/);
+assert.match(html,/OPEN NEURAL TRACE \/ DECISION PIPELINE/);
+assert.match(html,/function renderNeuralTrace/);
+assert.match(html,/function selectDashboardSymbol/);
+assert.match(html,/TRADES \/ P&L/);
+assert.match(html,/state\.execution\?\.performance\?\.totalPnL/);
+assert.match(html,/grid-template-rows:auto auto auto auto auto auto/);
+assert.match(html,/\.right\{display:grid/);
+console.log('dashboard-complete-ui: PASS');

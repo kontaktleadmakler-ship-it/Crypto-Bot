@@ -1,8 +1,11 @@
-# Dashboard Fix — 2026-09-03
+# Dashboard Fix v25.0.19
 
-- Fixed the right column: six dashboard panels were defined but only three grid rows existed, pushing lower panels below the viewport. The right column now exposes all six panels with its own scrollbar.
-- Added responsive layouts so panels remain reachable on smaller screens.
-- The dashboard now consumes the existing read-only `/api/dashboard/intelligence` projection so ML learning/sample and validation accuracy fields can populate.
-- Server time now renders from the canonical server timestamp.
-- Added a dashboard regression test.
-- No live order execution was added or enabled.
+## Fixed
+- Footer navigation now targets complete dashboard panels instead of inner elements that could not scroll correctly.
+- Neural Core is clickable and has an explicit `OPEN NEURAL TRACE / DECISION PIPELINE` action.
+- Added a modal Neural Trace showing market input, technical/sentiment/ML/DQN/risk/supervisor/final-decision/outcome stages.
+- Market rows are clickable and switch the selected symbol.
+- Added visible closed paper-trade history backed by `/api/dashboard/execution` and `closedTrades`.
+- Dashboard header P&L now displays realized + unrealized total P&L in USD when available, instead of treating dollar P&L as a percentage.
+- Expanded the right dashboard column with its own scroll container so all forensic, neural, scan-history, portfolio, router and regime panels are reachable.
+- Kept live order execution disabled; dashboard remains read-only/paper/shadow.
