@@ -5623,7 +5623,7 @@ app.use((req, res, next) => {
   // including the dashboard and its /api/dashboard/* data endpoints, which
   // expose live strategy/portfolio internals and must never be reachable by
   // an unauthenticated caller on a publicly bound (0.0.0.0) deployment.
-  if (req.path === '/health') return next();
+  if (req.path === '/health' || req.path === '/dashboard/manifest.webmanifest' || req.path === '/dashboard/service-worker.js' || req.path.startsWith('/dashboard/icons/')) return next();
   if (config.ALLOW_UNAUTHENTICATED_API) return next();
   if (!config.API_KEY) return res.status(503).json({ error: 'API_KEY_NOT_CONFIGURED' });
   // EventSource (used by /api/dashboard/events/stream) cannot set custom
@@ -6112,6 +6112,26 @@ async function getDashboardData(symbol) {
   try { return await task; }
   finally { dashboardDataInflight.delete(inflightKey); }
 }
+
+app.get('/dashboard/manifest.webmanifest', (req, res) => {
+  res.type('application/manifest+json');
+  res.sendFile(path.join(__dirname, 'dashboard', 'manifest.webmanifest'));
+});
+app.get('/dashboard/service-worker.js', (req, res) => {
+  res.type('application/javascript');
+  res.set('Cache-Control', 'no-store');
+  res.sendFile(path.join(__dirname, 'dashboard', 'service-worker.js'));
+});
+app.get('/dashboard/icons/:icon', (req, res) => {
+  const icon = String(req.params.icon || '');
+  if (!/^icon-(192|512)\.png$/.test(icon)) return res.status(404).end();
+  res.sendFile(path.join(__dirname, 'dashboard', 'icons', icon));
+});
+
+app.get('/dashboard/', (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.sendFile(path.join(__dirname, 'dashboard.html'));
+});
 
 app.get('/dashboard', (req, res) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
