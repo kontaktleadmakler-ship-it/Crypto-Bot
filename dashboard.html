@@ -644,14 +644,39 @@ if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('/dashboard/service-worker.js', {scope:'/dashboard/'}).catch(()=>{}));
 }
 let pwaDeferredPrompt = null;
+const pwaBar = $('pwaInstallBar');
+const pwaBtn = $('pwaInstallBtn');
+function isStandalone(){ return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true; }
+function showPwaBar(){ if(pwaBar && !isStandalone()) pwaBar.hidden=false; }
 window.addEventListener('beforeinstallprompt', (e) => {
   e.preventDefault(); pwaDeferredPrompt = e;
-  const bar=$('pwaInstallBar'); if(bar) bar.hidden=false;
+  if(pwaBtn) pwaBtn.textContent='INSTALLIEREN';
+  showPwaBar();
 });
-$('pwaInstallBtn')?.addEventListener('click', async()=>{
-  if(!pwaDeferredPrompt)return; pwaDeferredPrompt.prompt();
-  try{await pwaDeferredPrompt.userChoice;}catch(_){}
-  pwaDeferredPrompt=null; const bar=$('pwaInstallBar'); if(bar)bar.hidden=true;
+window.addEventListener('load',()=>{
+  // Firefox and iOS Safari do not expose beforeinstallprompt. Keep the UI useful
+  // and provide browser-specific installation guidance instead of a dead button.
+  if(!isStandalone()) {
+    if(!pwaDeferredPrompt && pwaBtn) pwaBtn.textContent='APP HINZUFÜGEN';
+    showPwaBar();
+  }
+});
+pwaBtn?.addEventListener('click', async()=>{
+  if(pwaDeferredPrompt){
+    pwaDeferredPrompt.prompt();
+    try{await pwaDeferredPrompt.userChoice;}catch(_){}
+    pwaDeferredPrompt=null; if(pwaBar)pwaBar.hidden=true; return;
+  }
+  const ua=navigator.userAgent||'';
+  const isIOS=/iPhone|iPad|iPod/i.test(ua);
+  const isFirefox=/Firefox/i.test(ua);
+  if(isIOS){
+    alert('iPhone/iPad: Öffne das Teilen-Menü (□↑) und wähle „Zum Home-Bildschirm“.');
+  } else if(isFirefox){
+    alert('Firefox unterstützt den direkten INSTALLIEREN-Button für PWAs nicht. Für die App-Installation bitte Chrome oder Edge verwenden. In Chrome/Edge: Menü → App installieren bzw. Zum Startbildschirm hinzufügen.');
+  } else {
+    alert('Dein Browser stellt die automatische PWA-Installation hier nicht bereit. Öffne das Browser-Menü und wähle „App installieren“ oder „Zum Startbildschirm hinzufügen“.');
+  }
 });
 $('pwaInstallClose')?.addEventListener('click',()=>{const bar=$('pwaInstallBar');if(bar)bar.hidden=true;});
 window.addEventListener('appinstalled',()=>{const bar=$('pwaInstallBar');if(bar)bar.hidden=true;});
