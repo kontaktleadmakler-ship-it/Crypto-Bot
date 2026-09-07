@@ -3,6 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#07111c">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="JARVIS">
+<link rel="manifest" href="/dashboard/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/dashboard/icons/icon-192.png">
 <title>JARVIS 6.17 // Neural Intelligence Command Center</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -82,9 +89,44 @@
 #authBanner.show{display:block}
 
 .audit-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px}.audit-cell{background:#07111a;border:1px solid #102b3b;padding:4px;border-radius:4px;min-width:0}.audit-cell span{display:block;color:var(--muted);font-size:7px}.audit-cell b{display:block;margin-top:2px;font-size:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.audit-reasons{font-size:8px}.audit-reason{padding:4px 5px;margin:2px 0;border-left:2px solid var(--red);background:#120b11;color:#ffdbe1}.audit-reason.ok{border-left-color:var(--green);background:#07140f}.audit-table{font-size:7px;overflow:auto;max-height:180px}.audit-table table{width:100%;border-collapse:collapse}.audit-table th,.audit-table td{padding:3px;border-bottom:1px solid #102536;text-align:left;white-space:nowrap}.audit-table th{color:var(--muted);font-weight:500}.audit-table .good{color:var(--green)}.audit-table .bad{color:var(--red)}.audit-table .warn{color:var(--yellow)}
+
+/* JARVIS MOBILE PWA */
+.pwa-install-bar{position:fixed;left:10px;right:10px;bottom:70px;z-index:1200;display:flex;align-items:center;gap:8px;padding:9px 10px;border:1px solid var(--cyan);border-radius:9px;background:#07121df5;box-shadow:0 0 24px #00f0ff22;font-size:9px}.pwa-install-bar span{flex:1}.pwa-install-bar button{background:#0a1a28;border:1px solid #14566f;color:#d8f9ff;border-radius:5px;padding:6px 8px;font:700 8px 'JetBrains Mono'}.pwa-install-bar button:first-of-type{border-color:var(--cyan)}.mobile-bottom-nav{display:none}
+@media (max-width: 820px){
+ html,body{height:auto;min-height:100%;overflow:auto;-webkit-overflow-scrolling:touch}
+ body{padding-bottom:72px}
+ .app{height:auto;min-height:100vh;display:block;padding:6px}
+ .header{height:auto;min-height:64px;display:flex;align-items:center;justify-content:space-between;padding:9px 10px;position:sticky;top:6px;z-index:100}
+ .header .center-title{display:block;flex:1;text-align:center}.header .header-metrics{display:none}.header .brand{font-size:16px}.header .brand small{font-size:7px;letter-spacing:2px}.header .coin-title{font-size:14px;letter-spacing:1.5px}.header .status{gap:5px;font-size:7px}.header .status .dot{width:7px;height:7px}
+ .main{display:flex;flex-direction:column;gap:6px;min-height:auto}
+ .left,.center,.right{display:contents}
+ .panel{padding:9px;border-radius:8px;overflow:hidden}
+ .left>.panel:nth-child(1){order:1;min-height:210px}.left>.panel:nth-child(2){order:2}.left>.panel:nth-child(3){order:3}
+ .center>.panel:nth-child(1){order:4;min-height:420px}.center>.panel:nth-child(2){order:5;min-height:245px}
+ .right>.panel{min-height:0!important;max-height:none;order:6}.right>.panel:nth-child(1){min-height:300px!important}.right>.panel:nth-child(2){order:7}.right>.panel:nth-child(3){order:8}.right>.panel:nth-child(4){order:9;min-height:300px!important}.right>.panel:nth-child(5){order:10}.right>.panel:nth-child(6){order:11}
+ .market-table{font-size:8px}.market-table th,.market-table td{padding:6px 2px}.market-table th:nth-child(4),.market-table td:nth-child(4){display:none}.market-table th:nth-child(5),.market-table td:nth-child(5){display:none}
+ .heat{grid-template-columns:repeat(3,1fr);max-height:145px}.heatcell{min-height:42px}
+ .brain-panel{min-height:420px!important}.brain-head{grid-template-columns:repeat(2,1fr);gap:4px}.brain-head .stat:last-child{grid-column:1/-1}.brain{min-height:320px}.brain .nodeText{font-size:8px}.brain .nodeSub{font-size:6px}.brain-layer-label,.neural-synapse-legend,.neural-kpi{display:none}
+ .outcome-panel{display:block}.chartwrap canvas{height:170px!important}.outcome-stats{margin-top:6px}
+ .forensic-summary{grid-template-columns:repeat(2,1fr)}.router{grid-template-columns:1fr}
+ .trade-history{min-width:0}.scroll{max-height:260px}
+ .footer{height:auto;min-height:38px;margin-top:6px;padding:7px;font-size:7px}
+ .footer nav{display:none}
+ .mobile-bottom-nav{position:fixed;display:grid;grid-template-columns:repeat(5,1fr);left:6px;right:6px;bottom:6px;z-index:1100;height:58px;border:1px solid #0c4560;border-radius:10px;background:#07111df7;backdrop-filter:blur(14px);box-shadow:0 0 24px #00f0ff18}.mobile-bottom-nav button{border:0;background:transparent;color:#668a9b;font:14px 'JetBrains Mono';display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px}.mobile-bottom-nav button span{font-size:6px;letter-spacing:.7px}.mobile-bottom-nav button:active,.mobile-bottom-nav button.active{color:var(--cyan)}
+ #authOverlay{align-items:flex-start;padding-top:18vh}.neural-card{width:94vw}.neural-grid{grid-template-columns:1fr}
+}
+@media (max-width:420px){.panel{padding:8px}.title{font-size:10px}.sub{font-size:8px}.live-control{grid-template-columns:1fr 1fr}.agent-row{grid-template-columns:92px 1fr 32px}.brain-panel{min-height:390px!important}.brain{min-height:285px}.coin-title{font-size:12px!important}.header{top:4px}.app{padding:4px}}
 </style>
 </head>
 <body>
+<div id="pwaInstallBar" class="pwa-install-bar" hidden><span>◉ JARVIS kann als App installiert werden.</span><button id="pwaInstallBtn">INSTALLIEREN</button><button id="pwaInstallClose" aria-label="Schließen">×</button></div>
+<nav class="mobile-bottom-nav" aria-label="Mobile Navigation">
+  <button data-focus="marketRows">⌁<span>MARKET</span></button>
+  <button data-focus="brainPanel">◉<span>BRAIN</span></button>
+  <button data-focus="liveControl">▣<span>RISK</span></button>
+  <button data-focus="eventStream">≋<span>EVENTS</span></button>
+  <button data-focus="footerStatus">⚙<span>STATUS</span></button>
+</nav>
 <div id="authOverlay" class="hidden">
   <div id="authBox">
     <h2>◉ DASHBOARD AUTH</h2>
@@ -597,6 +639,27 @@ function connectProductionStream(){
     };
   }catch(_){$('eventCount').textContent='POLLING';}
 }
+// PWA bootstrap + mobile navigation
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('/dashboard/service-worker.js', {scope:'/dashboard/'}).catch(()=>{}));
+}
+let pwaDeferredPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault(); pwaDeferredPrompt = e;
+  const bar=$('pwaInstallBar'); if(bar) bar.hidden=false;
+});
+$('pwaInstallBtn')?.addEventListener('click', async()=>{
+  if(!pwaDeferredPrompt)return; pwaDeferredPrompt.prompt();
+  try{await pwaDeferredPrompt.userChoice;}catch(_){}
+  pwaDeferredPrompt=null; const bar=$('pwaInstallBar'); if(bar)bar.hidden=true;
+});
+$('pwaInstallClose')?.addEventListener('click',()=>{const bar=$('pwaInstallBar');if(bar)bar.hidden=true;});
+window.addEventListener('appinstalled',()=>{const bar=$('pwaInstallBar');if(bar)bar.hidden=true;});
+document.querySelectorAll('.mobile-bottom-nav button').forEach(btn=>btn.addEventListener('click',()=>{
+  document.querySelectorAll('.mobile-bottom-nav button').forEach(b=>b.classList.remove('active')); btn.classList.add('active');
+  const id=btn.dataset.focus, el=$(id); if(el){const panel=el.closest('.panel')||el; panel.scrollIntoView({behavior:'smooth',block:'start'});}
+}));
+
 load();
 // SSE is the primary live transport. Polling is only a low-frequency fallback
 // for snapshots that are not event-driven (risk/portfolio/analytics).
